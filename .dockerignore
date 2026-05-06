@@ -1,0 +1,15 @@
+.env
+.venv
+.tools
+.git
+agent-chat-ui
+mcp/google-forms-mcp/build
+mcp/google-forms-mcp/node_modules
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache

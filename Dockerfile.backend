@@ -1,0 +1,28 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    GOOGLE_FORMS_MCP_PATH=/opt/google-forms-mcp/build/index.js
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY mcp/google-forms-mcp /opt/google-forms-mcp
+
+RUN cd /opt/google-forms-mcp \
+    && npm ci \
+    && npm run build
+
+COPY pyproject.toml README.md langgraph.json ./
+COPY src ./src
+COPY skills ./skills
+
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -e ".[server]"
+
+EXPOSE 2024
+
+CMD ["langgraph", "dev", "--host", "0.0.0.0", "--port", "2024", "--no-browser"]

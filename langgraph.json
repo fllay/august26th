@@ -1,0 +1,8 @@
+{
+  "python_version": "3.12",
+  "dependencies": ["."],
+  "graphs": {
+    "agent": "google_form_agent.graph:agent"
+  },
+  "env": ".env"
+}

@@ -1,0 +1,27 @@
+[project]
+name = "google-form-agent-nectec"
+version = "0.1.0"
+description = "LangChain Deep Agent for creating Google Forms through a Google Forms MCP server."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "deepagents>=0.4.12",
+    "langchain-openai>=1.0.0",
+    "langchain-mcp-adapters>=0.2.2",
+    "python-dotenv>=1.0.1",
+]
+
+[project.optional-dependencies]
+server = [
+    "langgraph-cli[inmem]>=0.4.0",
+]
+
+[project.scripts]
+google-form-agent = "google_form_agent.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
