@@ -9,6 +9,18 @@ services:
       GOOGLE_FORMS_MCP_PATH: /opt/google-forms-mcp/build/index.js
     ports:
       - "2024:2024"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:2024/info', timeout=2)",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
 
   webui:
     build:
@@ -24,4 +36,5 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy

@@ -13,6 +13,7 @@ from langchain_openai import ChatOpenAI
 
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+LOCAL_LLM_DEFAULT_API_KEY = "not-needed"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SKILLS_DIR = PROJECT_ROOT / "skills"
 
@@ -42,8 +43,18 @@ def get_required_env(name: str) -> str:
     return value
 
 
+def normalize_openai_base_url(base_url: str) -> str:
+    """Normalize local OpenAI-compatible base URLs such as Ollama endpoints."""
+    normalized = base_url.strip().rstrip("/")
+    if not normalized.startswith(("http://", "https://")):
+        normalized = f"http://{normalized}"
+    if not normalized.endswith("/v1"):
+        normalized = f"{normalized}/v1"
+    return normalized
+
+
 def build_openrouter_model() -> ChatOpenAI:
-    """Create a LangChain chat model that uses OpenRouter's OpenAI-compatible API."""
+    """Create a chat model that uses OpenRouter's OpenAI-compatible API."""
     api_key = get_required_env("OPENROUTER_API_KEY")
     model = os.getenv("OPENROUTER_MODEL", "openai/gpt-4.1")
     fallback_models = [
@@ -70,6 +81,36 @@ def build_openrouter_model() -> ChatOpenAI:
         extra_body={"models": fallback_models} if fallback_models else None,
         max_retries=3,
         disable_streaming=True,
+    )
+
+
+def build_local_model() -> ChatOpenAI:
+    """Create a chat model for a local OpenAI-compatible LLM server."""
+    base_url = normalize_openai_base_url(get_required_env("LOCAL_LLM_BASE_URL"))
+    model = os.getenv("LOCAL_LLM_MODEL", "llama3.1")
+    api_key = os.getenv("LOCAL_LLM_API_KEY", LOCAL_LLM_DEFAULT_API_KEY)
+
+    return ChatOpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        temperature=0.2,
+        max_retries=3,
+        disable_streaming=True,
+    )
+
+
+def build_chat_model() -> ChatOpenAI:
+    """Create the configured chat model provider."""
+    provider = os.getenv("LLM_PROVIDER", "openrouter").strip().lower()
+    if provider == "openrouter":
+        return build_openrouter_model()
+    if provider == "local":
+        return build_local_model()
+
+    raise RuntimeError(
+        "Unsupported LLM_PROVIDER. Use 'openrouter' or 'local'. "
+        f"Received: {provider}"
     )
 
 
@@ -101,7 +142,7 @@ def build_mcp_client() -> MultiServerMCPClient:
 
 async def build_agent() -> Any:
     """Create the Deep Agent with Google Forms MCP tools."""
-    model = build_openrouter_model()
+    model = build_chat_model()
     client = build_mcp_client()
     tools = await client.get_tools()
 

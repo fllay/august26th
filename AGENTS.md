@@ -16,7 +16,9 @@ These instructions apply to this repository unless a more specific `AGENTS.md` e
 
 - Keep secrets in `.env`; commit only `.env.example`.
 - Start the bundled Google Forms MCP server over stdio with Node and a configured `GOOGLE_FORMS_MCP_PATH`.
+- Configure the LLM provider with `LLM_PROVIDER=openrouter` or `LLM_PROVIDER=local`.
 - Configure OpenRouter fallbacks with `OPENROUTER_MODEL_2` and `OPENROUTER_MODEL_3`.
+- Configure local OpenAI-compatible LLM servers with `LOCAL_LLM_BASE_URL`, `LOCAL_LLM_MODEL`, and optional `LOCAL_LLM_API_KEY`.
 - Configure the Web UI backend URLs through `.env` with `WEBUI_PUBLIC_API_URL` and `WEBUI_LANGGRAPH_API_URL`.
 - Run backend and web UI together with `docker compose up --build`; Docker Desktop must be running with the Linux engine.
 - Deployment target is not documented yet.
