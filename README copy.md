@@ -36,6 +36,8 @@ Copy `.env.example` to `.env`, then fill in:
 
 - `OPENROUTER_API_KEY`
 - `OPENROUTER_MODEL`
+- `OPENROUTER_MODEL_2`
+- `OPENROUTER_MODEL_3`
 - `GOOGLE_FORMS_MCP_PATH`
 - `GOOGLE_CLIENT_ID`
 - `GOOGLE_CLIENT_SECRET`
@@ -97,6 +99,18 @@ The Docker setup starts:
 - Web UI at `http://localhost:3000`
 - Assistant / graph id: `agent`
 
+The Web UI backend URLs are configured through `.env`:
+
+```env
+WEBUI_PUBLIC_API_URL=http://localhost:2024
+WEBUI_LANGGRAPH_API_URL=http://backend:2024
+WEBUI_ASSISTANT_ID=agent
+```
+
+Use `WEBUI_PUBLIC_API_URL` for the browser-facing backend URL and
+`WEBUI_LANGGRAPH_API_URL` for the Docker-internal backend URL used by the
+Next.js API proxy.
+
 The backend image copies and builds the bundled `mcp/google-forms-mcp` server
 during the Docker build. Keep your real OpenRouter and Google OAuth values in
 `.env`; the compose file injects them into the backend container. In Docker,
@@ -111,7 +125,12 @@ during the Docker build. Keep your real OpenRouter and Google OAuth values in
 OpenRouter uses an OpenAI-compatible endpoint:
 
 - Base URL: `https://openrouter.ai/api/v1`
-- Model: set with `OPENROUTER_MODEL`, for example `openai/gpt-4.1`
+- Primary model: set with `OPENROUTER_MODEL`, for example `openai/gpt-4.1`
+- Fallback models: set with `OPENROUTER_MODEL_2` and `OPENROUTER_MODEL_3`
+
+The fallback models are sent to OpenRouter with its `models` array. If the
+primary model fails due to provider downtime, rate limiting, moderation refusal,
+or another model/provider error, OpenRouter tries the fallback models in order.
 
 The MCP server is started over stdio with:
 

@@ -46,6 +46,14 @@ def build_openrouter_model() -> ChatOpenAI:
     """Create a LangChain chat model that uses OpenRouter's OpenAI-compatible API."""
     api_key = get_required_env("OPENROUTER_API_KEY")
     model = os.getenv("OPENROUTER_MODEL", "openai/gpt-4.1")
+    fallback_models = [
+        fallback_model
+        for fallback_model in (
+            os.getenv("OPENROUTER_MODEL_2"),
+            os.getenv("OPENROUTER_MODEL_3"),
+        )
+        if fallback_model
+    ]
 
     default_headers: dict[str, str] = {}
     if site_url := os.getenv("OPENROUTER_SITE_URL"):
@@ -59,6 +67,7 @@ def build_openrouter_model() -> ChatOpenAI:
         model=model,
         temperature=0.2,
         default_headers=default_headers or None,
+        extra_body={"models": fallback_models} if fallback_models else None,
         max_retries=3,
         disable_streaming=True,
     )

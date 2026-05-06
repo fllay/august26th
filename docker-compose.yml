@@ -15,12 +15,12 @@ services:
       context: ./agent-chat-ui
       dockerfile: Dockerfile
       args:
-        NEXT_PUBLIC_API_URL: http://localhost:2024
-        NEXT_PUBLIC_ASSISTANT_ID: agent
+        NEXT_PUBLIC_API_URL: ${WEBUI_PUBLIC_API_URL}
+        NEXT_PUBLIC_ASSISTANT_ID: ${WEBUI_ASSISTANT_ID:-agent}
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:2024
-      NEXT_PUBLIC_ASSISTANT_ID: agent
-      LANGGRAPH_API_URL: http://backend:2024
+      NEXT_PUBLIC_API_URL: ${WEBUI_PUBLIC_API_URL}
+      NEXT_PUBLIC_ASSISTANT_ID: ${WEBUI_ASSISTANT_ID:-agent}
+      LANGGRAPH_API_URL: ${WEBUI_LANGGRAPH_API_URL}
     ports:
       - "3000:3000"
     depends_on:

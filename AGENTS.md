@@ -16,6 +16,8 @@ These instructions apply to this repository unless a more specific `AGENTS.md` e
 
 - Keep secrets in `.env`; commit only `.env.example`.
 - Start the bundled Google Forms MCP server over stdio with Node and a configured `GOOGLE_FORMS_MCP_PATH`.
+- Configure OpenRouter fallbacks with `OPENROUTER_MODEL_2` and `OPENROUTER_MODEL_3`.
+- Configure the Web UI backend URLs through `.env` with `WEBUI_PUBLIC_API_URL` and `WEBUI_LANGGRAPH_API_URL`.
 - Run backend and web UI together with `docker compose up --build`; Docker Desktop must be running with the Linux engine.
 - Deployment target is not documented yet.
 
