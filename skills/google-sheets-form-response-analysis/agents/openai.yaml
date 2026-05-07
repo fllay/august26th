@@ -1,0 +1,10 @@
+interface:
+  display_name: "Google Sheets Form Analysis"
+  short_description: "Analyze Sheets data and create charts"
+  default_prompt: "Use $google-sheets-form-response-analysis to analyze spreadsheet data in Google Sheets and create a summary or chart."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "google-sheets"
+      description: "Google Sheets MCP server for reading and writing spreadsheet data"

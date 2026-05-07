@@ -11,13 +11,22 @@ const STATE_COOKIE_NAME = "google_oauth_state";
 const SCOPES = [
   "https://www.googleapis.com/auth/forms.body",
   "https://www.googleapis.com/auth/forms.responses.readonly",
-  "https://www.googleapis.com/auth/drive.file",
+  "https://www.googleapis.com/auth/spreadsheets",
+  "https://www.googleapis.com/auth/drive",
 ];
 
+const GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token";
+
 export type StoredGoogleToken = {
+  token?: string;
   refresh_token: string;
+  client_id: string;
+  client_secret: string;
+  token_uri: string;
+  scopes: string[];
   scope?: string;
   token_type?: string;
+  expiry?: string;
   created_at: string;
 };
 
@@ -136,8 +145,10 @@ export async function exchangeCodeForToken(
   });
 
   const data = (await response.json()) as {
+    access_token?: string;
     error?: string;
     error_description?: string;
+    expires_in?: number;
     refresh_token?: string;
     scope?: string;
     token_type?: string;
@@ -157,10 +168,26 @@ export async function exchangeCodeForToken(
     );
   }
 
+  const clientId = requiredEnv("GOOGLE_CLIENT_ID");
+  const clientSecret = requiredEnv("GOOGLE_CLIENT_SECRET");
+  const scopeList = (data.scope || SCOPES.join(" "))
+    .split(" ")
+    .map((scope) => scope.trim())
+    .filter(Boolean);
+  const expiry = data.expires_in
+    ? new Date(Date.now() + data.expires_in * 1000).toISOString()
+    : undefined;
+
   return {
+    token: data.access_token,
     refresh_token: data.refresh_token,
+    client_id: clientId,
+    client_secret: clientSecret,
+    token_uri: GOOGLE_TOKEN_URI,
+    scopes: scopeList,
     scope: data.scope,
     token_type: data.token_type,
+    expiry,
     created_at: new Date().toISOString(),
   };
 }

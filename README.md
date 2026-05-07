@@ -29,6 +29,51 @@ The app now derives the OAuth callback URL automatically from the incoming
 request host. If users open the UI from a different host or IP, add that exact
 `/api/google/oauth/callback` URL to the Google OAuth client as well.
 
+## Google Sheets Analysis Skill
+
+The project now includes a bundled skill:
+
+- `google-sheets-form-response-analysis`
+
+Use it when a user wants to analyze Google Form responses that are stored in a
+Google Sheet, or more generally analyze spreadsheet data in Google Sheets, for
+example counts, rating distributions, grouped summaries, trend analysis, data
+quality checks, written analysis tabs, or charts and graphs.
+
+To make the skill usable, enable the Sheets MCP in `.env`:
+
+```env
+ENABLE_GOOGLE_SHEETS_MCP=true
+```
+
+When the user connects Google in the web UI, the Sheets MCP now reuses that same
+shared OAuth token automatically.
+
+Optional alternative for server automation:
+
+```env
+SERVICE_ACCOUNT_PATH=/path/to/service-account.json
+DRIVE_FOLDER_ID=your-google-drive-folder-id
+```
+
+The backend starts the upstream `mcp-google-sheets` server with a default
+analysis-oriented tool subset:
+
+- `search_spreadsheets`
+- `list_spreadsheets`
+- `list_sheets`
+- `get_sheet_data`
+- `get_multiple_sheet_data`
+- `get_sheet_formulas`
+- `find_in_spreadsheet`
+- `create_sheet`
+- `update_cells`
+- `batch_update_cells`
+- `add_chart`
+- `batch_update`
+
+This keeps tool context smaller than loading the full upstream tool list.
+
 ## LLM Provider
 
 The backend supports OpenAI-compatible chat APIs.

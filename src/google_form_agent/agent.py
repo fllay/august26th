@@ -15,9 +15,14 @@ from xml.etree import ElementTree
 
 from deepagents import create_deep_agent
 from deepagents.backends.filesystem import FilesystemBackend
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as UserCredentials
+from googleapiclient.discovery import build as build_google_api
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_core.messages import AIMessage, AnyMessage
+from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 
 
@@ -26,6 +31,10 @@ LOCAL_LLM_DEFAULT_API_KEY = "not-needed"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SKILLS_DIR = PROJECT_ROOT / "skills"
 DEFAULT_GOOGLE_OAUTH_TOKEN_PATH = PROJECT_ROOT / ".data" / "google-oauth.json"
+GOOGLE_SHEETS_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
 
 PDF_MIME_TYPE = "application/pdf"
 DOC_MIME_TYPE = "application/msword"
@@ -62,10 +71,10 @@ EXTENSION_MIME_TYPES = {
 }
 
 
-SYSTEM_PROMPT = """You are a Google Forms creation agent for NECTEC users.
+SYSTEM_PROMPT = """You are a NECTEC workflow agent for Google Forms and Google Sheets.
 
-Your job is to convert a user's form request into a clear Google Form using the
-available Google Forms MCP tools. Work deliberately:
+Your job is to help NECTEC users with Google Forms and Google Sheets workflows.
+Work deliberately:
 - If a user asks about an uploaded file and the message contains "Uploaded file
   context", treat that context as the already-extracted file text. Answer from
   it directly. Do not say you cannot access the file unless no extracted context
@@ -73,17 +82,42 @@ available Google Forms MCP tools. Work deliberately:
 - If the message contains <<<FILE_TEXT>>> and <<<END_FILE_TEXT>>> markers, the
   exact uploaded file text is between those markers. For requests like "show all
   text in this file", return that marked text directly.
+- If a user provides a Google Sheets spreadsheet URL or spreadsheet ID, treat it
+  as a spreadsheet target, not as spreadsheet content or as part of the command
+  text. Use Google Sheets tools to inspect it.
+- If a user asks to analyze spreadsheet data, prefer Google Sheets analysis
+  behavior over Google Forms creation behavior.
+- If a request is clearly about spreadsheet analysis, do not switch into Google
+  Forms creation mode and do not ask whether the user wants to create a form
+  unless the user explicitly mentions creating one.
 - Clarify only when required fields or question details are missing.
-- Create the form first, then add questions one at a time.
-- When calling create_form, pass only the form title. Do not pass a description,
-  questions, settings, or other form fields in the create_form call because the
-  Google Forms API only allows info.title during creation.
-- Prefer concise, user-ready form titles, descriptions, and question labels.
-- Use text questions for open responses and multiple choice questions when the
-  user gives options.
-- After creating or editing a form, report the form title, the questions added,
-  and any URL or form ID returned by the tools.
-- Never claim a form was created unless a Google Forms MCP tool succeeded.
+- For Google Forms creation:
+  - Create the form first, then add questions one at a time.
+  - When calling create_form, pass only the form title. Do not pass a description,
+    questions, settings, or other form fields in the create_form call because the
+    Google Forms API only allows info.title during creation.
+  - Prefer concise, user-ready form titles, descriptions, and question labels.
+  - Use text questions for open responses and multiple choice questions when the
+    user gives options.
+  - After creating or editing a form, report the form title, the questions added,
+    and any URL or form ID returned by the tools.
+  - Never claim a form was created unless a Google Forms MCP tool succeeded.
+- For Google Sheets analysis:
+  - Start spreadsheet inspection with the inspect_spreadsheet_for_analysis tool
+    when the user provides a spreadsheet target and wants analysis.
+  - Inspect the spreadsheet structure first.
+  - Unless the user narrows the scope, analyze the full used range of all sheet
+    tabs that contain data, not just a preview sample.
+  - Use the spreadsheet ID or URL directly when present.
+  - If the user asks for analysis without specifying a type, choose a sensible
+    default analysis from the available columns.
+  - Do not ask the user to specify tabs, ranges, columns, chart types, or other
+    analysis parameters before you have inspected the spreadsheet with tools.
+  - For requests such as "analyze this spreadsheet", "simple summary", or
+    similarly broad analysis asks, decide the analysis plan yourself after
+    reading the spreadsheet structure.
+  - Report the spreadsheet/tab used, the row scope, the key findings, and any
+    chart or summary tab created.
 """
 
 OLD_UPLOAD_CONTEXT_RE = re.compile(
@@ -98,6 +132,11 @@ FILE_TEXT_RE = re.compile(
 )
 UPLOAD_FILE_HEADER_RE = re.compile(r"^\[(?:Uploaded|Attached) file: .+\]$", re.IGNORECASE)
 PAGE_MARKER_RE = re.compile(r"^--\s*\d+\s+of\s+\d+\s*--$", re.IGNORECASE)
+SPREADSHEET_URL_RE = re.compile(
+    r"https?://docs\.google\.com/spreadsheets/d/([a-zA-Z0-9-_]+)",
+    re.IGNORECASE,
+)
+SPREADSHEET_ID_RE = re.compile(r"\b[a-zA-Z0-9-_]{30,}\b")
 
 
 def clean_extracted_file_text(context: str) -> str:
@@ -151,6 +190,223 @@ def normalize_uploaded_file_context(text: str) -> str:
     return OLD_UPLOAD_CONTEXT_RE.sub(
         lambda match: marker_file_context(match.group("context")),
         text,
+    )
+
+
+def extract_spreadsheet_targets(text: str) -> list[str]:
+    """Extract likely Google Sheets URLs or spreadsheet IDs from user text."""
+    targets: list[str] = []
+    for match in SPREADSHEET_URL_RE.finditer(text):
+        targets.append(match.group(0))
+    if targets:
+        return targets
+
+    if "spreadsheet" not in text.lower() and "sheet" not in text.lower():
+        return []
+
+    for match in SPREADSHEET_ID_RE.finditer(text):
+        candidate = match.group(0)
+        if candidate not in targets:
+            targets.append(candidate)
+    return targets
+
+
+def strip_spreadsheet_targets(text: str, targets: list[str]) -> str:
+    """Remove spreadsheet URLs/IDs from text so the remaining intent is clearer."""
+    stripped = text
+    for target in targets:
+        stripped = stripped.replace(target, " ")
+
+    stripped = re.sub(r"\s+", " ", stripped).strip(" :\n\t")
+    return stripped
+
+
+def build_spreadsheet_alias_map(targets: list[str]) -> list[tuple[str, str]]:
+    """Assign stable, human-readable aliases to spreadsheet targets."""
+    aliases: list[tuple[str, str]] = []
+    for index, target in enumerate(targets):
+        alias = f"TARGET_{chr(ord('A') + index)}"
+        aliases.append((alias, target))
+    return aliases
+
+
+def looks_like_spreadsheet_analysis_request(text: str) -> bool:
+    """Return whether the user is probably asking to inspect spreadsheet data."""
+    lowered = text.lower()
+    analysis_keywords = (
+        "analy",
+        "summary",
+        "summarize",
+        "insight",
+        "review",
+        "count",
+        "trend",
+        "chart",
+        "graph",
+        "data",
+        "sheet",
+        "spreadsheet",
+    )
+    return any(keyword in lowered for keyword in analysis_keywords)
+
+
+def extract_spreadsheet_id(target: str) -> str:
+    """Return a spreadsheet id from either a full URL or a bare id."""
+    match = SPREADSHEET_URL_RE.search(target)
+    if match:
+        return match.group(1)
+    return target.strip()
+
+
+def _load_google_sheets_credentials() -> service_account.Credentials | UserCredentials:
+    """Load usable Google Sheets credentials from configured auth sources."""
+    service_account_path = os.getenv("SERVICE_ACCOUNT_PATH")
+    if service_account_path:
+        candidate = Path(service_account_path).expanduser()
+        if candidate.exists():
+            return service_account.Credentials.from_service_account_file(
+                str(candidate),
+                scopes=GOOGLE_SHEETS_SCOPES,
+            )
+
+    token_path = Path(
+        os.getenv("TOKEN_PATH") or str(get_google_oauth_token_path())
+    ).expanduser()
+    if token_path.exists():
+        payload = json.loads(token_path.read_text(encoding="utf-8"))
+        credentials = UserCredentials.from_authorized_user_info(
+            payload,
+            scopes=GOOGLE_SHEETS_SCOPES,
+        )
+        if not credentials.valid and credentials.refresh_token:
+            credentials.refresh(GoogleAuthRequest())
+        return credentials
+
+    refresh_token = load_google_refresh_token()
+    if refresh_token:
+        credentials = UserCredentials(
+            token=None,
+            refresh_token=refresh_token,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=get_required_env("GOOGLE_CLIENT_ID"),
+            client_secret=get_required_env("GOOGLE_CLIENT_SECRET"),
+            scopes=GOOGLE_SHEETS_SCOPES,
+        )
+        credentials.refresh(GoogleAuthRequest())
+        return credentials
+
+    raise RuntimeError("No Google Sheets credentials are available.")
+
+
+def _quote_sheet_title(sheet_title: str) -> str:
+    escaped = sheet_title.replace("'", "''")
+    return f"'{escaped}'"
+
+
+@tool
+def inspect_spreadsheet_for_analysis(
+    spreadsheet_target: str | None = None,
+    spreadsheet_id: str | None = None,
+    sheet_name: str | None = None,
+    a1_range: str | None = None,
+    max_sheets: int = 20,
+    max_rows_per_sheet: int = 2000,
+) -> str:
+    """Inspect spreadsheet tabs and read the full used range for analysis without guessing sheet names.
+
+    Accepts either:
+    - spreadsheet_target: a spreadsheet URL or bare spreadsheet ID
+    - spreadsheet_id: a bare spreadsheet ID
+
+    Optional sheet_name and a1_range can narrow inspection, but full-workbook
+    analysis remains the default when they are omitted.
+    """
+    target = (spreadsheet_target or spreadsheet_id or "").strip()
+    if not target:
+        raise RuntimeError(
+            "inspect_spreadsheet_for_analysis requires either spreadsheet_target "
+            "or spreadsheet_id."
+        )
+
+    spreadsheet_id_value = extract_spreadsheet_id(target)
+    credentials = _load_google_sheets_credentials()
+    service = build_google_api(
+        "sheets",
+        "v4",
+        credentials=credentials,
+        cache_discovery=False,
+    )
+
+    metadata = (
+        service.spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id_value,
+            fields="properties.title,sheets.properties(sheetId,title,index,gridProperties)",
+        )
+        .execute()
+    )
+    spreadsheet_title = metadata.get("properties", {}).get("title", "")
+    sheets = metadata.get("sheets", [])
+
+    sheet_payloads: list[dict[str, Any]] = []
+    normalized_sheet_name = (sheet_name or "").strip()
+    normalized_a1_range = (a1_range or "").strip()
+    selected_sheets = sheets[: max(1, max_sheets)]
+    if normalized_sheet_name:
+        selected_sheets = [
+            sheet
+            for sheet in selected_sheets
+            if sheet.get("properties", {}).get("title", "") == normalized_sheet_name
+        ]
+
+    for sheet in selected_sheets:
+        properties = sheet.get("properties", {})
+        title = properties.get("title", "")
+        if not title:
+            continue
+
+        if normalized_a1_range:
+            full_range = f"{_quote_sheet_title(title)}!{normalized_a1_range}"
+        else:
+            full_range = _quote_sheet_title(title)
+        values_response = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=spreadsheet_id_value, range=full_range)
+            .execute()
+        )
+        values = values_response.get("values", [])
+        row_count = len(values)
+        truncated = row_count > max_rows_per_sheet
+        returned_rows = values[:max_rows_per_sheet] if truncated else values
+
+        sheet_payloads.append(
+            {
+                "sheet_title": title,
+                "sheet_index": properties.get("index"),
+                "sheet_id": properties.get("sheetId"),
+                "used_range": values_response.get("range", full_range),
+                "grid_row_count": properties.get("gridProperties", {}).get("rowCount"),
+                "grid_column_count": properties.get("gridProperties", {}).get("columnCount"),
+                "returned_row_count": len(returned_rows),
+                "total_used_row_count": row_count,
+                "truncated": truncated,
+                "rows": returned_rows,
+            }
+        )
+
+    return json.dumps(
+        {
+            "spreadsheet_id": spreadsheet_id_value,
+            "spreadsheet_title": spreadsheet_title,
+            "sheet_count": len(sheets),
+            "analysis_scope": "all available sheet tabs up to configured limits",
+            "requested_sheet_name": normalized_sheet_name or None,
+            "requested_a1_range": normalized_a1_range or None,
+            "sheets": sheet_payloads,
+        },
+        ensure_ascii=False,
+        indent=2,
     )
 
 
@@ -223,6 +479,24 @@ def load_google_refresh_token() -> str | None:
     return None
 
 
+def has_shared_google_oauth_token() -> bool:
+    """Return whether the shared Google OAuth token file exists."""
+    return get_google_oauth_token_path().exists()
+
+
+def has_google_sheets_auth_config() -> bool:
+    """Return whether Sheets MCP has any usable auth source configured."""
+    if os.getenv("CREDENTIALS_CONFIG"):
+        return True
+    if has_shared_google_oauth_token():
+        return True
+    for env_name in ("SERVICE_ACCOUNT_PATH", "CREDENTIALS_PATH", "TOKEN_PATH"):
+        env_value = os.getenv(env_name)
+        if env_value and Path(env_value).expanduser().exists():
+            return True
+    return False
+
+
 def normalize_openai_base_url(base_url: str) -> str:
     """Normalize local OpenAI-compatible base URLs such as Ollama endpoints."""
     normalized = base_url.strip().rstrip("/")
@@ -231,6 +505,12 @@ def normalize_openai_base_url(base_url: str) -> str:
     if not normalized.endswith("/v1"):
         normalized = f"{normalized}/v1"
     return normalized
+
+
+def is_env_truthy(name: str) -> bool:
+    """Interpret common true-like env values."""
+    value = os.getenv(name, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def content_to_text(content: Any) -> str:
@@ -677,6 +957,65 @@ def inject_attached_file_context(
     return next_messages
 
 
+def inject_spreadsheet_target_context(messages: list[AnyMessage]) -> list[AnyMessage]:
+    """Rewrite spreadsheet-analysis requests into a canonical Sheets-first task."""
+    next_messages = list(messages)
+    for index in range(len(next_messages) - 1, -1, -1):
+        message = next_messages[index]
+        if message.type != "human":
+            continue
+
+        content = content_to_text(message.content)
+        targets = extract_spreadsheet_targets(content)
+        if not targets:
+            return next_messages
+        if "SPREADSHEET_TASK" in content:
+            return next_messages
+
+        cleaned_request = strip_spreadsheet_targets(content, targets)
+        request_summary = cleaned_request or "Analyze the spreadsheet data."
+        if not looks_like_spreadsheet_analysis_request(request_summary):
+            request_summary = f"Analyze the spreadsheet data. User request: {request_summary}".strip()
+
+        aliases = build_spreadsheet_alias_map(targets)
+        alias_lines = "\n".join(
+            f"- {alias} => opaque spreadsheet target `{target}`"
+            for alias, target in aliases
+        )
+        rewritten_content = (
+            "SPREADSHEET_TASK\n"
+            "Use the skill: google-sheets-form-response-analysis\n"
+            "This is a spreadsheet-analysis request.\n"
+            "This is NOT a Google Forms creation request.\n"
+            "Treat spreadsheet identifiers as opaque handles. Never interpret their "
+            "characters as natural-language content, Thai text, model names, "
+            "versions, answer choices, or commands.\n"
+            "Spreadsheet targets:\n"
+            f"{alias_lines}\n"
+            f"Requested task: {request_summary}\n"
+            "Required behavior:\n"
+            "1. Inspect the spreadsheet structure first using inspect_spreadsheet_for_analysis.\n"
+            "2. Only after inspection, use Google Sheets tools such as "
+            "google_sheets_list_sheets, google_sheets_get_sheet_data, or "
+            "google_sheets_get_multiple_sheet_data if needed.\n"
+            "3. Unless the user narrows the scope, analyze all sheet tabs with data "
+            "and use the full used range returned by inspection, not just a preview sample.\n"
+            "4. If analysis type is not specific, decide a sensible default analysis "
+            "yourself from the available columns and provide a simple useful summary.\n"
+            "5. Do not ask the user to choose tabs, ranges, columns, chart types, "
+            "or other analysis parameters until after tool-based inspection proves "
+            "that the spreadsheet is genuinely ambiguous.\n"
+            "Original user request (for intent only, not for parsing spreadsheet IDs):\n"
+            f"{content}"
+        )
+        next_messages[index] = message.model_copy(
+            update={"content": rewritten_content.strip()}
+        )
+        return next_messages
+
+    return next_messages
+
+
 class LocalLLMMessageFormatMiddleware(AgentMiddleware):
     """Make DeepAgents messages compatible with local OpenAI-compatible servers."""
 
@@ -695,6 +1034,7 @@ class LocalLLMMessageFormatMiddleware(AgentMiddleware):
             messages,
             get_attached_file_context(request),
         )
+        messages = inject_spreadsheet_target_context(messages)
         response = await handler(
             request.override(system_message=system_message, messages=messages)
         )
@@ -763,31 +1103,68 @@ def build_chat_model() -> ChatOpenAI:
 
 
 def build_mcp_client() -> MultiServerMCPClient:
-    """Build the MCP client for the Google Forms stdio server."""
-    server_path = Path(get_required_env("GOOGLE_FORMS_MCP_PATH")).expanduser()
-    if not server_path.exists():
+    """Build the MCP client for the configured stdio MCP servers."""
+    forms_server_path = Path(get_required_env("GOOGLE_FORMS_MCP_PATH")).expanduser()
+    if not forms_server_path.exists():
         raise RuntimeError(
             "GOOGLE_FORMS_MCP_PATH does not exist. Build google-forms-mcp and "
-            f"set GOOGLE_FORMS_MCP_PATH to its build/index.js file: {server_path}"
+            f"set GOOGLE_FORMS_MCP_PATH to its build/index.js file: {forms_server_path}"
         )
 
-    refresh_token = load_google_refresh_token()
-    server_env = {
+    forms_server_env = {
         "GOOGLE_CLIENT_ID": get_required_env("GOOGLE_CLIENT_ID"),
         "GOOGLE_CLIENT_SECRET": get_required_env("GOOGLE_CLIENT_SECRET"),
     }
+    refresh_token = load_google_refresh_token()
     if refresh_token:
-        server_env["GOOGLE_REFRESH_TOKEN"] = refresh_token
+        forms_server_env["GOOGLE_REFRESH_TOKEN"] = refresh_token
+
+    servers: dict[str, dict[str, Any]] = {
+        "google_forms": {
+            "transport": "stdio",
+            "command": "node",
+            "args": [str(forms_server_path)],
+            "env": forms_server_env,
+        }
+    }
+
+    if is_env_truthy("ENABLE_GOOGLE_SHEETS_MCP"):
+        if not has_google_sheets_auth_config():
+            return MultiServerMCPClient(
+                servers,
+                tool_name_prefix=True,
+            )
+
+        sheets_server_env = {
+            key: value
+            for key in (
+                "SERVICE_ACCOUNT_PATH",
+                "DRIVE_FOLDER_ID",
+                "CREDENTIALS_PATH",
+                "TOKEN_PATH",
+                "CREDENTIALS_CONFIG",
+                "ENABLED_TOOLS",
+            )
+            if (value := os.getenv(key))
+        }
+        if "TOKEN_PATH" not in sheets_server_env and has_shared_google_oauth_token():
+            sheets_server_env["TOKEN_PATH"] = str(get_google_oauth_token_path())
+        sheets_enabled_tools = os.getenv(
+            "GOOGLE_SHEETS_ENABLED_TOOLS",
+            "search_spreadsheets,list_spreadsheets,list_sheets,get_sheet_data,"
+            "get_multiple_sheet_data,get_sheet_formulas,find_in_spreadsheet,"
+            "create_sheet,update_cells,batch_update_cells,add_chart,batch_update",
+        ).strip()
+        sheets_server_args = ["--include-tools", sheets_enabled_tools] if sheets_enabled_tools else []
+        servers["google_sheets"] = {
+            "transport": "stdio",
+            "command": "mcp-google-sheets",
+            "args": sheets_server_args,
+            "env": sheets_server_env,
+        }
 
     return MultiServerMCPClient(
-        {
-            "google_forms": {
-                "transport": "stdio",
-                "command": "node",
-                "args": [str(server_path)],
-                "env": server_env,
-            }
-        },
+        servers,
         tool_name_prefix=True,
     )
 
@@ -796,7 +1173,7 @@ async def build_agent() -> Any:
     """Create the Deep Agent with Google Forms MCP tools."""
     model = build_chat_model()
     client = build_mcp_client()
-    tools = await client.get_tools()
+    tools = [inspect_spreadsheet_for_analysis, *(await client.get_tools())]
 
     return create_deep_agent(
         model=model,

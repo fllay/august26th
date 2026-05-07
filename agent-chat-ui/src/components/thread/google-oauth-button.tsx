@@ -47,7 +47,7 @@ export function GoogleOauthButton() {
 
     if (oauthState === "success") {
       toast.success("Google connected", {
-        description: "The agent can now use your Google Forms access.",
+        description: "The agent can now use your Google access for connected tools.",
       });
       fetchStatus().then(setStatus).catch(console.error);
     } else if (oauthState === "error") {
@@ -71,7 +71,9 @@ export function GoogleOauthButton() {
         throw new Error("Failed to disconnect Google.");
       }
       setStatus({ connected: false, connectedAt: null });
-      toast.success("Google disconnected");
+      toast.success("Google disconnected", {
+        description: "The agent no longer has access to your connected Google tools.",
+      });
     } catch (error) {
       console.error(error);
       toast.error("Could not disconnect Google.");
@@ -123,4 +125,3 @@ export function GoogleOauthButton() {
     </Button>
   );
 }
-
