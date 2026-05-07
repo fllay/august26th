@@ -16,8 +16,8 @@ const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
 
-if (!CLIENT_ID || !CLIENT_SECRET || !REFRESH_TOKEN) {
-  throw new Error('GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REFRESH_TOKEN environment variables are required');
+if (!CLIENT_ID || !CLIENT_SECRET) {
+  throw new Error('GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET environment variables are required');
 }
 
 class GoogleFormsServer {
@@ -43,9 +43,11 @@ class GoogleFormsServer {
       CLIENT_ID,
       CLIENT_SECRET
     );
-    this.oauth2Client.setCredentials({
-      refresh_token: REFRESH_TOKEN
-    });
+    if (REFRESH_TOKEN) {
+      this.oauth2Client.setCredentials({
+        refresh_token: REFRESH_TOKEN
+      });
+    }
 
     // Initialize Google Forms API
     this.forms = google.forms({
@@ -200,7 +202,19 @@ class GoogleFormsServer {
     });
   }
 
+  private ensureConnected() {
+    if (REFRESH_TOKEN) {
+      return;
+    }
+
+    throw new McpError(
+      ErrorCode.InvalidRequest,
+      'Google account not connected. Complete OAuth in the web UI before using Google Forms tools.'
+    );
+  }
+
   private async createForm(args: any) {
+    this.ensureConnected();
     if (!args.title) {
       throw new McpError(ErrorCode.InvalidParams, 'Title is required');
     }
@@ -247,6 +261,7 @@ class GoogleFormsServer {
   }
 
   private async addTextQuestion(args: any) {
+    this.ensureConnected();
     if (!args.formId || !args.questionTitle) {
       throw new McpError(
         ErrorCode.InvalidParams,
@@ -311,6 +326,7 @@ class GoogleFormsServer {
   }
 
   private async addMultipleChoiceQuestion(args: any) {
+    this.ensureConnected();
     if (!args.formId || !args.questionTitle || !args.options || !Array.isArray(args.options)) {
       throw new McpError(
         ErrorCode.InvalidParams,
@@ -379,6 +395,7 @@ class GoogleFormsServer {
   }
 
   private async getForm(args: any) {
+    this.ensureConnected();
     if (!args.formId) {
       throw new McpError(ErrorCode.InvalidParams, 'Form ID is required');
     }
@@ -406,6 +423,7 @@ class GoogleFormsServer {
   }
 
   private async getFormResponses(args: any) {
+    this.ensureConnected();
     if (!args.formId) {
       throw new McpError(ErrorCode.InvalidParams, 'Form ID is required');
     }

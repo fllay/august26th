@@ -25,6 +25,7 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 LOCAL_LLM_DEFAULT_API_KEY = "not-needed"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SKILLS_DIR = PROJECT_ROOT / "skills"
+DEFAULT_GOOGLE_OAUTH_TOKEN_PATH = PROJECT_ROOT / ".data" / "google-oauth.json"
 
 PDF_MIME_TYPE = "application/pdf"
 DOC_MIME_TYPE = "application/msword"
@@ -191,6 +192,35 @@ def get_required_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
+
+
+def get_google_oauth_token_path() -> Path:
+    """Return the shared OAuth token file path used by the web UI and backend."""
+    configured = os.getenv("GOOGLE_OAUTH_TOKEN_PATH")
+    if configured:
+        return Path(configured).expanduser()
+    return DEFAULT_GOOGLE_OAUTH_TOKEN_PATH
+
+
+def load_google_refresh_token() -> str | None:
+    """Load the Google refresh token from env first, then shared OAuth storage."""
+    env_token = os.getenv("GOOGLE_REFRESH_TOKEN")
+    if env_token:
+        return env_token
+
+    token_path = get_google_oauth_token_path()
+    if not token_path.exists():
+        return None
+
+    try:
+        payload = json.loads(token_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    refresh_token = payload.get("refresh_token")
+    if isinstance(refresh_token, str) and refresh_token.strip():
+        return refresh_token.strip()
+    return None
 
 
 def normalize_openai_base_url(base_url: str) -> str:
@@ -741,17 +771,21 @@ def build_mcp_client() -> MultiServerMCPClient:
             f"set GOOGLE_FORMS_MCP_PATH to its build/index.js file: {server_path}"
         )
 
+    refresh_token = load_google_refresh_token()
+    server_env = {
+        "GOOGLE_CLIENT_ID": get_required_env("GOOGLE_CLIENT_ID"),
+        "GOOGLE_CLIENT_SECRET": get_required_env("GOOGLE_CLIENT_SECRET"),
+    }
+    if refresh_token:
+        server_env["GOOGLE_REFRESH_TOKEN"] = refresh_token
+
     return MultiServerMCPClient(
         {
             "google_forms": {
                 "transport": "stdio",
                 "command": "node",
                 "args": [str(server_path)],
-                "env": {
-                    "GOOGLE_CLIENT_ID": get_required_env("GOOGLE_CLIENT_ID"),
-                    "GOOGLE_CLIENT_SECRET": get_required_env("GOOGLE_CLIENT_SECRET"),
-                    "GOOGLE_REFRESH_TOKEN": get_required_env("GOOGLE_REFRESH_TOKEN"),
-                },
+                "env": server_env,
             }
         },
         tool_name_prefix=True,

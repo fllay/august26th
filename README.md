@@ -1,6 +1,30 @@
 # august26th
 An AI agent for training management.
 
+## Google OAuth
+
+The app now includes a built-in Google OAuth 2.0 consent flow for Google Forms.
+
+1. Create a Google OAuth client in Google Cloud.
+2. Add this redirect URI to the client:
+
+```text
+http://localhost:3000/api/google/oauth/callback
+```
+
+3. Set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` in `.env`.
+4. Start both services:
+
+```bash
+docker compose up --build
+```
+
+5. Open the web UI at `http://localhost:3000` and click `Connect Google`.
+
+After consent succeeds, the refresh token is stored in shared app storage and
+the backend will use it for Google Forms MCP calls. A manual
+`GOOGLE_REFRESH_TOKEN` is still supported, but it is now optional.
+
 ## LLM Provider
 
 The backend supports OpenAI-compatible chat APIs.
@@ -34,7 +58,8 @@ The server must accept network traffic on port `11434`. On the Ollama server, ru
 
 ## Uploaded Files
 
-The Web UI accepts JPEG, PNG, GIF, WEBP, PDF, DOC, and DOCX files.
+The Web UI accepts JPEG, PNG, GIF, WEBP, PDF, DOC, DOCX, XLSX, PPTX, RTF, TXT,
+Markdown, CSV, TSV, JSON, XML, and HTML files.
 
 For local text-only LLMs, the backend converts uploaded content before sending it to the model:
 

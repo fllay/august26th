@@ -49,6 +49,7 @@ import { ThreadView } from "./agent-inbox";
 import { isAgentInboxInterruptSchema } from "@/lib/agent-inbox-interrupt";
 import { GenericInterruptView } from "./messages/generic-interrupt";
 import { MarkdownText } from "./markdown-text";
+import { GoogleOauthButton } from "./google-oauth-button";
 
 const isThreadNotFoundError = (message: string) => {
   const normalized = message.toLowerCase();
@@ -654,8 +655,9 @@ export function Thread() {
                     <PanelRightClose className="size-5" />
                   )}
                 </Button>
-              )}
+                  )}
               </div>
+              <GoogleOauthButton />
             </div>
           )}
           {chatStarted && (
@@ -695,6 +697,7 @@ export function Thread() {
               </div>
 
               <div className="flex items-center gap-4">
+                <GoogleOauthButton />
                 <TooltipIconButton
                   size="lg"
                   className="p-4"

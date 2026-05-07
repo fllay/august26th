@@ -153,6 +153,7 @@ activemq-data/
 .env
 .envrc
 .venv
+.data/
 .tools/
 node_modules/
 .next/
