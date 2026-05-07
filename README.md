@@ -6,7 +6,7 @@ An AI agent for training management.
 The app now includes a built-in Google OAuth 2.0 consent flow for Google Forms.
 
 1. Create a Google OAuth client in Google Cloud.
-2. Add this redirect URI to the client:
+2. Add the callback URL for the exact host users will open in the browser. For local use, that is:
 
 ```text
 http://localhost:3000/api/google/oauth/callback
@@ -24,6 +24,10 @@ docker compose up --build
 After consent succeeds, the refresh token is stored in shared app storage and
 the backend will use it for Google Forms MCP calls. A manual
 `GOOGLE_REFRESH_TOKEN` is still supported, but it is now optional.
+
+The app now derives the OAuth callback URL automatically from the incoming
+request host. If users open the UI from a different host or IP, add that exact
+`/api/google/oauth/callback` URL to the Google OAuth client as well.
 
 ## LLM Provider
 

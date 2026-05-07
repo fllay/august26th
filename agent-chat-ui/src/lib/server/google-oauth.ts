@@ -29,34 +29,53 @@ function requiredEnv(name: string): string {
   return value;
 }
 
+function normalizePublicHostname(hostname: string): string {
+  if (hostname === "0.0.0.0" || hostname === "::" || hostname === "[::]") {
+    return "localhost";
+  }
+  return hostname;
+}
+
+function getRequestOrigin(request: Request): string {
+  const url = new URL(request.url);
+  const forwardedProto = request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
+  const forwardedHost = request.headers.get("x-forwarded-host")?.split(",")[0]?.trim();
+  const hostHeader = request.headers.get("host")?.trim();
+
+  const protocol = forwardedProto || url.protocol.replace(":", "") || "http";
+  const host = forwardedHost || hostHeader || url.host;
+
+  if (!host) {
+    return url.origin;
+  }
+
+  const normalizedHost = (() => {
+    if (host.startsWith("[")) {
+      const closingIndex = host.indexOf("]");
+      if (closingIndex === -1) return host;
+      const hostname = host.slice(0, closingIndex + 1);
+      const rest = host.slice(closingIndex + 1);
+      return `${normalizePublicHostname(hostname)}${rest}`;
+    }
+
+    const [hostname, ...portParts] = host.split(":");
+    const port = portParts.length > 0 ? `:${portParts.join(":")}` : "";
+    return `${normalizePublicHostname(hostname)}${port}`;
+  })();
+
+  return `${protocol}://${normalizedHost}`;
+}
+
 export function getGoogleOauthTokenPath(): string {
   return process.env.GOOGLE_OAUTH_TOKEN_PATH?.trim() || DEFAULT_TOKEN_PATH;
 }
 
 export function getGoogleOauthRedirectUri(request: Request): string {
-  const configured = process.env.GOOGLE_OAUTH_REDIRECT_URI?.trim();
-  if (configured) {
-    return configured;
-  }
-  return new URL("/api/google/oauth/callback", request.url).toString();
+  return `${getRequestOrigin(request)}/api/google/oauth/callback`;
 }
 
 export function getGoogleOauthAppBaseUrl(request: Request): string {
-  const configured =
-    process.env.WEBUI_PUBLIC_APP_URL?.trim() ||
-    process.env.NEXT_PUBLIC_APP_URL?.trim();
-  if (configured) {
-    return configured.replace(/\/+$/, "");
-  }
-
-  const url = new URL(request.url);
-  if (url.hostname === "0.0.0.0") {
-    url.hostname = "localhost";
-  }
-  url.pathname = "/";
-  url.search = "";
-  url.hash = "";
-  return url.toString().replace(/\/+$/, "");
+  return getRequestOrigin(request).replace(/\/+$/, "");
 }
 
 export async function buildGoogleOauthUrl(request: Request): Promise<string> {

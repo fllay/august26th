@@ -35,10 +35,8 @@ services:
     environment:
       NEXT_PUBLIC_API_URL: ${WEBUI_PUBLIC_API_URL}
       NEXT_PUBLIC_ASSISTANT_ID: ${WEBUI_ASSISTANT_ID:-agent}
-      WEBUI_PUBLIC_APP_URL: ${WEBUI_PUBLIC_APP_URL:-http://localhost:3000}
       LANGGRAPH_API_URL: ${WEBUI_LANGGRAPH_API_URL}
       GOOGLE_OAUTH_TOKEN_PATH: /data/google-oauth.json
-      GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI:-http://localhost:3000/api/google/oauth/callback}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
     ports:
