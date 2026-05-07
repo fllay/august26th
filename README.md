@@ -31,3 +31,14 @@ LOCAL_LLM_BASE_URL=http://10.147.17.215:11434/v1
 ```
 
 The server must accept network traffic on port `11434`. On the Ollama server, run Ollama bound to the network, for example with `OLLAMA_HOST=0.0.0.0:11434`, and allow the port through the firewall. For CLI runs directly on Windows, use `http://localhost:<port>/v1`.
+
+## Uploaded Files
+
+The Web UI accepts JPEG, PNG, GIF, WEBP, PDF, DOC, and DOCX files.
+
+For local text-only LLMs, the backend converts uploaded content before sending it to the model:
+
+- PDF: extracts readable page text with `pypdf`
+- DOCX: extracts readable Word document text
+- DOC: best-effort text extraction from legacy Word binary files
+- Images: passes filename and MIME type as attachment context

@@ -8,6 +8,8 @@ dependencies = [
     "deepagents>=0.4.12",
     "langchain-openai>=1.0.0",
     "langchain-mcp-adapters>=0.2.2",
+    "olefile>=0.47",
+    "pypdf>=5.0.0",
     "python-dotenv>=1.0.1",
 ]
 

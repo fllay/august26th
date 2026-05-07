@@ -34,6 +34,7 @@ import {
   SUPPORTED_FILE_EXTENSIONS,
   useFileUpload,
 } from "@/hooks/use-file-upload";
+import { describeContentBlockForModel } from "@/lib/multimodal-utils";
 import { ContentBlocksPreview } from "./ContentBlocksPreview";
 import {
   useArtifactOpen,
@@ -386,11 +387,26 @@ export function Thread() {
       return;
     }
 
+    const attachedFileContext = (
+      await Promise.all(contentBlocks.map(describeContentBlockForModel))
+    )
+      .filter(Boolean)
+      .join("\n\n");
+    const inputWithAttachments = [
+      input.trim(),
+      attachedFileContext
+        ? `The uploaded file has already been processed by the application. Do not use tools. Do not say you cannot access it.\nExact extracted uploaded file text:\n<<<FILE_TEXT>>>\n${attachedFileContext}\n<<<END_FILE_TEXT>>>\nWhen the user asks for text in the uploaded file, return only the text between FILE_TEXT markers.`
+        : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
     const newHumanMessage: Message = {
       id: uuidv4(),
       type: "human",
       content: [
-        ...(input.trim().length > 0 ? [{ type: "text", text: input }] : []),
+        ...(inputWithAttachments.length > 0
+          ? [{ type: "text", text: inputWithAttachments }]
+          : []),
         ...contentBlocks,
       ] as Message["content"],
     };
@@ -410,7 +426,6 @@ export function Thread() {
         name,
         type: block.type,
         mimeType: block.mimeType,
-        data: block.data,
       };
     });
 
@@ -426,6 +441,7 @@ export function Thread() {
                 mimeType,
               }),
             ),
+            attached_file_context: attachedFileContext,
           }
         : {}),
       web_search_enabled: false,

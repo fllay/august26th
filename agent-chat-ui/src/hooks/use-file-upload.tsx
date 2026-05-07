@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, ChangeEvent } from "react";
 import { toast } from "sonner";
 import { ContentBlock } from "@langchain/core/messages";
-import { fileToContentBlock } from "@/lib/multimodal-utils";
+import { fileToContentBlock, inferMimeType } from "@/lib/multimodal-utils";
 
 export const SUPPORTED_FILE_TYPES = [
   "image/jpeg",
@@ -11,17 +11,29 @@ export const SUPPORTED_FILE_TYPES = [
   "application/pdf",
   "application/msword",
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/rtf",
+  "text/plain",
+  "text/markdown",
+  "text/csv",
+  "text/tab-separated-values",
+  "text/html",
+  "text/xml",
+  "application/json",
+  "application/xml",
 ];
 
-export const SUPPORTED_FILE_EXTENSIONS = ".jpg,.jpeg,.png,.gif,.webp,.pdf,.doc,.docx";
+export const SUPPORTED_FILE_EXTENSIONS =
+  ".jpg,.jpeg,.png,.gif,.webp,.pdf,.doc,.docx,.xlsx,.pptx,.rtf,.txt,.md,.markdown,.csv,.tsv,.json,.xml,.html,.htm";
 
-const SUPPORTED_FILE_LABEL = "JPEG, PNG, GIF, WEBP, PDF, DOC, or DOCX";
+const SUPPORTED_FILE_LABEL =
+  "JPEG, PNG, GIF, WEBP, PDF, DOC, DOCX, XLSX, PPTX, RTF, TXT, Markdown, CSV, TSV, JSON, XML, or HTML";
 
 const isDocumentFile = (mimeType: string) =>
-  mimeType === "application/pdf" ||
-  mimeType === "application/msword" ||
-  mimeType ===
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  SUPPORTED_FILE_TYPES.includes(mimeType) && !mimeType.startsWith("image/");
+
+const fileMimeType = (file: File) => inferMimeType(file.name, file.type);
 
 interface UseFileUploadOptions {
   initialBlocks?: ContentBlock.Multimodal.Data[];
@@ -37,20 +49,21 @@ export function useFileUpload({
   const dragCounter = useRef(0);
 
   const isDuplicate = (file: File, blocks: ContentBlock.Multimodal.Data[]) => {
-    if (isDocumentFile(file.type)) {
+    const mimeType = fileMimeType(file);
+    if (isDocumentFile(mimeType)) {
       return blocks.some(
         (b) =>
           b.type === "file" &&
-          b.mimeType === file.type &&
+          b.mimeType === mimeType &&
           b.metadata?.filename === file.name,
       );
     }
-    if (SUPPORTED_FILE_TYPES.includes(file.type)) {
+    if (SUPPORTED_FILE_TYPES.includes(mimeType)) {
       return blocks.some(
         (b) =>
           b.type === "image" &&
           b.metadata?.name === file.name &&
-          b.mimeType === file.type,
+          b.mimeType === mimeType,
       );
     }
     return false;
@@ -61,10 +74,10 @@ export function useFileUpload({
     if (!files) return;
     const fileArray = Array.from(files);
     const validFiles = fileArray.filter((file) =>
-      SUPPORTED_FILE_TYPES.includes(file.type),
+      SUPPORTED_FILE_TYPES.includes(fileMimeType(file)),
     );
     const invalidFiles = fileArray.filter(
-      (file) => !SUPPORTED_FILE_TYPES.includes(file.type),
+      (file) => !SUPPORTED_FILE_TYPES.includes(fileMimeType(file)),
     );
     const duplicateFiles = validFiles.filter((file) =>
       isDuplicate(file, contentBlocks),
@@ -121,10 +134,10 @@ export function useFileUpload({
 
       const files = Array.from(e.dataTransfer.files);
       const validFiles = files.filter((file) =>
-        SUPPORTED_FILE_TYPES.includes(file.type),
+        SUPPORTED_FILE_TYPES.includes(fileMimeType(file)),
       );
       const invalidFiles = files.filter(
-        (file) => !SUPPORTED_FILE_TYPES.includes(file.type),
+        (file) => !SUPPORTED_FILE_TYPES.includes(fileMimeType(file)),
       );
       const duplicateFiles = validFiles.filter((file) =>
         isDuplicate(file, contentBlocks),
@@ -227,26 +240,27 @@ export function useFileUpload({
     }
     e.preventDefault();
     const validFiles = files.filter((file) =>
-      SUPPORTED_FILE_TYPES.includes(file.type),
+      SUPPORTED_FILE_TYPES.includes(fileMimeType(file)),
     );
     const invalidFiles = files.filter(
-      (file) => !SUPPORTED_FILE_TYPES.includes(file.type),
+      (file) => !SUPPORTED_FILE_TYPES.includes(fileMimeType(file)),
     );
     const isDuplicate = (file: File) => {
-      if (isDocumentFile(file.type)) {
+      const mimeType = fileMimeType(file);
+      if (isDocumentFile(mimeType)) {
         return contentBlocks.some(
           (b) =>
             b.type === "file" &&
-            b.mimeType === file.type &&
+            b.mimeType === mimeType &&
             b.metadata?.filename === file.name,
         );
       }
-      if (SUPPORTED_FILE_TYPES.includes(file.type)) {
+      if (SUPPORTED_FILE_TYPES.includes(mimeType)) {
         return contentBlocks.some(
           (b) =>
             b.type === "image" &&
             b.metadata?.name === file.name &&
-            b.mimeType === file.type,
+            b.mimeType === mimeType,
         );
       }
       return false;

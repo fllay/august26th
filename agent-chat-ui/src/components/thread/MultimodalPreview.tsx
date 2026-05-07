@@ -52,13 +52,7 @@ export const MultimodalPreview: React.FC<MultimodalPreviewProps> = ({
   }
 
   // Document block
-  if (
-    block.type === "file" &&
-    (block.mimeType === "application/pdf" ||
-      block.mimeType === "application/msword" ||
-      block.mimeType ===
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-  ) {
+  if (block.type === "file") {
     const filename =
       block.metadata?.filename || block.metadata?.name || "Document file";
     return (
