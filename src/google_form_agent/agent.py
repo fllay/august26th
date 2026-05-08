@@ -1,7 +1,9 @@
 """LangChain Deep Agent wired to the Google Forms MCP server."""
 
+import ast
 import base64
 import csv
+from datetime import datetime, timezone
 import html
 import io
 import json
@@ -31,9 +33,16 @@ LOCAL_LLM_DEFAULT_API_KEY = "not-needed"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SKILLS_DIR = PROJECT_ROOT / "skills"
 DEFAULT_GOOGLE_OAUTH_TOKEN_PATH = PROJECT_ROOT / ".data" / "google-oauth.json"
+FORM_SHEET_LINKS_PATH = PROJECT_ROOT / ".data" / "form-sheet-links.json"
 GOOGLE_SHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
+]
+GOOGLE_WORKSPACE_SCOPES = [
+    "https://www.googleapis.com/auth/forms.body",
+    "https://www.googleapis.com/auth/forms.responses.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
 ]
 
 PDF_MIME_TYPE = "application/pdf"
@@ -85,6 +94,9 @@ Work deliberately:
 - If a user provides a Google Sheets spreadsheet URL or spreadsheet ID, treat it
   as a spreadsheet target, not as spreadsheet content or as part of the command
   text. Use Google Sheets tools to inspect it.
+- Never invent, shorten, abbreviate, or replace Google Form or Spreadsheet IDs
+  with placeholders such as "1aBcD..." or similar. Only use the exact ID
+  provided by the user or returned by a successful tool call.
 - If a user asks to analyze spreadsheet data, prefer Google Sheets analysis
   behavior over Google Forms creation behavior.
 - If a request is clearly about spreadsheet analysis, do not switch into Google
@@ -92,15 +104,27 @@ Work deliberately:
   unless the user explicitly mentions creating one.
 - Clarify only when required fields or question details are missing.
 - For Google Forms creation:
-  - Create the form first, then add questions one at a time.
-  - When calling create_form, pass only the form title. Do not pass a description,
-    questions, settings, or other form fields in the create_form call because the
-    Google Forms API only allows info.title during creation.
+  - Prefer create_form_with_response_sheet for new forms so each created form
+    also gets a companion response spreadsheet tracked by the app.
+  - If the prompt already contains enough information, include the description
+    and generated questions in the create_form_with_response_sheet call so the
+    form is created as completely as possible in one tool call.
+  - If questions were not included in the create_form_with_response_sheet call,
+    add them after creating the form.
+  - Do not use the raw MCP create_form tool for new form creation. Use
+    create_form_with_response_sheet instead.
   - Prefer concise, user-ready form titles, descriptions, and question labels.
   - Use text questions for open responses and multiple choice questions when the
     user gives options.
+  - If the user asks to list or browse forms, use list_google_forms.
+  - If the user asks to refresh a companion response sheet from the live form,
+    use sync_form_responses_to_sheet.
+  - Do not call sync_form_responses_to_sheet during a form creation request
+    unless the user explicitly asks to sync responses.
+  - After create_form_with_response_sheet succeeds, reuse the exact returned
+    formId and spreadsheetId values. Never substitute placeholder IDs.
   - After creating or editing a form, report the form title, the questions added,
-    and any URL or form ID returned by the tools.
+    and any URL, form ID, or spreadsheet ID returned by the tools.
   - Never claim a form was created unless a Google Forms MCP tool succeeded.
 - For Google Sheets analysis:
   - Start spreadsheet inspection with the inspect_spreadsheet_for_analysis tool
@@ -250,23 +274,183 @@ def looks_like_spreadsheet_analysis_request(text: str) -> bool:
     return any(keyword in lowered for keyword in analysis_keywords)
 
 
+def looks_like_form_creation_request(text: str) -> bool:
+    """Return whether the user is probably asking to create or modify a form."""
+    lowered = text.lower()
+    if "spreadsheet" in lowered and "analy" in lowered:
+        return False
+
+    creation_keywords = (
+        "create a form",
+        "create form",
+        "google form",
+        "pre-test",
+        "pretest",
+        "post-test",
+        "posttest",
+        "question",
+        "multiple-choice",
+        "multiple choice",
+        "แบบทดสอบ",
+        "แบบฟอร์ม",
+        "ฟอร์ม",
+        "คำถาม",
+    )
+    return any(keyword in lowered for keyword in creation_keywords)
+
+
+def extract_form_title(text: str) -> str:
+    """Extract a form title from common prompt patterns."""
+    lines = [line.rstrip() for line in text.splitlines()]
+    for index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if line.lower() == "title:" and index + 1 < len(lines):
+            candidate = lines[index + 1].strip()
+            if candidate:
+                return candidate
+        if line.lower().startswith("title:"):
+            candidate = line.split(":", 1)[1].strip()
+            if candidate:
+                return candidate
+    return ""
+
+
+def extract_form_description(text: str) -> str:
+    """Extract a description block from common prompt patterns."""
+    lines = text.splitlines()
+    collected: list[str] = []
+    capture = False
+    for raw_line in lines:
+        line = raw_line.strip()
+        lowered = line.lower()
+        if lowered == "description:":
+            capture = True
+            continue
+        if lowered.startswith("description:"):
+            capture = True
+            remainder = line.split(":", 1)[1].strip()
+            if remainder:
+                collected.append(remainder)
+            continue
+        if capture and (
+            lowered.startswith("include these points")
+            or lowered.startswith("then generate")
+            or lowered.startswith("requirements")
+        ):
+            break
+        if capture:
+            if line:
+                collected.append(line)
+            elif collected:
+                break
+    return "\n".join(collected).strip()
+
+
+def extract_question_count(text: str) -> int | None:
+    """Extract requested question count when present."""
+    patterns = (
+        r"(\d+)\s+required\s+multiple[- ]choice\s+questions",
+        r"(\d+)\s+multiple[- ]choice\s+questions",
+        r"จำนวน\s+(\d+)\s+ข้อ",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return None
+    return None
+
+
+def compress_form_creation_request(text: str) -> str:
+    """Condense a long form-creation prompt into a compact structured task."""
+    title = extract_form_title(text)
+    description = extract_form_description(text)
+    question_count = extract_question_count(text) or 0
+    lowered = text.lower()
+
+    requirement_lines: list[str] = []
+    if question_count:
+        requirement_lines.append(
+            f"- Generate {question_count} required multiple-choice questions."
+        )
+    if "thai" in lowered or "ภาษาไทย" in lowered:
+        requirement_lines.append("- Write the form and questions in Thai.")
+    if "4 choices" in lowered or "4 answer choices" in lowered or "4 choices." in lowered:
+        requirement_lines.append("- Each multiple-choice question must have 4 choices.")
+    if "do not add short-answer" in lowered or "do not add short answer" in lowered:
+        requirement_lines.append("- Do not add short-answer questions.")
+    if "do not collect email" in lowered:
+        requirement_lines.append("- Do not collect email addresses.")
+    if "do not include personal information" in lowered or "do not add personal information" in lowered:
+        requirement_lines.append("- Do not include personal information fields.")
+    if "companion google sheet" in lowered or "response sheet" in lowered:
+        requirement_lines.append("- Create and link a companion Google Sheet for responses.")
+
+    topic_lines: list[str] = []
+    for marker in (
+        "related to ",
+        "about ",
+    ):
+        marker_index = lowered.find(marker)
+        if marker_index != -1:
+            topic = text[marker_index + len(marker) :].splitlines()[0].strip().rstrip(".")
+            if topic:
+                topic_lines.append(f"- Topic: {topic}")
+                break
+
+    sections = [
+        "FORM_CREATION_TASK",
+        "This is a Google Form creation request.",
+        (
+            "Use tools. Prefer one create_form_with_response_sheet call with title, "
+            "description, and questions_json when enough details are available."
+        ),
+    ]
+    if title:
+        sections.append(f"Title: {title}")
+    if description:
+        sections.append(f"Description:\n{description}")
+    if requirement_lines or topic_lines:
+        sections.append("Requirements:")
+        sections.extend(requirement_lines)
+        sections.extend(topic_lines)
+    sections.append(
+        "If you can infer the questions, pass them in questions_json as JSON like "
+        "[{\"title\":\"...\",\"type\":\"multiple_choice\",\"required\":true,"
+        "\"options\":[\"A\",\"B\",\"C\",\"D\"]}]."
+    )
+    sections.append("Do not call sync_form_responses_to_sheet unless the user explicitly asks for syncing.")
+    sections.append("Never invent or shorten IDs like '1aBcD...'. Use only exact IDs returned by tools.")
+    sections.append("Always return the form ID, edit URL, responder URL, spreadsheet ID, and spreadsheet URL after successful creation.")
+    sections.append("If any field is missing, ask the minimum necessary clarifying question.")
+    return "\n".join(sections)
+
+
 def extract_spreadsheet_id(target: str) -> str:
     """Return a spreadsheet id from either a full URL or a bare id."""
+    if "..." in target:
+        raise RuntimeError(
+            "Spreadsheet ID appears truncated or placeholder-like. Use the full exact spreadsheet ID."
+        )
     match = SPREADSHEET_URL_RE.search(target)
     if match:
         return match.group(1)
     return target.strip()
 
 
-def _load_google_sheets_credentials() -> service_account.Credentials | UserCredentials:
-    """Load usable Google Sheets credentials from configured auth sources."""
+def _load_google_credentials(
+    scopes: list[str],
+) -> service_account.Credentials | UserCredentials:
+    """Load usable Google Workspace credentials from configured auth sources."""
     service_account_path = os.getenv("SERVICE_ACCOUNT_PATH")
     if service_account_path:
         candidate = Path(service_account_path).expanduser()
         if candidate.exists():
             return service_account.Credentials.from_service_account_file(
                 str(candidate),
-                scopes=GOOGLE_SHEETS_SCOPES,
+                scopes=scopes,
             )
 
     token_path = Path(
@@ -276,7 +460,7 @@ def _load_google_sheets_credentials() -> service_account.Credentials | UserCrede
         payload = json.loads(token_path.read_text(encoding="utf-8"))
         credentials = UserCredentials.from_authorized_user_info(
             payload,
-            scopes=GOOGLE_SHEETS_SCOPES,
+            scopes=scopes,
         )
         if not credentials.valid and credentials.refresh_token:
             credentials.refresh(GoogleAuthRequest())
@@ -290,17 +474,576 @@ def _load_google_sheets_credentials() -> service_account.Credentials | UserCrede
             token_uri="https://oauth2.googleapis.com/token",
             client_id=get_required_env("GOOGLE_CLIENT_ID"),
             client_secret=get_required_env("GOOGLE_CLIENT_SECRET"),
-            scopes=GOOGLE_SHEETS_SCOPES,
+            scopes=scopes,
         )
         credentials.refresh(GoogleAuthRequest())
         return credentials
 
-    raise RuntimeError("No Google Sheets credentials are available.")
+    raise RuntimeError("No Google Workspace credentials are available.")
+
+
+def _load_google_sheets_credentials() -> service_account.Credentials | UserCredentials:
+    """Load usable Google Sheets credentials from configured auth sources."""
+    return _load_google_credentials(GOOGLE_SHEETS_SCOPES)
+
+
+def _load_google_workspace_credentials() -> service_account.Credentials | UserCredentials:
+    """Load usable Google Forms/Sheets/Drive credentials from configured auth sources."""
+    return _load_google_credentials(GOOGLE_WORKSPACE_SCOPES)
 
 
 def _quote_sheet_title(sheet_title: str) -> str:
     escaped = sheet_title.replace("'", "''")
     return f"'{escaped}'"
+
+
+def _load_form_sheet_links() -> dict[str, dict[str, Any]]:
+    """Load the local registry of form-to-sheet links."""
+    if not FORM_SHEET_LINKS_PATH.exists():
+        return {}
+
+    try:
+        payload = json.loads(FORM_SHEET_LINKS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(form_id): details
+        for form_id, details in payload.items()
+        if isinstance(form_id, str) and isinstance(details, dict)
+    }
+
+
+def _save_form_sheet_links(links: dict[str, dict[str, Any]]) -> None:
+    """Persist the local registry of form-to-sheet links."""
+    FORM_SHEET_LINKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    FORM_SHEET_LINKS_PATH.write_text(
+        json.dumps(links, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _upsert_form_sheet_link(form_id: str, details: dict[str, Any]) -> None:
+    """Insert or update a form-to-sheet link entry."""
+    links = _load_form_sheet_links()
+    existing = links.get(form_id, {})
+    existing.update(details)
+    links[form_id] = existing
+    _save_form_sheet_links(links)
+
+
+def _get_latest_form_sheet_link() -> tuple[str, dict[str, Any]]:
+    """Return the most recently linked form entry, if any."""
+    links = _load_form_sheet_links()
+    if not links:
+        return "", {}
+
+    def sort_key(item: tuple[str, dict[str, Any]]) -> str:
+        _, details = item
+        linked_at = str(details.get("linkedAt", "") or "")
+        return linked_at
+
+    form_id, details = max(links.items(), key=sort_key)
+    return form_id, details
+
+
+def _find_form_id_by_spreadsheet_id(spreadsheet_id: str) -> str:
+    """Find a linked form id from a spreadsheet id in the local registry."""
+    normalized = spreadsheet_id.strip()
+    if not normalized:
+        return ""
+
+    for form_id, details in _load_form_sheet_links().items():
+        if str(details.get("spreadsheetId", "") or "").strip() == normalized:
+            return form_id
+    return ""
+
+
+def _build_forms_service() -> Any:
+    """Create a Google Forms API client."""
+    credentials = _load_google_workspace_credentials()
+    return build_google_api(
+        "forms",
+        "v1",
+        credentials=credentials,
+        cache_discovery=False,
+    )
+
+
+def _build_sheets_service() -> Any:
+    """Create a Google Sheets API client."""
+    credentials = _load_google_workspace_credentials()
+    return build_google_api(
+        "sheets",
+        "v4",
+        credentials=credentials,
+        cache_discovery=False,
+    )
+
+
+def _build_drive_service() -> Any:
+    """Create a Google Drive API client."""
+    credentials = _load_google_workspace_credentials()
+    return build_google_api(
+        "drive",
+        "v3",
+        credentials=credentials,
+        cache_discovery=False,
+    )
+
+
+def _extract_form_question_map(form_payload: dict[str, Any]) -> list[dict[str, str]]:
+    """Collect question IDs and titles from a Form resource."""
+    question_map: list[dict[str, str]] = []
+    for item in form_payload.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        question_item = item.get("questionItem")
+        if not isinstance(question_item, dict):
+            continue
+        question = question_item.get("question")
+        if not isinstance(question, dict):
+            continue
+        question_id = question.get("questionId")
+        title = item.get("title")
+        if isinstance(question_id, str) and question_id and isinstance(title, str) and title:
+            question_map.append({"questionId": question_id, "title": title})
+    return question_map
+
+
+def _stringify_form_answer(answer: dict[str, Any]) -> str:
+    """Convert a Google Forms answer payload into a readable string."""
+    text_answers = answer.get("textAnswers", {}).get("answers", [])
+    if isinstance(text_answers, list) and text_answers:
+        values = [
+            entry.get("value", "").strip()
+            for entry in text_answers
+            if isinstance(entry, dict) and isinstance(entry.get("value"), str)
+        ]
+        values = [value for value in values if value]
+        if values:
+            return "; ".join(values)
+
+    file_answers = answer.get("fileUploadAnswers", {}).get("answers", [])
+    if isinstance(file_answers, list) and file_answers:
+        file_ids = [
+            entry.get("fileId", "").strip()
+            for entry in file_answers
+            if isinstance(entry, dict) and isinstance(entry.get("fileId"), str)
+        ]
+        file_ids = [file_id for file_id in file_ids if file_id]
+        if file_ids:
+            return "; ".join(file_ids)
+
+    grade = answer.get("grade")
+    if isinstance(grade, dict):
+        score = grade.get("score")
+        if score is not None:
+            return str(score)
+
+    return ""
+
+
+def _build_response_rows(
+    form_payload: dict[str, Any],
+    responses_payload: dict[str, Any],
+) -> list[list[str]]:
+    """Build spreadsheet rows from a form definition and responses list."""
+    question_map = _extract_form_question_map(form_payload)
+    headers = ["Response ID", "Created Time", "Last Submitted Time", "Respondent Email"]
+    headers.extend(question["title"] for question in question_map)
+
+    rows: list[list[str]] = [headers]
+    for response in responses_payload.get("responses", []) or []:
+        if not isinstance(response, dict):
+            continue
+        answers = response.get("answers", {})
+        if not isinstance(answers, dict):
+            answers = {}
+
+        row = [
+            str(response.get("responseId", "") or ""),
+            str(response.get("createTime", "") or ""),
+            str(response.get("lastSubmittedTime", "") or ""),
+            str(response.get("respondentEmail", "") or ""),
+        ]
+        for question in question_map:
+            row.append(_stringify_form_answer(answers.get(question["questionId"], {})))
+        rows.append(row)
+
+    return rows
+
+
+def _parse_questions_json(questions_json: str) -> list[dict[str, Any]]:
+    """Parse a JSON question payload into a normalized list."""
+    raw_payload = questions_json.strip()
+    if not raw_payload:
+        return []
+
+    if raw_payload.startswith("```"):
+        fenced_match = re.match(
+            r"^```(?:json|python|py|javascript|js)?\s*(?P<body>[\s\S]*?)\s*```$",
+            raw_payload,
+            re.IGNORECASE,
+        )
+        if fenced_match:
+            raw_payload = fenced_match.group("body").strip()
+
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError as exc:
+        try:
+            payload = ast.literal_eval(raw_payload)
+        except (ValueError, SyntaxError) as literal_exc:
+            raise RuntimeError(
+                "questions_json must be valid JSON or a Python-style list/dict literal: "
+                f"{exc}"
+            ) from literal_exc
+
+    if isinstance(payload, dict):
+        questions = payload.get("questions", [])
+    else:
+        questions = payload
+
+    if not isinstance(questions, list):
+        raise RuntimeError("questions_json must be a JSON array or an object with a 'questions' array.")
+
+    normalized_questions: list[dict[str, Any]] = []
+    for index, raw_question in enumerate(questions, start=1):
+        if not isinstance(raw_question, dict):
+            raise RuntimeError(f"Question {index} must be a JSON object.")
+
+        title = str(raw_question.get("title", "") or "").strip()
+        if not title:
+            raise RuntimeError(f"Question {index} is missing a title.")
+
+        question_type = str(raw_question.get("type", "multiple_choice") or "multiple_choice").strip().lower()
+        required = bool(raw_question.get("required", True))
+        options = raw_question.get("options", [])
+        help_text = str(raw_question.get("description", "") or raw_question.get("help_text", "") or "").strip()
+
+        normalized = {
+            "title": title,
+            "type": question_type,
+            "required": required,
+            "options": options if isinstance(options, list) else [],
+            "description": help_text,
+        }
+        normalized_questions.append(normalized)
+
+    return normalized_questions
+
+
+def _build_form_item(question: dict[str, Any]) -> dict[str, Any]:
+    """Build a Google Forms item payload from a normalized question."""
+    question_type = str(question.get("type", "multiple_choice") or "multiple_choice").strip().lower()
+    required = bool(question.get("required", True))
+    item: dict[str, Any] = {"title": str(question["title"])}
+    description = str(question.get("description", "") or "").strip()
+    if description:
+        item["description"] = description
+
+    if question_type in {"multiple_choice", "multiple-choice", "radio"}:
+        options = [str(option).strip() for option in question.get("options", []) if str(option).strip()]
+        if len(options) < 2:
+            raise RuntimeError(f"Multiple-choice question '{question['title']}' needs at least 2 options.")
+        item["questionItem"] = {
+            "question": {
+                "required": required,
+                "choiceQuestion": {
+                    "type": "RADIO",
+                    "options": [{"value": option} for option in options],
+                },
+            }
+        }
+        return item
+
+    if question_type in {"checkbox", "checkboxes"}:
+        options = [str(option).strip() for option in question.get("options", []) if str(option).strip()]
+        if len(options) < 2:
+            raise RuntimeError(f"Checkbox question '{question['title']}' needs at least 2 options.")
+        item["questionItem"] = {
+            "question": {
+                "required": required,
+                "choiceQuestion": {
+                    "type": "CHECKBOX",
+                    "options": [{"value": option} for option in options],
+                },
+            }
+        }
+        return item
+
+    if question_type in {"dropdown", "drop_down"}:
+        options = [str(option).strip() for option in question.get("options", []) if str(option).strip()]
+        if len(options) < 2:
+            raise RuntimeError(f"Dropdown question '{question['title']}' needs at least 2 options.")
+        item["questionItem"] = {
+            "question": {
+                "required": required,
+                "choiceQuestion": {
+                    "type": "DROP_DOWN",
+                    "options": [{"value": option} for option in options],
+                },
+            }
+        }
+        return item
+
+    item["questionItem"] = {
+        "question": {
+            "required": required,
+            "textQuestion": {},
+        }
+    }
+    return item
+
+
+def _apply_form_batch_updates(
+    forms_service: Any,
+    form_id: str,
+    description: str,
+    questions: list[dict[str, Any]],
+) -> None:
+    """Apply form description and items in a single batchUpdate call."""
+    requests: list[dict[str, Any]] = []
+
+    if description.strip():
+        requests.append(
+            {
+                "updateFormInfo": {
+                    "info": {"description": description.strip()},
+                    "updateMask": "description",
+                }
+            }
+        )
+
+    for index, question in enumerate(questions):
+        requests.append(
+            {
+                "createItem": {
+                    "item": _build_form_item(question),
+                    "location": {"index": index},
+                }
+            }
+        )
+
+    if not requests:
+        return
+
+    forms_service.forms().batchUpdate(
+        formId=form_id,
+        body={"requests": requests},
+    ).execute()
+
+
+@tool
+def create_form_with_response_sheet(
+    title: str,
+    description: str = "",
+    spreadsheet_title: str = "",
+    questions_json: str = "",
+) -> str:
+    """Create a Google Form, optionally add description/questions, and create a companion Google Sheet."""
+    if not title.strip():
+        raise RuntimeError("title is required")
+
+    forms_service = _build_forms_service()
+    sheets_service = _build_sheets_service()
+    questions = _parse_questions_json(questions_json)
+    form_body = {
+        "info": {
+            "title": title.strip(),
+            "documentTitle": title.strip(),
+        }
+    }
+    form_response = forms_service.forms().create(body=form_body).execute()
+    form_id = form_response.get("formId", "")
+    if not form_id:
+        raise RuntimeError("Google Forms API did not return a formId.")
+
+    _apply_form_batch_updates(
+        forms_service=forms_service,
+        form_id=form_id,
+        description=description,
+        questions=questions,
+    )
+
+    responder_uri = form_response.get("responderUri", "")
+    edit_uri = f"https://docs.google.com/forms/d/{form_id}/edit"
+    sheet_title = spreadsheet_title.strip() or f"{title.strip()} Responses"
+    spreadsheet_response = sheets_service.spreadsheets().create(
+        body={
+            "properties": {"title": sheet_title},
+            "sheets": [{"properties": {"title": "Responses"}}],
+        }
+    ).execute()
+    spreadsheet_id = spreadsheet_response.get("spreadsheetId", "")
+    spreadsheet_url = spreadsheet_response.get("spreadsheetUrl", "")
+    if not spreadsheet_id:
+        raise RuntimeError("Google Sheets API did not return a spreadsheetId.")
+
+    _upsert_form_sheet_link(
+        form_id,
+        {
+            "formId": form_id,
+            "formUrl": edit_uri,
+            "editUrl": edit_uri,
+            "title": title.strip(),
+            "description": description.strip(),
+            "responderUri": responder_uri,
+            "responseUrl": responder_uri,
+            "spreadsheetId": spreadsheet_id,
+            "spreadsheetUrl": spreadsheet_url,
+            "linkedAt": datetime.now(timezone.utc).isoformat(),
+            "syncMode": "agent-managed",
+        },
+    )
+
+    return json.dumps(
+        {
+            "formId": form_id,
+            "formUrl": edit_uri,
+            "editUrl": edit_uri,
+            "title": title.strip(),
+            "description": description.strip(),
+            "responderUri": responder_uri,
+            "responseUrl": responder_uri,
+            "spreadsheetId": spreadsheet_id,
+            "spreadsheetUrl": spreadsheet_url,
+            "questionCount": len(questions),
+            "linkMode": "agent-managed",
+            "note": (
+                "A companion response spreadsheet was created and linked in the app registry. "
+                "Use sync_form_responses_to_sheet to refresh sheet data from live form responses."
+            ),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@tool
+def sync_form_responses_to_sheet(
+    form_id: str = "",
+    spreadsheet_id: str = "",
+) -> str:
+    """Sync a form's live responses into its companion Google Sheet."""
+    normalized_form_id = form_id.strip()
+    normalized_spreadsheet_id = spreadsheet_id.strip()
+    if "..." in normalized_form_id or "..." in normalized_spreadsheet_id:
+        raise RuntimeError(
+            "Form or spreadsheet ID appears truncated or placeholder-like. Use the full exact ID returned by the create tool."
+        )
+    if not normalized_form_id and normalized_spreadsheet_id:
+        normalized_form_id = _find_form_id_by_spreadsheet_id(normalized_spreadsheet_id)
+    if not normalized_form_id and not normalized_spreadsheet_id:
+        normalized_form_id, latest_link = _get_latest_form_sheet_link()
+        normalized_spreadsheet_id = str(latest_link.get("spreadsheetId", "") or "")
+    if not normalized_form_id:
+        raise RuntimeError(
+            "form_id is required unless spreadsheet_id matches a linked form created by this app."
+        )
+
+    links = _load_form_sheet_links()
+    link = links.get(normalized_form_id, {})
+    target_spreadsheet_id = normalized_spreadsheet_id or str(link.get("spreadsheetId", "") or "")
+    if not target_spreadsheet_id:
+        raise RuntimeError("No spreadsheet is linked to this form. Provide spreadsheet_id explicitly.")
+
+    forms_service = _build_forms_service()
+    sheets_service = _build_sheets_service()
+
+    form_payload = forms_service.forms().get(formId=normalized_form_id).execute()
+    responses_payload = forms_service.forms().responses().list(formId=normalized_form_id).execute()
+    rows = _build_response_rows(form_payload, responses_payload)
+
+    response_tab = "Responses"
+    sheets_service.spreadsheets().values().clear(
+        spreadsheetId=target_spreadsheet_id,
+        range=_quote_sheet_title(response_tab),
+        body={},
+    ).execute()
+    sheets_service.spreadsheets().values().update(
+        spreadsheetId=target_spreadsheet_id,
+        range=f"{_quote_sheet_title(response_tab)}!A1",
+        valueInputOption="RAW",
+        body={"values": rows},
+    ).execute()
+
+    _upsert_form_sheet_link(
+        normalized_form_id,
+        {
+            "formId": normalized_form_id,
+            "title": str(form_payload.get("info", {}).get("title", "") or ""),
+            "description": str(form_payload.get("info", {}).get("description", "") or ""),
+            "responderUri": str(form_payload.get("responderUri", "") or ""),
+            "spreadsheetId": target_spreadsheet_id,
+            "lastSyncedAt": str(form_payload.get("revisionId", "") or ""),
+            "syncMode": "agent-managed",
+        },
+    )
+
+    return json.dumps(
+        {
+            "formId": normalized_form_id,
+            "spreadsheetId": target_spreadsheet_id,
+            "responseTab": response_tab,
+            "rowCountWritten": len(rows),
+            "responseCount": max(len(rows) - 1, 0),
+            "questionCount": max(len(rows[0]) - 4, 0) if rows else 0,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@tool
+def list_google_forms(query: str = "", limit: int = 20) -> str:
+    """List the user's Google Forms and include any companion response sheet tracked by this app."""
+    drive_service = _build_drive_service()
+    normalized_limit = max(1, min(int(limit), 100))
+    mime_type = "application/vnd.google-apps.form"
+    drive_query_parts = [f"mimeType='{mime_type}'", "trashed=false"]
+    if query.strip():
+        escaped_query = query.strip().replace("'", "\\'")
+        drive_query_parts.append(f"name contains '{escaped_query}'")
+
+    response = drive_service.files().list(
+        q=" and ".join(drive_query_parts),
+        pageSize=normalized_limit,
+        fields="files(id,name,createdTime,modifiedTime,webViewLink)",
+        orderBy="modifiedTime desc",
+    ).execute()
+
+    links = _load_form_sheet_links()
+    forms: list[dict[str, Any]] = []
+    for entry in response.get("files", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        form_id = str(entry.get("id", "") or "")
+        linked_sheet = links.get(form_id, {})
+        forms.append(
+            {
+                "formId": form_id,
+                "title": str(entry.get("name", "") or ""),
+                "editUrl": str(entry.get("webViewLink", "") or ""),
+                "createdTime": str(entry.get("createdTime", "") or ""),
+                "modifiedTime": str(entry.get("modifiedTime", "") or ""),
+                "linkedSpreadsheetId": str(linked_sheet.get("spreadsheetId", "") or ""),
+                "linkedSpreadsheetUrl": str(linked_sheet.get("spreadsheetUrl", "") or ""),
+                "linkMode": str(linked_sheet.get("syncMode", "") or ""),
+            }
+        )
+
+    return json.dumps(
+        {
+            "count": len(forms),
+            "forms": forms,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @tool
@@ -408,6 +1151,27 @@ def inspect_spreadsheet_for_analysis(
         ensure_ascii=False,
         indent=2,
     )
+
+
+def inject_form_creation_context(messages: list[AnyMessage]) -> list[AnyMessage]:
+    """Rewrite form-creation requests into a canonical tool-first task."""
+    next_messages = list(messages)
+    for index in range(len(next_messages) - 1, -1, -1):
+        message = next_messages[index]
+        if message.type != "human":
+            continue
+
+        content = content_to_text(message.content)
+        if not looks_like_form_creation_request(content):
+            return next_messages
+        if "FORM_CREATION_TASK" in content:
+            return next_messages
+
+        rewritten_content = compress_form_creation_request(content)
+        next_messages[index] = message.model_copy(update={"content": rewritten_content})
+        return next_messages
+
+    return next_messages
 
 
 def clean_model_file_context_echo(message: AIMessage) -> AIMessage:
@@ -1034,6 +1798,7 @@ class LocalLLMMessageFormatMiddleware(AgentMiddleware):
             messages,
             get_attached_file_context(request),
         )
+        messages = inject_form_creation_context(messages)
         messages = inject_spreadsheet_target_context(messages)
         response = await handler(
             request.override(system_message=system_message, messages=messages)
@@ -1173,7 +1938,19 @@ async def build_agent() -> Any:
     """Create the Deep Agent with Google Forms MCP tools."""
     model = build_chat_model()
     client = build_mcp_client()
-    tools = [inspect_spreadsheet_for_analysis, *(await client.get_tools())]
+    mcp_tools = await client.get_tools()
+    filtered_mcp_tools = [
+        tool
+        for tool in mcp_tools
+        if "create_form" not in str(getattr(tool, "name", "") or "").lower()
+    ]
+    tools = [
+        create_form_with_response_sheet,
+        sync_form_responses_to_sheet,
+        list_google_forms,
+        inspect_spreadsheet_for_analysis,
+        *filtered_mcp_tools,
+    ]
 
     return create_deep_agent(
         model=model,

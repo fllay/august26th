@@ -148,4 +148,29 @@
   .shadow-inner-left {
     box-shadow: inset 9px 0 6px -1px rgb(0 0 0 / 0.02);
   }
+
+  .composer-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(217 217 217) transparent;
+  }
+
+  .composer-scrollbar::-webkit-scrollbar {
+    width: 8px;
+  }
+
+  .composer-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .composer-scrollbar::-webkit-scrollbar-thumb {
+    border-radius: 9999px;
+    background-color: rgb(217 217 217);
+    border: 2px solid transparent;
+    background-clip: content-box;
+    min-height: 40px;
+  }
+
+  .composer-scrollbar::-webkit-scrollbar-thumb:hover {
+    background-color: rgb(204 204 204);
+  }
 }

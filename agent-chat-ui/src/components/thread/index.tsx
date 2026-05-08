@@ -134,6 +134,7 @@ export function Thread() {
 
   const stream = useStreamContext();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const messages = useMemo(() => {
     const raw = stream.messages ?? [];
     const lastIndexById = new Map<string, number>();
@@ -174,6 +175,16 @@ export function Thread() {
   const showLoadingBubble = isLoading && !hasVisibleAiAfterHuman;
 
   const lastError = useRef<string | undefined>(undefined);
+
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+
+    textarea.style.height = "0px";
+    const nextHeight = Math.min(textarea.scrollHeight, 288);
+    textarea.style.height = `${Math.max(nextHeight, 96)}px`;
+    textarea.style.overflowY = textarea.scrollHeight > 288 ? "auto" : "hidden";
+  }, [input]);
 
   const resolveUserId = useCallback(async () => {
     if (userIdRef.current) return userIdRef.current;
@@ -782,6 +793,8 @@ export function Thread() {
                         onRemove={removeBlock}
                       />
                       <textarea
+                        ref={textareaRef}
+                        rows={4}
                         value={input}
                         onChange={(e) => setInput(e.target.value)}
                         onPaste={handlePaste}
@@ -799,7 +812,7 @@ export function Thread() {
                           }
                         }}
                         placeholder="Type your message..."
-                        className="field-sizing-content resize-none border-none bg-transparent p-3.5 pb-0 shadow-none ring-0 outline-none focus:ring-0 focus:outline-none"
+                        className="composer-scrollbar min-h-24 max-h-72 w-full resize-none overflow-hidden border-none bg-transparent p-3.5 pb-0 leading-6 shadow-none ring-0 outline-none focus:ring-0 focus:outline-none"
                       />
 
                       <div className="flex items-center p-2 pt-4">
