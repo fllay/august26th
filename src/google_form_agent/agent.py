@@ -5,10 +5,13 @@ import base64
 import csv
 from datetime import datetime, timezone
 import html
+from httplib2.error import ServerNotFoundError
 import io
 import json
 import os
 import re
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
@@ -21,9 +24,10 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build as build_google_api
+from googleapiclient.errors import HttpError
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_core.messages import AIMessage, AnyMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 
@@ -34,6 +38,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SKILLS_DIR = PROJECT_ROOT / "skills"
 DEFAULT_GOOGLE_OAUTH_TOKEN_PATH = PROJECT_ROOT / ".data" / "google-oauth.json"
 FORM_SHEET_LINKS_PATH = PROJECT_ROOT / ".data" / "form-sheet-links.json"
+GOOGLE_APPS_SCRIPT_CONFIG_PATH = PROJECT_ROOT / ".data" / "google-apps-script.json"
 GOOGLE_SHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
@@ -41,9 +46,34 @@ GOOGLE_SHEETS_SCOPES = [
 GOOGLE_WORKSPACE_SCOPES = [
     "https://www.googleapis.com/auth/forms.body",
     "https://www.googleapis.com/auth/forms.responses.readonly",
-    "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+DEFAULT_RESPONDENT_INFO_QUESTIONS = [
+    {"title": "ชื่อ-นามสกุล", "type": "text", "required": True},
+    {"title": "หน่วยงาน/สถานศึกษา", "type": "text", "required": True},
+    {"title": "ตำแหน่ง", "type": "text", "required": True},
+    {"title": "จังหวัด", "type": "text", "required": True},
+    {"title": "เบอร์โทรศัพท์", "type": "text", "required": True},
+    {"title": "อีเมล", "type": "text", "required": True},
+    {
+        "title": "ประสบการณ์หรือพื้นฐานด้านเครือข่าย/เทคโนโลยี",
+        "type": "multiple_choice",
+        "required": True,
+        "options": [
+            "ไม่มีพื้นฐาน",
+            "พื้นฐานเล็กน้อย",
+            "พื้นฐานปานกลาง",
+            "มีประสบการณ์มาก",
+        ],
+    },
+]
+RESPONDENT_SECTION_HINTS = (
+    "participant information",
+    "respondent information",
+    "section 1",
+    "ข้อมูลผู้เข้าอบรม",
+    "ข้อมูลผู้เข้ารับการอบรม",
+)
 
 PDF_MIME_TYPE = "application/pdf"
 DOC_MIME_TYPE = "application/msword"
@@ -104,8 +134,9 @@ Work deliberately:
   unless the user explicitly mentions creating one.
 - Clarify only when required fields or question details are missing.
 - For Google Forms creation:
-  - Prefer create_form_with_response_sheet for new forms so each created form
-    also gets a companion response spreadsheet tracked by the app.
+  - Local form tools are available in this agent: create_form_with_response_sheet
+    and list_google_forms.
+  - Prefer create_form_with_response_sheet for new forms.
   - If the prompt already contains enough information, include the description
     and generated questions in the create_form_with_response_sheet call so the
     form is created as completely as possible in one tool call.
@@ -117,15 +148,14 @@ Work deliberately:
   - Use text questions for open responses and multiple choice questions when the
     user gives options.
   - If the user asks to list or browse forms, use list_google_forms.
-  - If the user asks to refresh a companion response sheet from the live form,
-    use sync_form_responses_to_sheet.
-  - Do not call sync_form_responses_to_sheet during a form creation request
-    unless the user explicitly asks to sync responses.
   - After create_form_with_response_sheet succeeds, reuse the exact returned
-    formId and spreadsheetId values. Never substitute placeholder IDs.
+    formId value. Never substitute placeholder IDs.
   - After creating or editing a form, report the form title, the questions added,
-    and any URL, form ID, or spreadsheet ID returned by the tools.
+    and any URL or form ID returned by the tools.
   - Never claim a form was created unless a Google Forms MCP tool succeeded.
+  - Never say that form-creation tools are unavailable when the request is about
+    creating, listing, or syncing Google Forms. Those local form tools are
+    available in this agent.
 - For Google Sheets analysis:
   - Start spreadsheet inspection with the inspect_spreadsheet_for_analysis tool
     when the user provides a spreadsheet target and wants analysis.
@@ -363,17 +393,196 @@ def extract_question_count(text: str) -> int | None:
     return None
 
 
+def should_include_default_respondent_info(text: str) -> bool:
+    """Return whether the request likely needs a standard respondent-info block."""
+    lowered = text.lower()
+    respondent_keywords = (
+        "participant information",
+        "respondent information",
+        "ข้อมูลผู้เข้าอบรม",
+        "ข้อมูลผู้เข้ารับการอบรม",
+        "pre-test",
+        "pretest",
+        "training course",
+        "อบรม",
+        "ผู้เข้าอบรม",
+        "ผู้เข้ารับการอบรม",
+    )
+    return any(keyword in lowered for keyword in respondent_keywords)
+
+
+def _is_instructional_prompt_line(text: str) -> bool:
+    """Return whether a line reads like prompt instruction rather than form content."""
+    lowered = text.strip().casefold()
+    if not lowered:
+        return False
+    instructional_prefixes = (
+        "add these required",
+        "then generate",
+        "then create",
+        "generate ",
+        "create ",
+        "include these points",
+        "rules for the",
+        "requirements",
+        "important",
+        "do not ",
+        "also create",
+        "after finishing",
+        "pass that exact list",
+        "respondent information questions explicitly requested",
+        "section structure explicitly requested",
+    )
+    return lowered.startswith(instructional_prefixes)
+
+
+def _is_placeholder_content(text: str) -> bool:
+    """Return whether a line looks like an unfinished placeholder."""
+    lowered = text.strip().casefold()
+    placeholder_markers = (
+        "following the same pattern",
+        "more questions",
+        "same pattern",
+        "continue with",
+        "etc.",
+        "...",
+    )
+    return any(marker in lowered for marker in placeholder_markers)
+
+
+def extract_requested_respondent_questions(text: str) -> list[dict[str, Any]]:
+    """Extract respondent-information questions explicitly requested in the prompt."""
+    lines = text.replace("\r\n", "\n").splitlines()
+    capture = False
+    questions: list[dict[str, Any]] = []
+    current_question: dict[str, Any] | None = None
+
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        lowered = stripped.casefold()
+
+        if not capture and any(hint in lowered for hint in RESPONDENT_SECTION_HINTS):
+            capture = True
+            continue
+
+        if capture and (
+            lowered.startswith("then generate")
+            or lowered.startswith("section 2")
+            or "แบบทดสอบก่อนการอบรม" in lowered
+            or lowered.startswith("rules for the")
+        ):
+            break
+
+        if not capture or not stripped:
+            continue
+        if _is_instructional_prompt_line(stripped):
+            continue
+
+        item_match = re.match(r"^\d+[.)]?\s+(.+)$", stripped)
+        if item_match:
+            if current_question:
+                questions.append(current_question)
+            item_text = item_match.group(1).strip()
+            parts = re.split(r"\s+[—-]\s+", item_text)
+            title = parts[0].strip()
+            question_type = "text"
+            required = True
+            for part in parts[1:]:
+                lowered_part = part.casefold()
+                if "multiple choice" in lowered_part or "multiple-choice" in lowered_part:
+                    question_type = "multiple_choice"
+                elif "checkbox" in lowered_part:
+                    question_type = "checkbox"
+                elif "dropdown" in lowered_part or "drop down" in lowered_part:
+                    question_type = "dropdown"
+                elif "short answer" in lowered_part or "text" in lowered_part:
+                    question_type = "text"
+                elif "optional" in lowered_part:
+                    required = False
+                elif "required" in lowered_part:
+                    required = True
+            current_question = {
+                "title": title,
+                "type": question_type,
+                "required": required,
+                "options": [],
+            }
+            continue
+
+        option_match = re.match(r"^\s*[-*]\s+(.+)$", line)
+        if option_match and current_question is not None:
+            option = option_match.group(1).strip()
+            if option and not _is_instructional_prompt_line(option):
+                current_question.setdefault("options", []).append(option)
+                if current_question.get("type") == "text":
+                    current_question["type"] = "multiple_choice"
+
+    if current_question:
+        questions.append(current_question)
+
+    extracted_questions: list[dict[str, Any]] = []
+    for index, question in enumerate(questions, start=1):
+        if not question.get("title"):
+            continue
+        extracted_questions.append(_normalize_question_dict(question, index))
+    return extracted_questions
+
+
+def extract_requested_section_structure(text: str) -> dict[str, dict[str, str]]:
+    """Extract explicit section titles/descriptions from the prompt when present."""
+    lines = text.replace("\r\n", "\n").splitlines()
+    sections: dict[str, dict[str, str]] = {}
+    current_key: str | None = None
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+
+        match = re.match(r"^(Section\s*[12])\s*:\s*(.+)$", stripped, re.IGNORECASE)
+        if match:
+            current_key = "section_1" if match.group(1).casefold().startswith("section 1") else "section_2"
+            sections[current_key] = {"title": match.group(2).strip()}
+            continue
+
+        lowered = stripped.casefold()
+        if lowered in {"ข้อมูลผู้เข้าอบรม", "ข้อมูลผู้เข้ารับการอบรม"}:
+            current_key = "section_1"
+            sections[current_key] = {"title": stripped}
+            continue
+        if lowered in {"แบบทดสอบก่อนการอบรม", "แบบทดสอบหลังการอบรม"}:
+            current_key = "section_2"
+            sections[current_key] = {"title": stripped}
+            continue
+
+        if current_key and "description" not in sections[current_key]:
+            if (
+                not re.match(r"^\d+[.)]?\s+", stripped)
+                and not stripped.startswith(("-", "*"))
+                and not _is_instructional_prompt_line(stripped)
+            ):
+                sections[current_key]["description"] = stripped
+
+    return sections
+
+
 def compress_form_creation_request(text: str) -> str:
     """Condense a long form-creation prompt into a compact structured task."""
     title = extract_form_title(text)
     description = extract_form_description(text)
     question_count = extract_question_count(text) or 0
+    respondent_questions = extract_requested_respondent_questions(text)
+    section_structure = extract_requested_section_structure(text)
     lowered = text.lower()
 
     requirement_lines: list[str] = []
     if question_count:
         requirement_lines.append(
             f"- Generate {question_count} required multiple-choice questions."
+        )
+        requirement_lines.append(
+            f"- Pass expected_question_count={question_count} to create_form_with_response_sheet."
         )
     if "thai" in lowered or "ภาษาไทย" in lowered:
         requirement_lines.append("- Write the form and questions in Thai.")
@@ -385,9 +594,6 @@ def compress_form_creation_request(text: str) -> str:
         requirement_lines.append("- Do not collect email addresses.")
     if "do not include personal information" in lowered or "do not add personal information" in lowered:
         requirement_lines.append("- Do not include personal information fields.")
-    if "companion google sheet" in lowered or "response sheet" in lowered:
-        requirement_lines.append("- Create and link a companion Google Sheet for responses.")
-
     topic_lines: list[str] = []
     for marker in (
         "related to ",
@@ -404,8 +610,12 @@ def compress_form_creation_request(text: str) -> str:
         "FORM_CREATION_TASK",
         "This is a Google Form creation request.",
         (
+            "Available local form tools in this agent: create_form_with_response_sheet "
+            "and list_google_forms."
+        ),
+        (
             "Use tools. Prefer one create_form_with_response_sheet call with title, "
-            "description, and questions_json when enough details are available."
+            "description, and questions_text when enough details are available."
         ),
     ]
     if title:
@@ -416,14 +626,52 @@ def compress_form_creation_request(text: str) -> str:
         sections.append("Requirements:")
         sections.extend(requirement_lines)
         sections.extend(topic_lines)
+    if respondent_questions:
+        sections.append(
+            "Respondent information questions explicitly requested by the user. Preserve these first and in this order:"
+        )
+        sections.append(json.dumps(respondent_questions, ensure_ascii=False))
+        sections.append(
+            "Pass that exact list in respondent_questions_json when calling create_form_with_response_sheet."
+        )
+    if section_structure:
+        sections.append(
+            "Section structure explicitly requested by the user. Preserve these section titles/descriptions and pass them in section_structure_json:"
+        )
+        sections.append(json.dumps(section_structure, ensure_ascii=False))
+    sections.append("Pass the original user request in source_prompt exactly as received.")
     sections.append(
-        "If you can infer the questions, pass them in questions_json as JSON like "
-        "[{\"title\":\"...\",\"type\":\"multiple_choice\",\"required\":true,"
-        "\"options\":[\"A\",\"B\",\"C\",\"D\"]}]."
+        "If you can infer the questions, prefer questions_text in this markdown-style format:\n"
+        "### Question 1\n"
+        "- Title: ...\n"
+        "- Type: multiple_choice\n"
+        "- Required: true\n"
+        "- Description: ... (optional)\n"
+        "- Options:\n"
+        "  - A\n"
+        "  - B\n"
+        "  - C\n"
+        "  - D\n\n"
+        "### Question 2\n"
+        "- Title: ...\n"
+        "- Type: text\n"
+        "- Required: true"
     )
-    sections.append("Do not call sync_form_responses_to_sheet unless the user explicitly asks for syncing.")
+    sections.append(
+        "If you use questions_json, it must be strict JSON, but questions_text is preferred for long or complex prompts."
+    )
+    sections.append(
+        "Do not say that tools are unavailable for Google Form creation. "
+        "This request must use the available local form tools."
+    )
+    sections.append(
+        "Treat imperative prompt lines as instructions only. Do not copy lines like 'Add these required...' or 'Then generate...' into the form."
+    )
+    sections.append(
+        "Generate every requested question explicitly. Never use placeholders such as '... (13 more questions following the same pattern)'."
+    )
     sections.append("Never invent or shorten IDs like '1aBcD...'. Use only exact IDs returned by tools.")
-    sections.append("Always return the form ID, edit URL, responder URL, spreadsheet ID, and spreadsheet URL after successful creation.")
+    sections.append("Always return the form ID, edit URL, and responder URL after successful creation.")
     sections.append("If any field is missing, ask the minimum necessary clarifying question.")
     return "\n".join(sections)
 
@@ -516,6 +764,53 @@ def _load_form_sheet_links() -> dict[str, dict[str, Any]]:
     }
 
 
+def _load_apps_script_config() -> dict[str, Any]:
+    """Load persisted Apps Script project metadata used for native form linking."""
+    if not GOOGLE_APPS_SCRIPT_CONFIG_PATH.exists():
+        return {}
+
+    try:
+        payload = json.loads(GOOGLE_APPS_SCRIPT_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_apps_script_config(config: dict[str, Any]) -> None:
+    """Persist Apps Script project metadata used for native form linking."""
+    GOOGLE_APPS_SCRIPT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    GOOGLE_APPS_SCRIPT_CONFIG_PATH.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _upsert_apps_script_config(details: dict[str, Any]) -> None:
+    """Insert or update persisted Apps Script metadata."""
+    existing = _load_apps_script_config()
+    existing.update(details)
+    _save_apps_script_config(existing)
+
+
+def _get_configured_apps_script_id() -> str:
+    """Return the configured Apps Script project id from env or local config."""
+    configured = os.getenv("GOOGLE_APPS_SCRIPT_PROJECT_ID", "").strip()
+    if configured:
+        return configured
+    stored = _load_apps_script_config().get("scriptId", "")
+    return str(stored).strip() if stored else ""
+
+
+def _get_configured_apps_script_deployment_id() -> str:
+    """Return the configured Apps Script deployment id from env or local config."""
+    configured = os.getenv("GOOGLE_APPS_SCRIPT_DEPLOYMENT_ID", "").strip()
+    if configured:
+        return configured
+    stored = _load_apps_script_config().get("deploymentId", "")
+    return str(stored).strip() if stored else ""
+
+
 def _save_form_sheet_links(links: dict[str, dict[str, Any]]) -> None:
     """Persist the local registry of form-to-sheet links."""
     FORM_SHEET_LINKS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -592,6 +887,399 @@ def _build_drive_service() -> Any:
         credentials=credentials,
         cache_discovery=False,
     )
+
+
+def _build_apps_script_service() -> Any:
+    """Create a Google Apps Script API client."""
+    credentials = _load_google_workspace_credentials()
+    return build_google_api(
+        "script",
+        "v1",
+        credentials=credentials,
+        cache_discovery=False,
+    )
+
+
+def _apps_script_project_url(script_id: str) -> str:
+    """Return the Apps Script editor URL for a script project."""
+    return f"https://script.google.com/home/projects/{script_id}/edit"
+
+
+def _build_native_linker_script_files() -> list[dict[str, Any]]:
+    """Return Apps Script files that can set a form's native Sheets destination."""
+    code_source = """
+function linkFormToSheet(formId, spreadsheetId) {
+  if (!formId || !spreadsheetId) {
+    throw new Error('formId and spreadsheetId are required.');
+  }
+
+  const form = FormApp.openById(formId);
+  form.setDestination(FormApp.DestinationType.SPREADSHEET, spreadsheetId);
+
+  return {
+    formId: form.getId(),
+    destinationId: form.getDestinationId(),
+    destinationType: String(form.getDestinationType()),
+    editUrl: form.getEditUrl(),
+  };
+}
+""".strip()
+    manifest = {
+        "timeZone": "Asia/Bangkok",
+        "exceptionLogging": "STACKDRIVER",
+        "runtimeVersion": "V8",
+        "executionApi": {"access": "MYSELF"},
+        "oauthScopes": [
+            "https://www.googleapis.com/auth/forms",
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/script.scriptapp",
+        ],
+    }
+    return [
+        {"name": "Code", "type": "SERVER_JS", "source": code_source},
+        {
+            "name": "appsscript",
+            "type": "JSON",
+            "source": json.dumps(manifest, ensure_ascii=False, indent=2),
+        },
+    ]
+
+
+def _ensure_native_linker_project(script_service: Any) -> tuple[str, bool]:
+    """Return a reusable Apps Script project id, creating one if needed."""
+    script_id = _get_configured_apps_script_id()
+    if script_id:
+        return script_id, False
+
+    response = script_service.projects().create(
+        body={"title": "Google Form Agent Native Linker"}
+    ).execute()
+    script_id = str(response.get("scriptId", "") or "").strip()
+    if not script_id:
+        raise RuntimeError("Apps Script API did not return a scriptId.")
+
+    _upsert_apps_script_config(
+        {
+            "scriptId": script_id,
+            "scriptUrl": _apps_script_project_url(script_id),
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    return script_id, True
+
+
+def _update_native_linker_project_content(script_service: Any, script_id: str) -> None:
+    """Push the native-link helper source into the Apps Script project."""
+    script_service.projects().updateContent(
+        scriptId=script_id,
+        body={"files": _build_native_linker_script_files()},
+    ).execute()
+
+
+def _create_native_linker_deployment(script_service: Any, script_id: str) -> str:
+    """Create a fresh API executable deployment for the native-link script."""
+    version = script_service.projects().versions().create(
+        scriptId=script_id,
+        body={"description": "Google Form Agent native linker runtime"},
+    ).execute()
+    version_number = version.get("versionNumber")
+    if not isinstance(version_number, int):
+        raise RuntimeError("Apps Script API did not return a valid version number.")
+
+    deployment = script_service.projects().deployments().create(
+        scriptId=script_id,
+        body={
+            "versionNumber": version_number,
+            "manifestFileName": "appsscript",
+            "description": "Google Form Agent native linker runtime",
+        },
+    ).execute()
+    deployment_id = str(deployment.get("deploymentId", "") or "").strip()
+    if not deployment_id:
+        raise RuntimeError("Apps Script API did not return a deploymentId.")
+
+    _upsert_apps_script_config(
+        {
+            "scriptId": script_id,
+            "scriptUrl": _apps_script_project_url(script_id),
+            "deploymentId": deployment_id,
+            "versionNumber": version_number,
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    return deployment_id
+
+
+def _ensure_native_linker_deployment(script_service: Any) -> dict[str, str]:
+    """Ensure an Apps Script project and API deployment exist for native linking."""
+    script_id, created = _ensure_native_linker_project(script_service)
+    _update_native_linker_project_content(script_service, script_id)
+
+    deployment_id = _get_configured_apps_script_deployment_id()
+    if not deployment_id or created:
+        deployment_id = _create_native_linker_deployment(script_service, script_id)
+
+    return {
+        "scriptId": script_id,
+        "deploymentId": deployment_id,
+        "scriptUrl": _apps_script_project_url(script_id),
+    }
+
+
+def _get_shared_native_linker_runtime() -> dict[str, str]:
+    """Return the shared Apps Script runtime configuration for native linking."""
+    script_id = _get_configured_apps_script_id()
+    deployment_id = _get_configured_apps_script_deployment_id()
+    if not script_id or not deployment_id:
+        return {}
+    return {
+        "scriptId": script_id,
+        "deploymentId": deployment_id,
+        "scriptUrl": _apps_script_project_url(script_id),
+    }
+
+
+def _get_native_link_webapp_config() -> dict[str, str]:
+    """Return optional shared Apps Script web app configuration for native linking."""
+    web_app_url = os.getenv("GOOGLE_APPS_SCRIPT_WEB_APP_URL", "").strip()
+    shared_secret = os.getenv("GOOGLE_APPS_SCRIPT_SHARED_SECRET", "").strip()
+    actor_email = os.getenv("GOOGLE_APPS_SCRIPT_ACTOR_EMAIL", "").strip()
+    if not web_app_url or not shared_secret or not actor_email:
+        return {}
+    return {
+        "webAppUrl": web_app_url,
+        "sharedSecret": shared_secret,
+        "actorEmail": actor_email,
+    }
+
+
+def _share_drive_file_with_actor(file_id: str, actor_email: str) -> None:
+    """Grant the configured Apps Script actor access to a Drive file."""
+    drive_service = _build_drive_service()
+    drive_service.permissions().create(
+        fileId=file_id,
+        sendNotificationEmail=False,
+        body={
+            "type": "user",
+            "role": "writer",
+            "emailAddress": actor_email,
+        },
+    ).execute()
+
+
+def _share_native_link_targets_with_actor(form_id: str, spreadsheet_id: str, actor_email: str) -> None:
+    """Share both form and spreadsheet with the shared Apps Script actor account."""
+    _share_drive_file_with_actor(form_id, actor_email)
+    _share_drive_file_with_actor(spreadsheet_id, actor_email)
+
+
+def _link_form_to_sheet_via_webapp(
+    form_id: str,
+    spreadsheet_id: str,
+    web_app_url: str,
+    shared_secret: str,
+) -> dict[str, Any]:
+    """Call a shared Apps Script web app that performs native form-to-sheet linking."""
+    payload = json.dumps(
+        {
+            "secret": shared_secret,
+            "formId": form_id,
+            "spreadsheetId": spreadsheet_id,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = urllib_request.Request(
+        web_app_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=60) as response:
+            raw_body = response.read().decode("utf-8", errors="replace")
+    except urllib_error.HTTPError as exc:
+        raw_body = exc.read().decode("utf-8", errors="replace")
+        return {
+            "ok": False,
+            "status": "native-link-webapp-http-error",
+            "error": f"Apps Script web app returned HTTP {exc.code}: {raw_body}",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "native-link-webapp-error",
+            "error": str(exc),
+        }
+
+    try:
+        result = json.loads(raw_body)
+    except json.JSONDecodeError:
+        return {
+            "ok": False,
+            "status": "native-link-webapp-invalid-response",
+            "error": f"Apps Script web app returned non-JSON content: {raw_body}",
+        }
+
+    destination_id = str(result.get("destinationId", "") or "").strip()
+    success = bool(result.get("ok")) and destination_id == spreadsheet_id
+    return {
+        "ok": success,
+        "status": "linked" if success else str(result.get("status", "") or "native-link-webapp-failed"),
+        "destinationId": destination_id,
+        "destinationType": str(result.get("destinationType", "") or "").strip(),
+        "editUrl": str(result.get("editUrl", "") or "").strip(),
+        "raw": result,
+        "webAppUrl": web_app_url,
+    }
+
+
+def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str, Any]:
+    """Attempt to set the form's native Google Sheets response destination."""
+    web_app_config = _get_native_link_webapp_config()
+    if web_app_config:
+        try:
+            _share_native_link_targets_with_actor(
+                form_id=form_id,
+                spreadsheet_id=spreadsheet_id,
+                actor_email=web_app_config["actorEmail"],
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "native-link-share-failed",
+                "error": str(exc),
+                "guidance": (
+                    "The backend could not share the created form and sheet with the shared "
+                    "Apps Script actor account required for web-app-based native linking."
+                ),
+            }
+
+        webapp_result = _link_form_to_sheet_via_webapp(
+            form_id=form_id,
+            spreadsheet_id=spreadsheet_id,
+            web_app_url=web_app_config["webAppUrl"],
+            shared_secret=web_app_config["sharedSecret"],
+        )
+        if webapp_result.get("ok"):
+            webapp_result["mode"] = "web-app"
+            return webapp_result
+
+    granted_scopes = load_shared_google_oauth_scopes()
+    required_scopes = {
+        "https://www.googleapis.com/auth/forms",
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/script.projects",
+        "https://www.googleapis.com/auth/script.deployments",
+        "https://www.googleapis.com/auth/script.scriptapp",
+    }
+    if granted_scopes and not required_scopes.issubset(granted_scopes):
+        missing_scopes = sorted(required_scopes - granted_scopes)
+        return {
+            "ok": False,
+            "status": "reauthorize-required",
+            "error": "Shared Google OAuth token is missing Apps Script scopes.",
+            "guidance": (
+                "Disconnect and reconnect Google in the web UI so the backend receives the new "
+                "Apps Script scopes required for native Google Forms response linking."
+            ),
+            "missingScopes": missing_scopes,
+        }
+
+    if web_app_config:
+        return {
+            **webapp_result,
+            "mode": "web-app",
+            "guidance": (
+                str(webapp_result.get("guidance", "") or "").strip()
+                or "Shared Apps Script web app native linking failed."
+            ),
+        }
+
+    runtime = _get_shared_native_linker_runtime()
+    if not runtime:
+        return {
+            "ok": False,
+            "status": "shared-runtime-required",
+            "error": (
+                "Shared Apps Script runtime is not configured for native Google Forms linking."
+            ),
+            "guidance": (
+                "Create one shared Apps Script project, switch it to the same standard Google "
+                "Cloud project as this app's OAuth client, deploy it as an API executable, and "
+                "set GOOGLE_APPS_SCRIPT_PROJECT_ID plus GOOGLE_APPS_SCRIPT_DEPLOYMENT_ID."
+            ),
+        }
+
+    script_service = _build_apps_script_service()
+
+    try:
+        response = script_service.scripts().run(
+            scriptId=runtime["deploymentId"],
+            body={
+                "function": "linkFormToSheet",
+                "parameters": [form_id, spreadsheet_id],
+            },
+        ).execute()
+    except HttpError as exc:  # pragma: no cover - depends on Google API runtime
+        message = _describe_apps_script_http_error(exc)
+        guidance = (
+            "Native linking requires the configured shared Apps Script API executable to use "
+            "the same standard Google Cloud project as this app's OAuth client, with the Apps "
+            "Script API enabled. Reconnect Google after adding the new script scopes if needed."
+        )
+        return {
+            "ok": False,
+            "status": "native-link-failed",
+            "error": message,
+            "guidance": guidance,
+            "scriptId": runtime["scriptId"],
+            "deploymentId": runtime["deploymentId"],
+            "scriptUrl": runtime["scriptUrl"],
+        }
+    except Exception as exc:  # pragma: no cover - depends on Google API runtime
+        message = str(exc)
+        guidance = (
+            "Native linking requires an Apps Script API executable that shares the same "
+            "standard Google Cloud project as this app's OAuth client, with the Apps Script "
+            "API enabled. Reconnect Google after adding the new script scopes if needed."
+        )
+        return {
+            "ok": False,
+            "status": "native-link-failed",
+            "error": message,
+            "guidance": guidance,
+            "scriptId": runtime["scriptId"],
+            "deploymentId": runtime["deploymentId"],
+            "scriptUrl": runtime["scriptUrl"],
+        }
+
+    if isinstance(response, dict) and response.get("error"):
+        return {
+            "ok": False,
+            "status": "native-link-failed",
+            "error": json.dumps(response.get("error"), ensure_ascii=False),
+            "guidance": (
+                "The Apps Script runtime executed but did not complete the native link. "
+                "Verify the script project's Cloud project setup and OAuth scopes."
+            ),
+            "scriptId": runtime["scriptId"],
+            "deploymentId": runtime["deploymentId"],
+            "scriptUrl": runtime["scriptUrl"],
+        }
+
+    result = response.get("response", {}).get("result", {}) if isinstance(response, dict) else {}
+    destination_id = str(result.get("destinationId", "") or "").strip()
+    return {
+        "ok": destination_id == spreadsheet_id,
+        "status": "linked" if destination_id == spreadsheet_id else "mismatch",
+        "scriptId": runtime["scriptId"],
+        "deploymentId": runtime["deploymentId"],
+        "scriptUrl": runtime["scriptUrl"],
+        "destinationId": destination_id,
+        "destinationType": str(result.get("destinationType", "") or "").strip(),
+        "editUrl": str(result.get("editUrl", "") or "").strip(),
+        "raw": result,
+    }
 
 
 def _extract_form_question_map(form_payload: dict[str, Any]) -> list[dict[str, str]]:
@@ -697,10 +1385,12 @@ def _parse_questions_json(questions_json: str) -> list[dict[str, Any]]:
         try:
             payload = ast.literal_eval(raw_payload)
         except (ValueError, SyntaxError) as literal_exc:
-            raise RuntimeError(
-                "questions_json must be valid JSON or a Python-style list/dict literal: "
-                f"{exc}"
-            ) from literal_exc
+            payload = _recover_question_payload(raw_payload)
+            if payload is None:
+                raise RuntimeError(
+                    "questions_json must be valid JSON or a Python-style list/dict literal: "
+                    f"{exc}"
+                ) from literal_exc
 
     if isinstance(payload, dict):
         questions = payload.get("questions", [])
@@ -714,26 +1404,351 @@ def _parse_questions_json(questions_json: str) -> list[dict[str, Any]]:
     for index, raw_question in enumerate(questions, start=1):
         if not isinstance(raw_question, dict):
             raise RuntimeError(f"Question {index} must be a JSON object.")
-
-        title = str(raw_question.get("title", "") or "").strip()
-        if not title:
-            raise RuntimeError(f"Question {index} is missing a title.")
-
-        question_type = str(raw_question.get("type", "multiple_choice") or "multiple_choice").strip().lower()
-        required = bool(raw_question.get("required", True))
-        options = raw_question.get("options", [])
-        help_text = str(raw_question.get("description", "") or raw_question.get("help_text", "") or "").strip()
-
-        normalized = {
-            "title": title,
-            "type": question_type,
-            "required": required,
-            "options": options if isinstance(options, list) else [],
-            "description": help_text,
-        }
-        normalized_questions.append(normalized)
+        normalized_questions.append(_normalize_question_dict(raw_question, index))
 
     return normalized_questions
+
+
+def _normalize_question_dict(raw_question: dict[str, Any], index: int) -> dict[str, Any]:
+    """Normalize one question dictionary into the internal shape."""
+    title = str(raw_question.get("title", "") or "").strip()
+    if not title:
+        raise RuntimeError(f"Question {index} is missing a title.")
+
+    question_type = str(
+        raw_question.get("type", "multiple_choice") or "multiple_choice"
+    ).strip().lower()
+    required = bool(raw_question.get("required", True))
+    options = raw_question.get("options", [])
+    help_text = str(
+        raw_question.get("description", "") or raw_question.get("help_text", "") or ""
+    ).strip()
+
+    return {
+        "title": title,
+        "type": question_type,
+        "required": required,
+        "options": options if isinstance(options, list) else [],
+        "description": help_text,
+    }
+
+
+def _parse_questions_text(questions_text: str) -> list[dict[str, Any]]:
+    """Parse a plain-text question specification into structured questions."""
+    raw_text = questions_text.strip()
+    if not raw_text:
+        return []
+
+    normalized_text = raw_text.replace("\r\n", "\n")
+    blocks = re.split(r"\n\s*---+\s*\n|\n\s*\n", normalized_text)
+    questions: list[dict[str, Any]] = []
+
+    for block in blocks:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+
+        question: dict[str, Any] = {
+            "type": "multiple_choice",
+            "required": True,
+            "options": [],
+            "description": "",
+        }
+
+        for line in lines:
+            lowered = line.lower()
+            if lowered.startswith("question:"):
+                question["title"] = line.split(":", 1)[1].strip()
+                continue
+            if lowered.startswith("title:"):
+                question["title"] = line.split(":", 1)[1].strip()
+                continue
+            if lowered.startswith("type:"):
+                question["type"] = line.split(":", 1)[1].strip().lower()
+                continue
+            if lowered.startswith("required:"):
+                value = line.split(":", 1)[1].strip().lower()
+                question["required"] = value not in {"false", "no", "0"}
+                continue
+            if lowered.startswith("description:") or lowered.startswith("help_text:"):
+                question["description"] = line.split(":", 1)[1].strip()
+                continue
+            if lowered.startswith("option:"):
+                option = line.split(":", 1)[1].strip()
+                if option and not _is_placeholder_content(option):
+                    question["options"].append(option)
+                continue
+            bullet_match = re.match(r"^((?:[-*]|\d+[.)]|[A-Za-z][.)]|[ก-ฮ][.)]))\s+(.+)$", line)
+            if bullet_match:
+                option = bullet_match.group(2).strip()
+                if option and not _is_placeholder_content(option):
+                    question["options"].append(option)
+                continue
+            if "title" not in question and not _is_instructional_prompt_line(line):
+                question["title"] = line
+
+        if "title" not in question or not str(question["title"]).strip():
+            continue
+        questions.append(_normalize_question_dict(question, len(questions) + 1))
+
+    return questions
+
+
+def _parse_questions_text_rich(questions_text: str) -> list[dict[str, Any]]:
+    """Parse a human-readable markdown/plain-text question specification."""
+    raw_text = questions_text.strip()
+    if not raw_text:
+        return []
+
+    normalized_text = raw_text.replace("\r\n", "\n")
+    heading_blocks = re.split(
+        r"\n(?=#{1,6}\s*(?:question|q(?:uestion)?\s*\d+))",
+        normalized_text,
+        flags=re.IGNORECASE,
+    )
+    blocks = (
+        heading_blocks
+        if len(heading_blocks) > 1
+        else re.split(r"\n\s*---+\s*\n|\n\s*\n", normalized_text)
+    )
+    questions: list[dict[str, Any]] = []
+
+    for block in blocks:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+
+        question: dict[str, Any] = {
+            "type": "multiple_choice",
+            "required": True,
+            "options": [],
+            "description": "",
+        }
+        collecting_options = False
+
+        for line in lines:
+            cleaned_line = re.sub(r"^#{1,6}\s*", "", line).strip()
+            if re.match(
+                r"^(?:question|q(?:uestion)?\s*\d+)\b",
+                cleaned_line,
+                re.IGNORECASE,
+            ):
+                title_after_colon = cleaned_line.split(":", 1)
+                if len(title_after_colon) == 2 and title_after_colon[1].strip():
+                    question["title"] = title_after_colon[1].strip()
+                collecting_options = False
+                continue
+
+            normalized_line = re.sub(r"^[-*]\s*", "", cleaned_line).strip()
+            lowered = normalized_line.lower()
+
+            if lowered.startswith("question:"):
+                title_value = normalized_line.split(":", 1)[1].strip()
+                if title_value and not _is_instructional_prompt_line(title_value):
+                    question["title"] = title_value
+                collecting_options = False
+                continue
+            if lowered.startswith("title:"):
+                title_value = normalized_line.split(":", 1)[1].strip()
+                if title_value and not _is_instructional_prompt_line(title_value):
+                    question["title"] = title_value
+                collecting_options = False
+                continue
+            if lowered.startswith("type:"):
+                question["type"] = normalized_line.split(":", 1)[1].strip().lower()
+                collecting_options = False
+                continue
+            if lowered.startswith("required:"):
+                value = normalized_line.split(":", 1)[1].strip().lower()
+                question["required"] = value not in {"false", "no", "0"}
+                collecting_options = False
+                continue
+            if lowered.startswith("description:") or lowered.startswith("help_text:"):
+                description_value = normalized_line.split(":", 1)[1].strip()
+                if description_value and not _is_instructional_prompt_line(description_value):
+                    question["description"] = description_value
+                collecting_options = False
+                continue
+            if lowered.startswith("option:"):
+                option = normalized_line.split(":", 1)[1].strip()
+                if option and not _is_placeholder_content(option):
+                    question["options"].append(option)
+                collecting_options = False
+                continue
+            if lowered.startswith("options:"):
+                collecting_options = True
+                continue
+
+            bullet_match = re.match(
+                r"^((?:[-*]|\d+[.)]|[A-Za-z][.)]|[\u0E01-\u0E2E][.)]))\s+(.+)$",
+                cleaned_line,
+            )
+            if bullet_match:
+                option = bullet_match.group(2).strip()
+                if option and collecting_options and not _is_placeholder_content(option):
+                    question["options"].append(option)
+                    continue
+                if option and "title" not in question and not _is_instructional_prompt_line(option):
+                    question["title"] = option
+                    continue
+
+            if collecting_options:
+                option = normalized_line.strip()
+                if option and not _is_placeholder_content(option):
+                    question["options"].append(option)
+                    continue
+
+            if "title" not in question and not _is_instructional_prompt_line(normalized_line):
+                question["title"] = normalized_line
+
+        if "title" not in question or not str(question["title"]).strip():
+            continue
+        questions.append(_normalize_question_dict(question, len(questions) + 1))
+
+    return questions
+
+
+def _parse_questions_input(questions_json: str, questions_text: str) -> list[dict[str, Any]]:
+    """Parse questions from structured JSON first, then plain-text fallback."""
+    if questions_json.strip():
+        try:
+            return _parse_questions_json(questions_json)
+        except RuntimeError:
+            fallback_text = questions_text.strip() or questions_json
+            parsed_fallback = _parse_questions_text_rich(fallback_text)
+            if parsed_fallback:
+                return parsed_fallback
+            raise
+    return _parse_questions_text_rich(questions_text)
+
+
+def _parse_respondent_questions_input(respondent_questions_json: str) -> list[dict[str, Any]]:
+    """Parse structured respondent questions passed from the compressed prompt."""
+    payload = respondent_questions_json.strip()
+    if not payload:
+        return []
+
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        try:
+            parsed = ast.literal_eval(payload)
+        except (ValueError, SyntaxError) as exc:
+            raise RuntimeError(
+                f"respondent_questions_json must be valid JSON or Python-style list literal: {exc}"
+            ) from exc
+
+    if not isinstance(parsed, list):
+        raise RuntimeError("respondent_questions_json must be a list of question objects.")
+
+    return [
+        _normalize_question_dict(question, index)
+        for index, question in enumerate(parsed, start=1)
+        if isinstance(question, dict)
+    ]
+
+
+def _parse_section_structure_input(section_structure_json: str) -> dict[str, dict[str, str]]:
+    """Parse prompt-derived section metadata passed to the tool."""
+    payload = section_structure_json.strip()
+    if not payload:
+        return {}
+
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        try:
+            parsed = ast.literal_eval(payload)
+        except (ValueError, SyntaxError) as exc:
+            raise RuntimeError(
+                f"section_structure_json must be valid JSON or Python-style dict literal: {exc}"
+            ) from exc
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError("section_structure_json must be an object keyed by section names.")
+
+    normalized: dict[str, dict[str, str]] = {}
+    for key, value in parsed.items():
+        if not isinstance(value, dict):
+            continue
+        title = str(value.get("title", "") or "").strip()
+        description = str(value.get("description", "") or "").strip()
+        if title or description:
+            normalized[str(key)] = {
+                "title": title,
+                "description": description,
+            }
+    return normalized
+
+
+def _recover_question_payload(raw_payload: str) -> list[dict[str, Any]] | dict[str, Any] | None:
+    """Best-effort recovery for malformed question payloads from local models."""
+    extracted_objects = _extract_braced_objects(raw_payload)
+    recovered_questions: list[dict[str, Any]] = []
+    for chunk in extracted_objects:
+        parsed = _parse_single_question_object(chunk)
+        if isinstance(parsed, dict):
+            recovered_questions.append(parsed)
+
+    if recovered_questions:
+        return recovered_questions
+    return None
+
+
+def _extract_braced_objects(text: str) -> list[str]:
+    """Extract top-level {...} objects from a malformed list-like payload."""
+    objects: list[str] = []
+    depth = 0
+    start_index: int | None = None
+    in_string = False
+    string_quote = ""
+    escaping = False
+
+    for index, char in enumerate(text):
+        if in_string:
+            if escaping:
+                escaping = False
+            elif char == "\\":
+                escaping = True
+            elif char == string_quote:
+                in_string = False
+            continue
+
+        if char in {"'", '"'}:
+            in_string = True
+            string_quote = char
+            continue
+
+        if char == "{":
+            if depth == 0:
+                start_index = index
+            depth += 1
+            continue
+
+        if char == "}":
+            if depth == 0:
+                continue
+            depth -= 1
+            if depth == 0 and start_index is not None:
+                objects.append(text[start_index : index + 1])
+                start_index = None
+
+    return objects
+
+
+def _parse_single_question_object(chunk: str) -> dict[str, Any] | None:
+    """Parse a single recovered question object chunk."""
+    try:
+        parsed = json.loads(chunk)
+    except json.JSONDecodeError:
+        try:
+            parsed = ast.literal_eval(chunk)
+        except (ValueError, SyntaxError):
+            return None
+
+    if isinstance(parsed, dict):
+        return parsed
+    return None
 
 
 def _build_form_item(question: dict[str, Any]) -> dict[str, Any]:
@@ -744,6 +1759,10 @@ def _build_form_item(question: dict[str, Any]) -> dict[str, Any]:
     description = str(question.get("description", "") or "").strip()
     if description:
         item["description"] = description
+
+    if question_type in {"section", "section_break", "page_break"}:
+        item["pageBreakItem"] = {}
+        return item
 
     if question_type in {"multiple_choice", "multiple-choice", "radio"}:
         options = [str(option).strip() for option in question.get("options", []) if str(option).strip()]
@@ -799,6 +1818,68 @@ def _build_form_item(question: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _ensure_default_respondent_questions(
+    title: str,
+    description: str,
+    questions: list[dict[str, Any]],
+    respondent_questions: list[dict[str, Any]],
+    section_structure: dict[str, dict[str, str]],
+) -> list[dict[str, Any]]:
+    """Ensure explicitly requested respondent questions stay first and in order."""
+    if not respondent_questions:
+        return questions
+
+    respondent_titles = {
+        str(question["title"]).strip().casefold(): question
+        for question in respondent_questions
+    }
+    existing_by_title = {
+        str(question.get("title", "") or "").strip().casefold(): question
+        for question in questions
+        if isinstance(question, dict)
+    }
+
+    resolved_respondent_questions = [
+        existing_by_title.get(
+            str(default_question["title"]).strip().casefold(),
+            default_question,
+        )
+        for default_question in respondent_questions
+    ]
+    remaining_questions = [
+        question
+        for question in questions
+        if str(question.get("title", "") or "").strip().casefold()
+        not in respondent_titles
+    ]
+    merged_questions: list[dict[str, Any]] = []
+
+    section_one_meta = section_structure.get("section_1", {})
+    section_two_meta = section_structure.get("section_2", {})
+
+    if section_one_meta.get("title"):
+        merged_questions.append(
+            {
+                "title": section_one_meta["title"],
+                "type": "section",
+                "required": False,
+                "description": section_one_meta.get("description", ""),
+            }
+        )
+    merged_questions.extend(resolved_respondent_questions)
+    if section_two_meta.get("title"):
+        merged_questions.append(
+            {
+                "title": section_two_meta["title"],
+                "type": "section",
+                "required": False,
+                "description": section_two_meta.get("description", ""),
+            }
+        )
+    merged_questions.extend(remaining_questions)
+    return merged_questions
+
+
 def _apply_form_batch_updates(
     forms_service: Any,
     form_id: str,
@@ -837,20 +1918,351 @@ def _apply_form_batch_updates(
     ).execute()
 
 
+def _count_non_section_questions(questions: list[dict[str, Any]]) -> int:
+    """Count actual form questions, excluding section/page breaks."""
+    return sum(
+        1
+        for question in questions
+        if str(question.get("type", "") or "").strip().lower()
+        not in {"section", "section_break", "page_break"}
+    )
+
+
+def _generate_missing_questions(
+    title: str,
+    description: str,
+    existing_questions: list[dict[str, Any]],
+    respondent_questions: list[dict[str, Any]],
+    missing_count: int,
+    source_prompt: str = "",
+) -> list[dict[str, Any]]:
+    """Generate any missing main questions using the configured chat model."""
+    if missing_count <= 0:
+        return []
+
+    respondent_titles = {
+        str(question.get("title", "") or "").strip().casefold()
+        for question in respondent_questions
+    }
+    existing_main_titles = [
+        str(question.get("title", "") or "").strip()
+        for question in existing_questions
+        if str(question.get("type", "") or "").strip().lower()
+        not in {"section", "section_break", "page_break"}
+        and str(question.get("title", "") or "").strip().casefold()
+        not in respondent_titles
+    ]
+
+    model = build_chat_model()
+    response = model.invoke(
+        [
+            SystemMessage(
+                content=(
+                    "You generate missing Google Form questions. "
+                    "Return only question blocks in markdown. "
+                    "Do not include explanations, notes, placeholders, or summaries. "
+                    "Every question must be complete."
+                )
+            ),
+            HumanMessage(
+                content=(
+                    (
+                        f"Original user brief:\n{source_prompt.strip()}\n\n"
+                        if source_prompt.strip()
+                        else ""
+                    )
+                    +
+                    f"Form title: {title.strip()}\n"
+                    f"Form description:\n{description.strip()}\n\n"
+                    f"Need exactly {missing_count} additional main questions.\n"
+                    "Write them in Thai.\n"
+                    "Every question must be multiple_choice.\n"
+                    "Every question must be required.\n"
+                    "Every question must have exactly 4 answer choices.\n"
+                    "Do not repeat these existing main question titles:\n"
+                    + "\n".join(f"- {question_title}" for question_title in existing_main_titles)
+                    + "\n\n"
+                    "Return only in this format:\n"
+                    "### Question 1\n"
+                    "- Title: ...\n"
+                    "- Type: multiple_choice\n"
+                    "- Required: true\n"
+                    "- Options:\n"
+                    "  - ...\n"
+                    "  - ...\n"
+                    "  - ...\n"
+                    "  - ...\n\n"
+                    "Continue until all requested questions are produced."
+                )
+            ),
+        ]
+    )
+
+    generated_text = content_to_text(response.content).strip()
+    generated_questions = _parse_questions_text_rich(generated_text)
+    filtered_questions: list[dict[str, Any]] = []
+    seen_titles = {title.casefold() for title in existing_main_titles}
+    for question in generated_questions:
+        question_title = str(question.get("title", "") or "").strip()
+        if not question_title or question_title.casefold() in seen_titles:
+            continue
+        if str(question.get("type", "") or "").strip().lower() not in {
+            "multiple_choice",
+            "multiple-choice",
+            "radio",
+        }:
+            continue
+        options = [
+            str(option).strip()
+            for option in question.get("options", [])
+            if str(option).strip()
+        ]
+        if len(options) < 4:
+            continue
+        normalized_question = dict(question)
+        normalized_question["options"] = options[:4]
+        filtered_questions.append(normalized_question)
+        seen_titles.add(question_title.casefold())
+        if len(filtered_questions) >= missing_count:
+            break
+
+    return filtered_questions
+
+
+def _generate_full_question_set_from_brief(
+    title: str,
+    description: str,
+    source_prompt: str,
+    respondent_questions: list[dict[str, Any]],
+    expected_question_count: int,
+) -> list[dict[str, Any]]:
+    """Generate a complete main-question set from the original prompt when partial content is unusable."""
+    if expected_question_count <= 0:
+        return []
+
+    model = build_chat_model()
+    respondent_titles = "\n".join(
+        f"- {str(question.get('title', '')).strip()}"
+        for question in respondent_questions
+        if str(question.get("title", "")).strip()
+    )
+    response = model.invoke(
+        [
+            SystemMessage(
+                content=(
+                    "You generate complete Google Form quiz questions. "
+                    "Return only question blocks in markdown. "
+                    "Do not include explanations, notes, placeholders, or summaries."
+                )
+            ),
+            HumanMessage(
+                content=(
+                    f"Original user brief:\n{source_prompt.strip() or title.strip()}\n\n"
+                    f"Form title: {title.strip()}\n"
+                    f"Form description:\n{description.strip()}\n\n"
+                    f"Need exactly {expected_question_count} main questions.\n"
+                    "Write them in Thai.\n"
+                    "Every question must be multiple_choice.\n"
+                    "Every question must be required.\n"
+                    "Every question must have exactly 4 answer choices.\n"
+                    "Do not include respondent information questions in this set.\n"
+                    + (
+                        f"Respondent information fields already handled separately:\n{respondent_titles}\n\n"
+                        if respondent_titles
+                        else ""
+                    )
+                    + "Return only in this format:\n"
+                    "### Question 1\n"
+                    "- Title: ...\n"
+                    "- Type: multiple_choice\n"
+                    "- Required: true\n"
+                    "- Options:\n"
+                    "  - ...\n"
+                    "  - ...\n"
+                    "  - ...\n"
+                    "  - ...\n\n"
+                    "Continue until all requested questions are produced."
+                )
+            ),
+        ]
+    )
+
+    generated_text = content_to_text(response.content).strip()
+    generated_questions = _parse_questions_text_rich(generated_text)
+    main_questions: list[dict[str, Any]] = []
+    seen_titles: set[str] = set()
+    respondent_title_keys = {
+        str(question.get("title", "") or "").strip().casefold()
+        for question in respondent_questions
+    }
+    for question in generated_questions:
+        question_title = str(question.get("title", "") or "").strip()
+        if not question_title:
+            continue
+        lowered_title = question_title.casefold()
+        if lowered_title in respondent_title_keys or lowered_title in seen_titles:
+            continue
+        options = [
+            str(option).strip()
+            for option in question.get("options", [])
+            if str(option).strip()
+        ]
+        if len(options) < 4:
+            continue
+        normalized_question = dict(question)
+        normalized_question["options"] = options[:4]
+        main_questions.append(normalized_question)
+        seen_titles.add(lowered_title)
+        if len(main_questions) >= expected_question_count:
+            break
+
+    return main_questions
+
+
+def _cleanup_created_workspace_files(file_ids: list[str]) -> None:
+    """Best-effort cleanup for newly created Drive files when creation must abort."""
+    valid_ids = [file_id.strip() for file_id in file_ids if isinstance(file_id, str) and file_id.strip()]
+    if not valid_ids:
+        return
+
+    drive_service = _build_drive_service()
+    for file_id in valid_ids:
+        try:
+            drive_service.files().delete(fileId=file_id).execute()
+        except Exception:
+            continue
+
+
+def _raise_google_api_connectivity_error(exc: ServerNotFoundError) -> None:
+    """Raise a friendlier error when the container cannot resolve Google API hosts."""
+    message = str(exc)
+    if "googleapis.com" in message:
+        raise RuntimeError(
+            "The backend container could not resolve a Google API hostname "
+            f"({message}). This is usually a Docker DNS/network issue, not a form bug. "
+            "Rebuild and restart with the updated docker-compose DNS settings, then retry."
+        ) from exc
+    raise RuntimeError(message) from exc
+
+
+def _describe_apps_script_http_error(exc: HttpError) -> str:
+    """Convert common Apps Script API failures into a short actionable message."""
+    status = getattr(exc.resp, "status", None)
+    details: Any = {}
+    message = str(exc)
+    activation_url = ""
+
+    try:
+        details = json.loads(exc.content.decode("utf-8"))
+    except Exception:
+        details = {}
+
+    if isinstance(details, dict):
+        error_payload = details.get("error", {})
+        if isinstance(error_payload, dict):
+            api_message = error_payload.get("message")
+            if isinstance(api_message, str) and api_message.strip():
+                message = api_message.strip()
+            for item in error_payload.get("details", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                for link in item.get("links", []) or []:
+                    if isinstance(link, dict) and isinstance(link.get("url"), str):
+                        activation_url = link["url"].strip()
+                        break
+                if activation_url:
+                    break
+
+    if status == 403 and (
+        "Apps Script API has not been used" in message
+        or "SERVICE_DISABLED" in str(details)
+        or "script.googleapis.com" in message
+    ):
+        guidance = (
+            "Enable the Apps Script API for the Google Cloud project used by your OAuth client, "
+            "wait a few minutes, then retry."
+        )
+        if activation_url:
+            guidance += f" Open this URL: {activation_url}"
+        return f"{message} {guidance}"
+
+    return message
+
+
 @tool
 def create_form_with_response_sheet(
     title: str,
     description: str = "",
-    spreadsheet_title: str = "",
     questions_json: str = "",
+    questions_text: str = "",
+    respondent_questions_json: str = "",
+    section_structure_json: str = "",
+    expected_question_count: int = 0,
+    source_prompt: str = "",
 ) -> str:
-    """Create a Google Form, optionally add description/questions, and create a companion Google Sheet."""
+    """Create a Google Form and optionally add description/questions."""
     if not title.strip():
         raise RuntimeError("title is required")
 
     forms_service = _build_forms_service()
-    sheets_service = _build_sheets_service()
-    questions = _parse_questions_json(questions_json)
+    normalized_source_prompt = source_prompt.strip()
+    inferred_question_count = extract_question_count(normalized_source_prompt) if normalized_source_prompt else None
+    effective_expected_question_count = expected_question_count or inferred_question_count or 0
+
+    questions = _parse_questions_input(questions_json, questions_text)
+    respondent_questions = _parse_respondent_questions_input(respondent_questions_json)
+    if not respondent_questions and normalized_source_prompt:
+        respondent_questions = extract_requested_respondent_questions(normalized_source_prompt)
+    section_structure = _parse_section_structure_input(section_structure_json)
+    if not section_structure and normalized_source_prompt:
+        section_structure = extract_requested_section_structure(normalized_source_prompt)
+
+    if (
+        effective_expected_question_count > 0
+        and _count_non_section_questions(questions) - len(respondent_questions) < effective_expected_question_count
+        and normalized_source_prompt
+    ):
+        regenerated_main_questions = _generate_full_question_set_from_brief(
+            title=title,
+            description=description,
+            source_prompt=normalized_source_prompt,
+            respondent_questions=respondent_questions,
+            expected_question_count=effective_expected_question_count,
+        )
+        if regenerated_main_questions:
+            questions = regenerated_main_questions
+
+    questions = _ensure_default_respondent_questions(
+        title,
+        description,
+        questions,
+        respondent_questions,
+        section_structure,
+    )
+    if effective_expected_question_count > 0:
+        actual_main_question_count = (
+            _count_non_section_questions(questions) - len(respondent_questions)
+        )
+        if actual_main_question_count < effective_expected_question_count:
+            missing_questions = _generate_missing_questions(
+                title=title,
+                description=description,
+                existing_questions=questions,
+                respondent_questions=respondent_questions,
+                missing_count=effective_expected_question_count - actual_main_question_count,
+                source_prompt=normalized_source_prompt,
+            )
+            questions.extend(missing_questions)
+            actual_main_question_count = (
+                _count_non_section_questions(questions) - len(respondent_questions)
+            )
+            if actual_main_question_count < effective_expected_question_count:
+                raise RuntimeError(
+                    "Generated form content is incomplete: "
+                    f"expected {effective_expected_question_count} main questions, "
+                    f"but only received {actual_main_question_count}. "
+                    "Generate every requested question explicitly and do not use placeholders."
+                )
     form_body = {
         "info": {
             "title": title.strip(),
@@ -871,34 +2283,6 @@ def create_form_with_response_sheet(
 
     responder_uri = form_response.get("responderUri", "")
     edit_uri = f"https://docs.google.com/forms/d/{form_id}/edit"
-    sheet_title = spreadsheet_title.strip() or f"{title.strip()} Responses"
-    spreadsheet_response = sheets_service.spreadsheets().create(
-        body={
-            "properties": {"title": sheet_title},
-            "sheets": [{"properties": {"title": "Responses"}}],
-        }
-    ).execute()
-    spreadsheet_id = spreadsheet_response.get("spreadsheetId", "")
-    spreadsheet_url = spreadsheet_response.get("spreadsheetUrl", "")
-    if not spreadsheet_id:
-        raise RuntimeError("Google Sheets API did not return a spreadsheetId.")
-
-    _upsert_form_sheet_link(
-        form_id,
-        {
-            "formId": form_id,
-            "formUrl": edit_uri,
-            "editUrl": edit_uri,
-            "title": title.strip(),
-            "description": description.strip(),
-            "responderUri": responder_uri,
-            "responseUrl": responder_uri,
-            "spreadsheetId": spreadsheet_id,
-            "spreadsheetUrl": spreadsheet_url,
-            "linkedAt": datetime.now(timezone.utc).isoformat(),
-            "syncMode": "agent-managed",
-        },
-    )
 
     return json.dumps(
         {
@@ -909,14 +2293,8 @@ def create_form_with_response_sheet(
             "description": description.strip(),
             "responderUri": responder_uri,
             "responseUrl": responder_uri,
-            "spreadsheetId": spreadsheet_id,
-            "spreadsheetUrl": spreadsheet_url,
             "questionCount": len(questions),
-            "linkMode": "agent-managed",
-            "note": (
-                "A companion response spreadsheet was created and linked in the app registry. "
-                "Use sync_form_responses_to_sheet to refresh sheet data from live form responses."
-            ),
+            "note": "Form creation no longer creates or links a Google Sheet.",
         },
         ensure_ascii=False,
         indent=2,
@@ -928,79 +2306,15 @@ def sync_form_responses_to_sheet(
     form_id: str = "",
     spreadsheet_id: str = "",
 ) -> str:
-    """Sync a form's live responses into its companion Google Sheet."""
-    normalized_form_id = form_id.strip()
-    normalized_spreadsheet_id = spreadsheet_id.strip()
-    if "..." in normalized_form_id or "..." in normalized_spreadsheet_id:
-        raise RuntimeError(
-            "Form or spreadsheet ID appears truncated or placeholder-like. Use the full exact ID returned by the create tool."
-        )
-    if not normalized_form_id and normalized_spreadsheet_id:
-        normalized_form_id = _find_form_id_by_spreadsheet_id(normalized_spreadsheet_id)
-    if not normalized_form_id and not normalized_spreadsheet_id:
-        normalized_form_id, latest_link = _get_latest_form_sheet_link()
-        normalized_spreadsheet_id = str(latest_link.get("spreadsheetId", "") or "")
-    if not normalized_form_id:
-        raise RuntimeError(
-            "form_id is required unless spreadsheet_id matches a linked form created by this app."
-        )
-
-    links = _load_form_sheet_links()
-    link = links.get(normalized_form_id, {})
-    target_spreadsheet_id = normalized_spreadsheet_id or str(link.get("spreadsheetId", "") or "")
-    if not target_spreadsheet_id:
-        raise RuntimeError("No spreadsheet is linked to this form. Provide spreadsheet_id explicitly.")
-
-    forms_service = _build_forms_service()
-    sheets_service = _build_sheets_service()
-
-    form_payload = forms_service.forms().get(formId=normalized_form_id).execute()
-    responses_payload = forms_service.forms().responses().list(formId=normalized_form_id).execute()
-    rows = _build_response_rows(form_payload, responses_payload)
-
-    response_tab = "Responses"
-    sheets_service.spreadsheets().values().clear(
-        spreadsheetId=target_spreadsheet_id,
-        range=_quote_sheet_title(response_tab),
-        body={},
-    ).execute()
-    sheets_service.spreadsheets().values().update(
-        spreadsheetId=target_spreadsheet_id,
-        range=f"{_quote_sheet_title(response_tab)}!A1",
-        valueInputOption="RAW",
-        body={"values": rows},
-    ).execute()
-
-    _upsert_form_sheet_link(
-        normalized_form_id,
-        {
-            "formId": normalized_form_id,
-            "title": str(form_payload.get("info", {}).get("title", "") or ""),
-            "description": str(form_payload.get("info", {}).get("description", "") or ""),
-            "responderUri": str(form_payload.get("responderUri", "") or ""),
-            "spreadsheetId": target_spreadsheet_id,
-            "lastSyncedAt": str(form_payload.get("revisionId", "") or ""),
-            "syncMode": "agent-managed",
-        },
-    )
-
-    return json.dumps(
-        {
-            "formId": normalized_form_id,
-            "spreadsheetId": target_spreadsheet_id,
-            "responseTab": response_tab,
-            "rowCountWritten": len(rows),
-            "responseCount": max(len(rows) - 1, 0),
-            "questionCount": max(len(rows[0]) - 4, 0) if rows else 0,
-        },
-        ensure_ascii=False,
-        indent=2,
+    """Legacy compatibility tool; syncing linked sheets has been removed."""
+    raise RuntimeError(
+        "Form-to-spreadsheet linking and syncing have been removed from this app."
     )
 
 
 @tool
 def list_google_forms(query: str = "", limit: int = 20) -> str:
-    """List the user's Google Forms and include any companion response sheet tracked by this app."""
+    """List the user's Google Forms."""
     drive_service = _build_drive_service()
     normalized_limit = max(1, min(int(limit), 100))
     mime_type = "application/vnd.google-apps.form"
@@ -1016,13 +2330,11 @@ def list_google_forms(query: str = "", limit: int = 20) -> str:
         orderBy="modifiedTime desc",
     ).execute()
 
-    links = _load_form_sheet_links()
     forms: list[dict[str, Any]] = []
     for entry in response.get("files", []) or []:
         if not isinstance(entry, dict):
             continue
         form_id = str(entry.get("id", "") or "")
-        linked_sheet = links.get(form_id, {})
         forms.append(
             {
                 "formId": form_id,
@@ -1030,9 +2342,6 @@ def list_google_forms(query: str = "", limit: int = 20) -> str:
                 "editUrl": str(entry.get("webViewLink", "") or ""),
                 "createdTime": str(entry.get("createdTime", "") or ""),
                 "modifiedTime": str(entry.get("modifiedTime", "") or ""),
-                "linkedSpreadsheetId": str(linked_sheet.get("spreadsheetId", "") or ""),
-                "linkedSpreadsheetUrl": str(linked_sheet.get("spreadsheetUrl", "") or ""),
-                "linkMode": str(linked_sheet.get("syncMode", "") or ""),
             }
         )
 
@@ -1241,6 +2550,26 @@ def load_google_refresh_token() -> str | None:
     if isinstance(refresh_token, str) and refresh_token.strip():
         return refresh_token.strip()
     return None
+
+
+def load_shared_google_oauth_scopes() -> set[str]:
+    """Load granted scopes from the shared Google OAuth token file when available."""
+    token_path = get_google_oauth_token_path()
+    if not token_path.exists():
+        return set()
+
+    try:
+        payload = json.loads(token_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+    scopes = payload.get("scopes")
+    if isinstance(scopes, list):
+        return {str(scope).strip() for scope in scopes if str(scope).strip()}
+    scope = payload.get("scope")
+    if isinstance(scope, str):
+        return {item.strip() for item in scope.split(" ") if item.strip()}
+    return set()
 
 
 def has_shared_google_oauth_token() -> bool:
@@ -1946,7 +3275,6 @@ async def build_agent() -> Any:
     ]
     tools = [
         create_form_with_response_sheet,
-        sync_form_responses_to_sheet,
         list_google_forms,
         inspect_spreadsheet_for_analysis,
         *filtered_mcp_tools,

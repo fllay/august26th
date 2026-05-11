@@ -415,6 +415,7 @@ export function AssistantMessage({
 
   const aiMissingFromThread = message?.type === "ai" && messageIndex === -1;
   const isIntermediateAi = message?.type === "ai" && !isFinalAiMessage;
+  const shouldHideStreamingAi = isLoading && message?.type === "ai";
   const hasRenderableContent = contentString.trim().length > 0;
   const isThinkingOnlyContent =
     thinking.trim().length > 0 && !hasRenderableContent;
@@ -422,7 +423,8 @@ export function AssistantMessage({
     isToolResult ||
     aiMissingFromThread ||
     isIntermediateAi ||
-    (isToolCallMessage && isLoading) ||
+    shouldHideStreamingAi ||
+    isToolCallMessage ||
     isThinkingMessage ||
     isThinkingOnlyContent
   ) {

@@ -11,7 +11,6 @@ const STATE_COOKIE_NAME = "google_oauth_state";
 const SCOPES = [
   "https://www.googleapis.com/auth/forms.body",
   "https://www.googleapis.com/auth/forms.responses.readonly",
-  "https://www.googleapis.com/auth/spreadsheets",
   "https://www.googleapis.com/auth/drive",
 ];
 

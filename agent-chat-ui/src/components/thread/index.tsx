@@ -169,6 +169,10 @@ export function Thread() {
     .slice(lastHumanIndex + 1)
     .some((m) => {
       if (m.type !== "ai") return false;
+      if (isLoading) return false;
+      if ("tool_calls" in m && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+        return false;
+      }
       const content = getContentString(m.content ?? []);
       return stripThinking(content).length > 0;
     });

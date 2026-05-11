@@ -10,6 +10,9 @@ services:
       GOOGLE_OAUTH_TOKEN_PATH: /data/google-oauth.json
     ports:
       - "2024:2024"
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     volumes:
       - google_oauth_data:/data
     healthcheck:
@@ -41,6 +44,9 @@ services:
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
     ports:
       - "3000:3000"
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     volumes:
       - google_oauth_data:/data
     depends_on:
