@@ -70,6 +70,14 @@ function separateThinking(
 ): { thinking: string; rest: string; hadThinking: boolean; blocks: string[] } {
   if (!text) return { thinking: "", rest: "", hadThinking: false, blocks: [] };
   const matches = [...text.matchAll(THINKING_REGEX)];
+  if (!matches.length && /<thinking>/i.test(text)) {
+    return {
+      thinking: "",
+      rest: text.replace(/<\/?thinking>/gi, "").trim(),
+      hadThinking: false,
+      blocks: [],
+    };
+  }
   if (!matches.length) return { thinking: "", rest: text, hadThinking: false, blocks: [] };
   const thinkingParts = matches.map((match) => match[1].trim()).filter(Boolean);
   const rest = text.replace(THINKING_REGEX, "").trim();

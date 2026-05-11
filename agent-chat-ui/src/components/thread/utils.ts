@@ -15,8 +15,23 @@ export function stripHiddenUploadContext(text: string): string {
  */
 export function getContentString(content: Message["content"]): string {
   if (typeof content === "string") return stripHiddenUploadContext(content);
-  const texts = content
-    .filter((c): c is { type: "text"; text: string } => c.type === "text")
-    .map((c) => c.text);
+  if (!Array.isArray(content)) return "";
+  const texts = content.flatMap((c) => {
+    if (typeof c === "string") return [c];
+    if (!c || typeof c !== "object") return [];
+    if ("type" in c && c.type === "text" && typeof c.text === "string") {
+      return [c.text];
+    }
+    if ("text" in c && typeof c.text === "string") {
+      return [c.text];
+    }
+    if ("content" in c && typeof c.content === "string") {
+      return [c.content];
+    }
+    if ("value" in c && typeof c.value === "string") {
+      return [c.value];
+    }
+    return [];
+  });
   return stripHiddenUploadContext(texts.join(" "));
 }

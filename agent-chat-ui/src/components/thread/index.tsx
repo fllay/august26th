@@ -9,7 +9,7 @@ import type {
   Message,
   Thread as LangGraphThread,
 } from "@langchain/langgraph-sdk";
-import { AssistantMessage, AssistantMessageLoading } from "./messages/ai";
+import { AssistantMessage, AssistantMessageError, AssistantMessageLoading } from "./messages/ai";
 import { HumanMessage } from "./messages/human";
 import {
   DO_NOT_RENDER_ID_PREFIX,
@@ -157,15 +157,55 @@ export function Thread() {
     return deduped;
   }, [stream.messages]);
   const isLoading = stream.isLoading;
+  const stableMessagesRef = useRef<Message[]>([]);
+  useEffect(() => {
+    if (!isLoading) {
+      stableMessagesRef.current = messages;
+    }
+  }, [isLoading, messages]);
+  const displayMessages = useMemo(() => {
+    if (!isLoading) {
+      return messages;
+    }
+
+    const stableMessages = stableMessagesRef.current;
+    if (!stableMessages.length) {
+      return messages;
+    }
+
+    const currentById = new Map(
+      messages
+        .filter((message) => message.id)
+        .map((message) => [String(message.id), message] as const),
+    );
+    const stableIds = new Set<string>();
+    const merged = stableMessages.map((message) => {
+      const id = message.id ? String(message.id) : "";
+      if (!id) {
+        return message;
+      }
+      stableIds.add(id);
+      return currentById.get(id) ?? message;
+    });
+
+    for (const message of messages) {
+      const id = message.id ? String(message.id) : "";
+      if (!id || !stableIds.has(id)) {
+        merged.push(message);
+      }
+    }
+
+    return merged;
+  }, [isLoading, messages]);
   const stripThinking = (text: string) =>
     text.replace(/<thinking>[\s\S]*?<\/thinking>/gi, "").trim();
   const lastHumanIndex = (() => {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].type === "human") return i;
+    for (let i = displayMessages.length - 1; i >= 0; i--) {
+      if (displayMessages[i].type === "human") return i;
     }
     return -1;
   })();
-  const hasVisibleAiAfterHuman = messages
+  const hasVisibleAiAfterHuman = displayMessages
     .slice(lastHumanIndex + 1)
     .some((m) => {
       if (m.type !== "ai") return false;
@@ -177,6 +217,11 @@ export function Thread() {
       return stripThinking(content).length > 0;
     });
   const showLoadingBubble = isLoading && !hasVisibleAiAfterHuman;
+  const threadErrorMessage = !isLoading && stream.error
+    ? String((stream.error as { message?: unknown })?.message ?? "An unknown error occurred.")
+    : "";
+  const showInlineError =
+    threadErrorMessage.length > 0 && !hasVisibleAiAfterHuman && !stream.interrupt;
 
   const lastError = useRef<string | undefined>(undefined);
 
@@ -542,7 +587,7 @@ export function Thread() {
     });
   };
 
-  const chatStarted = !!threadId || !!messages.length;
+  const chatStarted = !!threadId || !!displayMessages.length;
   const approvalPromptText = () => {
     const interrupt = stream.interrupt;
     if (!interrupt || !isAgentInboxInterruptSchema(interrupt)) return "";
@@ -738,7 +783,7 @@ export function Thread() {
               contentClassName="pt-8 pb-16 max-w-3xl mx-auto flex flex-col gap-4 w-full"
               content={
                 <>
-                  {messages
+                  {displayMessages
                     .filter((m) => !m.id?.startsWith(DO_NOT_RENDER_ID_PREFIX))
                     .map((message, index) =>
                       message.type === "human" ? (
@@ -752,6 +797,7 @@ export function Thread() {
                           key={message.id ? `${message.id}-${index}` : `${message.type}-${index}`}
                           message={message}
                           isLoading={isLoading}
+                          threadMessages={displayMessages}
                           handleRegenerate={handleRegenerate}
                           feedbackById={feedbackById}
                           onFeedbackChange={updateFeedback}
@@ -763,6 +809,9 @@ export function Thread() {
                       {shouldRenderApprovalPrompt() && renderApprovalPrompt()}
                       <div className="w-full">{renderInterrupt()}</div>
                     </>
+                  )}
+                  {showInlineError && (
+                    <AssistantMessageError error={threadErrorMessage} />
                   )}
                   {showLoadingBubble && <AssistantMessageLoading />}
                 </>

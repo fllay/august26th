@@ -119,6 +119,13 @@ function separateThinking(
   if (!text) return { thinking: "", rest: "" };
   const regex = /<thinking>([\s\S]*?)<\/thinking>/gi;
   const thinkingParts: string[] = [];
+  const matches = Array.from(text.matchAll(regex));
+  if (matches.length === 0 && /<thinking>/i.test(text)) {
+    return {
+      thinking: "",
+      rest: text.replace(/<\/?thinking>/gi, "").trim(),
+    };
+  }
   const restWithoutClosed = text.replace(regex, (_match, inner) => {
     const trimmed = (inner || "").trim();
     if (trimmed) {
@@ -182,12 +189,14 @@ export function AssistantMessage({
   handleRegenerate,
   feedbackById,
   onFeedbackChange,
+  threadMessages: threadMessagesOverride,
 }: {
   message: Message | undefined;
   isLoading: boolean;
   handleRegenerate: (parentCheckpoint: Checkpoint | null | undefined) => void;
   feedbackById: Record<string, number>;
   onFeedbackChange?: (messageId: string, rating: number) => void;
+  threadMessages?: Message[];
 }) {
   const content = message?.content ?? [];
   const rawContentString = getContentString(content);
@@ -203,8 +212,8 @@ export function AssistantMessage({
 
   const thread = useStreamContext();
   const threadMessages = useMemo(
-    () => thread.messages ?? [],
-    [thread.messages],
+    () => threadMessagesOverride ?? thread.messages ?? [],
+    [threadMessagesOverride, thread.messages],
   );
   const isLastMessage =
     threadMessages[threadMessages.length - 1]?.id === message?.id;
@@ -415,7 +424,11 @@ export function AssistantMessage({
 
   const aiMissingFromThread = message?.type === "ai" && messageIndex === -1;
   const isIntermediateAi = message?.type === "ai" && !isFinalAiMessage;
-  const shouldHideStreamingAi = isLoading && message?.type === "ai";
+  const shouldHideStreamingAi =
+    isLoading &&
+    message?.type === "ai" &&
+    nextHumanIndex === -1 &&
+    isFinalAiMessage;
   const hasRenderableContent = contentString.trim().length > 0;
   const isThinkingOnlyContent =
     thinking.trim().length > 0 && !hasRenderableContent;
@@ -581,6 +594,25 @@ export function AssistantMessageLoading() {
         <div className="bg-foreground/50 h-1.5 w-1.5 animate-[pulse_1.5s_ease-in-out_infinite] rounded-full"></div>
         <div className="bg-foreground/50 h-1.5 w-1.5 animate-[pulse_1.5s_ease-in-out_0.5s_infinite] rounded-full"></div>
         <div className="bg-foreground/50 h-1.5 w-1.5 animate-[pulse_1.5s_ease-in-out_1s_infinite] rounded-full"></div>
+      </div>
+    </div>
+  );
+}
+
+export function AssistantMessageError({
+  error,
+}: {
+  error: string;
+}) {
+  return (
+    <div className="mr-auto flex w-full items-start gap-2">
+      <div className="flex w-full flex-col gap-2">
+        <div className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+          <div className="font-medium">The run ended before the assistant could return a final response.</div>
+          <div className="mt-1 whitespace-pre-wrap break-words text-rose-800/90">
+            {error}
+          </div>
+        </div>
       </div>
     </div>
   );

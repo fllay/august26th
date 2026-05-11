@@ -1,5 +1,6 @@
 """LangChain Deep Agent wired to the Google Forms MCP server."""
 
+import asyncio
 import ast
 import base64
 import csv
@@ -46,6 +47,7 @@ GOOGLE_SHEETS_SCOPES = [
 GOOGLE_WORKSPACE_SCOPES = [
     "https://www.googleapis.com/auth/forms.body",
     "https://www.googleapis.com/auth/forms.responses.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 DEFAULT_RESPONDENT_INFO_QUESTIONS = [
@@ -152,6 +154,9 @@ Work deliberately:
     formId value. Never substitute placeholder IDs.
   - After creating or editing a form, report the form title, the questions added,
     and any URL or form ID returned by the tools.
+  - After creating a form, tell the user to manually link the form to a Google
+    Spreadsheet in Google Forms and then send that spreadsheet link back so you
+    can format the raw response data for analysis.
   - Never claim a form was created unless a Google Forms MCP tool succeeded.
   - Never say that form-creation tools are unavailable when the request is about
     creating, listing, or syncing Google Forms. Those local form tools are
@@ -159,6 +164,10 @@ Work deliberately:
 - For Google Sheets analysis:
   - Start spreadsheet inspection with the inspect_spreadsheet_for_analysis tool
     when the user provides a spreadsheet target and wants analysis.
+  - If the user sends back a manually linked Google Form response spreadsheet,
+    first format the raw response tab into a clean analysis-ready table using
+    the local formatting tool before deeper analysis unless the sheet is already
+    well-structured.
   - Inspect the spreadsheet structure first.
   - Unless the user narrows the scope, analyze the full used range of all sheet
     tabs that contain data, not just a preview sample.
@@ -187,7 +196,7 @@ FILE_TEXT_RE = re.compile(
 UPLOAD_FILE_HEADER_RE = re.compile(r"^\[(?:Uploaded|Attached) file: .+\]$", re.IGNORECASE)
 PAGE_MARKER_RE = re.compile(r"^--\s*\d+\s+of\s+\d+\s*--$", re.IGNORECASE)
 SPREADSHEET_URL_RE = re.compile(
-    r"https?://docs\.google\.com/spreadsheets/d/([a-zA-Z0-9-_]+)",
+    r"https?://docs\.google\.com/spreadsheets/d/[a-zA-Z0-9-_]+(?:/[^\s<>()]*)?(?:\?[^\s<>()]*)?",
     re.IGNORECASE,
 )
 SPREADSHEET_ID_RE = re.compile(r"\b[a-zA-Z0-9-_]{30,}\b")
@@ -682,7 +691,11 @@ def extract_spreadsheet_id(target: str) -> str:
         raise RuntimeError(
             "Spreadsheet ID appears truncated or placeholder-like. Use the full exact spreadsheet ID."
         )
-    match = SPREADSHEET_URL_RE.search(target)
+    match = re.search(
+        r"/spreadsheets/d/([a-zA-Z0-9-_]+)",
+        target,
+        re.IGNORECASE,
+    )
     if match:
         return match.group(1)
     return target.strip()
@@ -1928,6 +1941,235 @@ def _count_non_section_questions(questions: list[dict[str, Any]]) -> int:
     )
 
 
+def _normalize_header_cell(value: str, fallback_index: int) -> str:
+    """Normalize a header cell while keeping it readable for analysis."""
+    cleaned = re.sub(r"\s+", " ", str(value or "").strip())
+    cleaned = cleaned.strip(":-")
+    return cleaned or f"Column {fallback_index}"
+
+
+def _dedupe_headers(headers: list[str]) -> list[str]:
+    """Make header names unique while preserving order."""
+    seen: dict[str, int] = {}
+    deduped: list[str] = []
+    for header in headers:
+        count = seen.get(header, 0) + 1
+        seen[header] = count
+        deduped.append(header if count == 1 else f"{header} ({count})")
+    return deduped
+
+
+def _is_effectively_blank_row(row: list[Any]) -> bool:
+    """Return whether a row has no meaningful values."""
+    return not any(str(cell or "").strip() for cell in row)
+
+
+def _guess_header_row_index(rows: list[list[Any]]) -> int:
+    """Choose the likeliest header row from raw sheet values."""
+    for index, row in enumerate(rows[:10]):
+        non_empty = [str(cell or "").strip() for cell in row if str(cell or "").strip()]
+        if len(non_empty) >= 2:
+            return index
+    return 0
+
+
+def _build_analysis_ready_table(rows: list[list[Any]]) -> tuple[list[str], list[list[str]], int]:
+    """Convert a raw response tab into normalized headers and cleaned rows."""
+    if not rows:
+        return [], [], 0
+
+    header_row_index = _guess_header_row_index(rows)
+    raw_headers = rows[header_row_index] if header_row_index < len(rows) else []
+    normalized_headers = _dedupe_headers(
+        [
+            _normalize_header_cell(value, index + 1)
+            for index, value in enumerate(raw_headers)
+        ]
+    )
+    width = len(normalized_headers)
+    cleaned_rows: list[list[str]] = []
+    for row in rows[header_row_index + 1 :]:
+        normalized_row = [str(cell or "").strip() for cell in row[:width]]
+        if len(normalized_row) < width:
+            normalized_row.extend([""] * (width - len(normalized_row)))
+        if _is_effectively_blank_row(normalized_row):
+            continue
+        cleaned_rows.append(normalized_row)
+
+    return normalized_headers, cleaned_rows, header_row_index
+
+
+def _is_timestamp_header(header: str) -> bool:
+    lowered = header.strip().casefold()
+    return any(
+        keyword in lowered
+        for keyword in (
+            "timestamp",
+            "submitted at",
+            "submit time",
+            "date",
+            "time",
+            "วันที่",
+            "เวลา",
+            "วันเวลา",
+        )
+    )
+
+
+def _is_metadata_header(header: str) -> bool:
+    lowered = header.strip().casefold()
+    respondent_titles = {
+        str(question.get("title", "") or "").strip().casefold()
+        for question in DEFAULT_RESPONDENT_INFO_QUESTIONS
+    }
+    if lowered in respondent_titles:
+        return True
+    return any(
+        keyword in lowered
+        for keyword in (
+            "name",
+            "email",
+            "phone",
+            "department",
+            "organization",
+            "position",
+            "province",
+            "school",
+            "unit",
+            "agency",
+            "respondent",
+            "participant",
+            "ชื่อ",
+            "อีเมล",
+            "เบอร์",
+            "โทร",
+            "หน่วยงาน",
+            "สถานศึกษา",
+            "ตำแหน่ง",
+            "จังหวัด",
+            "ผู้เข้าอบรม",
+            "ผู้เข้ารับการอบรม",
+        )
+    )
+
+
+def _classify_analysis_columns(headers: list[str]) -> tuple[list[int], list[int], int | None]:
+    """Split cleaned headers into metadata columns and question columns."""
+    metadata_indices: list[int] = []
+    question_indices: list[int] = []
+    timestamp_index: int | None = None
+
+    for index, header in enumerate(headers):
+        if _is_timestamp_header(header):
+            timestamp_index = index
+            continue
+        if _is_metadata_header(header):
+            metadata_indices.append(index)
+        else:
+            question_indices.append(index)
+
+    if not question_indices:
+        for index, _header in enumerate(headers):
+            if index == timestamp_index or index in metadata_indices:
+                continue
+            question_indices.append(index)
+
+    return metadata_indices, question_indices, timestamp_index
+
+
+def _build_normalized_analysis_rows(
+    headers: list[str],
+    cleaned_rows: list[list[str]],
+) -> tuple[list[str], list[list[str]], list[list[str]]]:
+    """Create long-form analysis rows plus question summary rows."""
+    metadata_indices, question_indices, timestamp_index = _classify_analysis_columns(headers)
+    metadata_headers = [headers[index] for index in metadata_indices]
+
+    analysis_headers = [
+        "Response ID",
+        "Timestamp",
+        *metadata_headers,
+        "Question",
+        "Answer",
+        "Answer Type",
+        "Answer Length",
+    ]
+    analysis_rows: list[list[str]] = []
+    summary_counts: dict[tuple[str, str], int] = {}
+    question_totals: dict[str, int] = {}
+
+    for row_number, row in enumerate(cleaned_rows, start=1):
+        timestamp_value = row[timestamp_index] if timestamp_index is not None and timestamp_index < len(row) else ""
+        metadata_values = [
+            row[index] if index < len(row) else ""
+            for index in metadata_indices
+        ]
+        for question_index in question_indices:
+            if question_index >= len(row):
+                continue
+            answer = str(row[question_index] or "").strip()
+            if not answer:
+                continue
+            question = headers[question_index]
+            answer_type = "MULTIPLE_CHOICE" if len(answer.split(",")) <= 4 and len(answer) <= 120 else "SHORT_ANSWER"
+            analysis_rows.append(
+                [
+                    str(row_number),
+                    timestamp_value,
+                    *metadata_values,
+                    question,
+                    answer,
+                    answer_type,
+                    str(len(answer)),
+                ]
+            )
+            summary_counts[(question, answer)] = summary_counts.get((question, answer), 0) + 1
+            question_totals[question] = question_totals.get(question, 0) + 1
+
+    summary_headers = ["Question", "Answer", "Count", "Percent"]
+    summary_rows: list[list[str]] = []
+    for (question, answer), count in sorted(
+        summary_counts.items(),
+        key=lambda item: (item[0][0].casefold(), -item[1], item[0][1].casefold()),
+    ):
+        total = max(question_totals.get(question, 0), 1)
+        percent = round((count / total) * 100, 2)
+        summary_rows.append([question, answer, str(count), f"{percent:.2f}%"])
+
+    return analysis_headers, analysis_rows, summary_rows
+
+
+def _ensure_sheet_exists(
+    service: Any,
+    spreadsheet_id: str,
+    sheet_title: str,
+    existing_sheets: list[dict[str, Any]],
+) -> None:
+    """Create the destination sheet when it does not already exist."""
+    existing_titles = {
+        str(sheet.get("properties", {}).get("title", "") or "")
+        for sheet in existing_sheets
+        if isinstance(sheet, dict)
+    }
+    if sheet_title in existing_titles:
+        return
+
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "requests": [
+                {
+                    "addSheet": {
+                        "properties": {
+                            "title": sheet_title,
+                        }
+                    }
+                }
+            ]
+        },
+    ).execute()
+
+
 def _generate_missing_questions(
     title: str,
     description: str,
@@ -2294,7 +2536,11 @@ def create_form_with_response_sheet(
             "responderUri": responder_uri,
             "responseUrl": responder_uri,
             "questionCount": len(questions),
-            "note": "Form creation no longer creates or links a Google Sheet.",
+            "nextStep": (
+                "Manually link this form to a Google Spreadsheet in Google Forms. "
+                "Then send the spreadsheet link back so the agent can format the raw response data "
+                "into an analysis-ready table."
+            ),
         },
         ensure_ascii=False,
         indent=2,
@@ -2309,6 +2555,142 @@ def sync_form_responses_to_sheet(
     """Legacy compatibility tool; syncing linked sheets has been removed."""
     raise RuntimeError(
         "Form-to-spreadsheet linking and syncing have been removed from this app."
+    )
+
+
+@tool
+def format_response_sheet_for_analysis(
+    spreadsheet_target: str,
+    source_sheet_name: str = "",
+    output_sheet_name: str = "Analysis Ready",
+) -> str:
+    """Format a raw Google Form response sheet into normalized analysis tables."""
+    target = spreadsheet_target.strip()
+    if not target:
+        raise RuntimeError("spreadsheet_target is required.")
+
+    spreadsheet_id_value = extract_spreadsheet_id(target)
+    credentials = _load_google_sheets_credentials()
+    service = build_google_api(
+        "sheets",
+        "v4",
+        credentials=credentials,
+        cache_discovery=False,
+    )
+
+    metadata = (
+        service.spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id_value,
+            fields="properties.title,sheets.properties(sheetId,title,index,gridProperties)",
+        )
+        .execute()
+    )
+    spreadsheet_title = str(metadata.get("properties", {}).get("title", "") or "")
+    sheets = metadata.get("sheets", []) or []
+
+    selected_sheet: dict[str, Any] | None = None
+    if source_sheet_name.strip():
+        for sheet in sheets:
+            if str(sheet.get("properties", {}).get("title", "") or "") == source_sheet_name.strip():
+                selected_sheet = sheet
+                break
+        if selected_sheet is None:
+            raise RuntimeError(f"Could not find source sheet named '{source_sheet_name.strip()}'.")
+    else:
+        best_rows: list[list[Any]] = []
+        for sheet in sheets:
+            title = str(sheet.get("properties", {}).get("title", "") or "")
+            if not title or title == output_sheet_name:
+                continue
+            values = (
+                service.spreadsheets()
+                .values()
+                .get(spreadsheetId=spreadsheet_id_value, range=_quote_sheet_title(title))
+                .execute()
+                .get("values", [])
+            )
+            if not values:
+                continue
+            headers, cleaned_rows, _ = _build_analysis_ready_table(values)
+            score = len(headers) * 10 + len(cleaned_rows)
+            best_score = len(best_rows[0]) * 10 + max(len(best_rows) - 1, 0) if best_rows else -1
+            if score > best_score:
+                selected_sheet = sheet
+                best_rows = values
+
+        if selected_sheet is None:
+            raise RuntimeError("No populated sheet was found to format.")
+
+    source_title = str(selected_sheet.get("properties", {}).get("title", "") or "")
+    raw_values = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id_value, range=_quote_sheet_title(source_title))
+        .execute()
+        .get("values", [])
+    )
+    headers, cleaned_rows, header_row_index = _build_analysis_ready_table(raw_values)
+    if not headers:
+        raise RuntimeError("Could not detect a usable header row in the source sheet.")
+    analysis_headers, analysis_rows, summary_rows = _build_normalized_analysis_rows(
+        headers,
+        cleaned_rows,
+    )
+
+    summary_sheet_name = f"{output_sheet_name} Summary"
+    _ensure_sheet_exists(service, spreadsheet_id_value, output_sheet_name, sheets)
+    _ensure_sheet_exists(service, spreadsheet_id_value, summary_sheet_name, sheets)
+    destination_range = f"{_quote_sheet_title(output_sheet_name)}!A1"
+    summary_range = f"{_quote_sheet_title(summary_sheet_name)}!A1"
+    service.spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id_value,
+        range=_quote_sheet_title(output_sheet_name),
+        body={},
+    ).execute()
+    service.spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id_value,
+        range=_quote_sheet_title(summary_sheet_name),
+        body={},
+    ).execute()
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id_value,
+        range=destination_range,
+        valueInputOption="RAW",
+        body={"values": [analysis_headers, *analysis_rows]},
+    ).execute()
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id_value,
+        range=summary_range,
+        valueInputOption="RAW",
+        body={
+            "values": [
+                ["Question", "Answer", "Count", "Percent"],
+                *summary_rows,
+            ]
+        },
+    ).execute()
+
+    return json.dumps(
+        {
+            "spreadsheetId": spreadsheet_id_value,
+            "spreadsheetTitle": spreadsheet_title,
+            "sourceSheet": source_title,
+            "outputSheet": output_sheet_name,
+            "summarySheet": summary_sheet_name,
+            "headerRowIndex": header_row_index + 1,
+            "columnCount": len(analysis_headers),
+            "rowCountWritten": len(analysis_rows),
+            "questionSummaryRowCount": len(summary_rows),
+            "rawHeaders": headers,
+            "analysisHeaders": analysis_headers,
+            "note": (
+                "The raw response data was normalized into one row per response answer, "
+                "and a separate summary sheet was created with counts and percentages by question."
+            ),
+        },
+        ensure_ascii=False,
+        indent=2,
     )
 
 
@@ -3109,6 +3491,194 @@ def inject_spreadsheet_target_context(messages: list[AnyMessage]) -> list[AnyMes
     return next_messages
 
 
+def maybe_complete_manual_sheet_format_handoff(messages: list[AnyMessage]) -> AIMessage | None:
+    """Directly format a linked response sheet when the user sends its URL back."""
+    latest_human_index = -1
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].type == "human":
+            latest_human_index = index
+            break
+
+    if latest_human_index == -1:
+        return None
+
+    latest_human_content = content_to_text(messages[latest_human_index].content)
+    targets = extract_spreadsheet_targets(latest_human_content)
+    if not targets:
+        return None
+
+    stripped_request = strip_spreadsheet_targets(latest_human_content, targets)
+    normalized_request = stripped_request.strip().lower()
+    if normalized_request.startswith("spreadsheet_task"):
+        return None
+
+    prior_ai_texts: list[str] = []
+    for index in range(latest_human_index - 1, -1, -1):
+        if messages[index].type == "ai":
+            content = content_to_text(messages[index].content).lower().strip()
+            if content:
+                prior_ai_texts.append(content)
+    previous_ai_text = "\n".join(prior_ai_texts)
+
+    handoff_markers = (
+        "send the spreadsheet link back",
+        "analysis-ready table",
+        "manually link this form",
+        "format the raw response data",
+        "please provide the spreadsheet link",
+        "link to spreadsheet",
+    )
+    looks_like_handoff_reply = any(marker in previous_ai_text for marker in handoff_markers)
+    is_link_only_reply = not normalized_request or normalized_request in {
+        "here",
+        "here you go",
+        "this one",
+        "this sheet",
+        "spreadsheet",
+        "sheet",
+    }
+    is_short_follow_up = len(normalized_request) <= 40
+    prior_form_context = any(
+        hint in previous_ai_text
+        for hint in (
+            "google form",
+            "form link",
+            "responses",
+            "setup responses",
+        )
+    )
+
+    if not looks_like_handoff_reply and not is_link_only_reply and not (
+        prior_form_context and is_short_follow_up
+    ):
+        return None
+
+    try:
+        result = format_response_sheet_for_analysis.invoke(
+            {"spreadsheet_target": targets[0]}
+        )
+        if not isinstance(result, str):
+            result = json.dumps(result, ensure_ascii=False, indent=2)
+        payload = json.loads(result)
+        spreadsheet_id = str(payload.get("spreadsheetId", "") or "")
+        spreadsheet_title = str(payload.get("spreadsheetTitle", "") or "")
+        source_sheet = str(payload.get("sourceSheet", "") or "")
+        output_sheet = str(payload.get("outputSheet", "") or "")
+        summary_sheet = str(payload.get("summarySheet", "") or "")
+        row_count = int(payload.get("rowCountWritten", 0) or 0)
+        column_count = int(payload.get("columnCount", 0) or 0)
+        summary_row_count = int(payload.get("questionSummaryRowCount", 0) or 0)
+        spreadsheet_url = (
+            f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+            if spreadsheet_id
+            else ""
+        )
+        response_lines = [
+            "I formatted the linked response sheet for analysis.",
+            "",
+            f"- Spreadsheet: {spreadsheet_title or spreadsheet_id}",
+            f"- Source sheet: {source_sheet}",
+            f"- Normalized analysis sheet: {output_sheet}",
+            f"- Summary sheet: {summary_sheet}",
+            f"- Normalized rows written: {row_count}",
+            f"- Analysis columns: {column_count}",
+            f"- Summary rows written: {summary_row_count}",
+        ]
+        if spreadsheet_url:
+            response_lines.extend(["", f"Spreadsheet link: {spreadsheet_url}"])
+        response_lines.extend(
+            [
+                "",
+                "Use the normalized analysis sheet for row-level analysis and the summary sheet for counts, percentages, charts, and further analysis.",
+            ]
+        )
+        return AIMessage(content="\n".join(response_lines).strip())
+    except Exception as exc:
+        raise RuntimeError(
+            "I recognized the spreadsheet link handoff, but formatting the linked response sheet failed. "
+            f"Details: {exc}"
+        ) from exc
+
+
+def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessage | None:
+    """Directly create a Google Form when the latest user turn is clearly a form request."""
+    latest_human_index = -1
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].type == "human":
+            latest_human_index = index
+            break
+
+    if latest_human_index == -1:
+        return None
+
+    latest_human_content = content_to_text(messages[latest_human_index].content).strip()
+    if not latest_human_content or latest_human_content.startswith("FORM_CREATION_TASK"):
+        return None
+    if extract_spreadsheet_targets(latest_human_content):
+        return None
+    if not looks_like_form_creation_request(latest_human_content):
+        return None
+
+    title = extract_form_title(latest_human_content).strip() or "Generated Google Form"
+    description = extract_form_description(latest_human_content).strip()
+    respondent_questions = extract_requested_respondent_questions(latest_human_content)
+    section_structure = extract_requested_section_structure(latest_human_content)
+    expected_question_count = extract_question_count(latest_human_content) or 0
+
+    try:
+        result = create_form_with_response_sheet.invoke(
+            {
+                "title": title,
+                "description": description,
+                "respondent_questions_json": json.dumps(
+                    respondent_questions,
+                    ensure_ascii=False,
+                )
+                if respondent_questions
+                else "",
+                "section_structure_json": json.dumps(
+                    section_structure,
+                    ensure_ascii=False,
+                )
+                if section_structure
+                else "",
+                "expected_question_count": expected_question_count,
+                "source_prompt": latest_human_content,
+            }
+        )
+        if not isinstance(result, str):
+            result = json.dumps(result, ensure_ascii=False, indent=2)
+        payload = json.loads(result)
+        response_lines = [
+            "The Google Form has been successfully created.",
+            "",
+            f"- Title: {str(payload.get('title', '') or title)}",
+        ]
+        form_url = str(payload.get("formUrl", "") or payload.get("editUrl", "") or "")
+        responder_url = str(
+            payload.get("responderUri", "") or payload.get("responseUrl", "") or ""
+        )
+        form_id = str(payload.get("formId", "") or "")
+        question_count = int(payload.get("questionCount", 0) or 0)
+        if form_id:
+            response_lines.append(f"- Form ID: {form_id}")
+        if question_count:
+            response_lines.append(f"- Questions added: {question_count}")
+        if form_url:
+            response_lines.extend(["", f"Form link: {form_url}"])
+        if responder_url:
+            response_lines.append(f"Responder link: {responder_url}")
+        next_step = str(payload.get("nextStep", "") or "").strip()
+        if next_step:
+            response_lines.extend(["", next_step])
+        return AIMessage(content="\n".join(response_lines).strip())
+    except Exception as exc:
+        raise RuntimeError(
+            "I recognized this as a Google Form creation request, but the direct form creation flow failed. "
+            f"Details: {exc}"
+        ) from exc
+
+
 class LocalLLMMessageFormatMiddleware(AgentMiddleware):
     """Make DeepAgents messages compatible with local OpenAI-compatible servers."""
 
@@ -3127,6 +3697,18 @@ class LocalLLMMessageFormatMiddleware(AgentMiddleware):
             messages,
             get_attached_file_context(request),
         )
+        direct_sheet_response = await asyncio.to_thread(
+            maybe_complete_manual_sheet_format_handoff,
+            messages,
+        )
+        if direct_sheet_response is not None:
+            return direct_sheet_response
+        direct_form_response = await asyncio.to_thread(
+            maybe_complete_form_creation_request,
+            messages,
+        )
+        if direct_form_response is not None:
+            return direct_form_response
         messages = inject_form_creation_context(messages)
         messages = inject_spreadsheet_target_context(messages)
         response = await handler(
@@ -3276,6 +3858,7 @@ async def build_agent() -> Any:
     tools = [
         create_form_with_response_sheet,
         list_google_forms,
+        format_response_sheet_for_analysis,
         inspect_spreadsheet_for_analysis,
         *filtered_mcp_tools,
     ]
