@@ -26,6 +26,7 @@ from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build as build_google_api
 from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaInMemoryUpload
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
@@ -83,6 +84,17 @@ DOCX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml
 XLSX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 PPTX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 RTF_MIME_TYPE = "application/rtf"
+IMAGE_MIME_BY_EXTENSION = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+}
 TEXT_MIME_TYPES = {
     "text/plain",
     "text/markdown",
@@ -285,6 +297,39 @@ def strip_embedded_file_context(text: str) -> str:
         "",
     )
     return re.sub(r"\n{3,}", "\n\n", stripped).strip()
+
+
+def extract_latest_docx_bytes(messages: list[AnyMessage]) -> bytes:
+    """Return the most recent attached DOCX bytes from the conversation, if present."""
+    for message in reversed(messages):
+        if message.type != "human":
+            continue
+        content = message.content
+        if not isinstance(content, list):
+            continue
+        for block in reversed(content):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "file":
+                continue
+            mime_type = normalize_mime_type(
+                str(
+                    (block.get("metadata") or {}).get("filename")
+                    or (block.get("metadata") or {}).get("name")
+                    or ""
+                ),
+                str(block.get("mimeType") or block.get("mime_type") or ""),
+            )
+            if mime_type != DOCX_MIME_TYPE:
+                continue
+            data = block.get("data")
+            if not isinstance(data, str) or not data.strip():
+                continue
+            try:
+                return base64.b64decode(data, validate=False)
+            except Exception:
+                continue
+    return b""
 
 
 def extract_spreadsheet_targets(text: str) -> list[str]:
@@ -1338,6 +1383,81 @@ def _share_drive_file_with_actor(file_id: str, actor_email: str) -> None:
     ).execute()
 
 
+def _make_drive_file_public(file_id: str) -> None:
+    """Allow Google Forms to fetch a Drive-hosted image via public URL."""
+    drive_service = _build_drive_service()
+    drive_service.permissions().create(
+        fileId=file_id,
+        body={
+            "type": "anyone",
+            "role": "reader",
+        },
+        fields="id",
+    ).execute()
+
+
+def _upload_support_image_to_drive(image: dict[str, Any], fallback_name: str) -> dict[str, Any]:
+    """Upload an embedded image to Drive and return a form-usable source URI."""
+    mime_type = str(image.get("mime_type", "") or "application/octet-stream").strip()
+    data_base64 = str(image.get("data_base64", "") or "").strip()
+    if not data_base64:
+        return image
+
+    try:
+        image_bytes = base64.b64decode(data_base64, validate=False)
+    except Exception:
+        return image
+
+    extension = Path(str(image.get("name", "") or fallback_name)).suffix or ""
+    drive_name = str(image.get("name", "") or fallback_name).strip() or fallback_name
+
+    drive_service = _build_drive_service()
+    media = MediaInMemoryUpload(image_bytes, mimetype=mime_type, resumable=False)
+    uploaded = drive_service.files().create(
+        body={
+            "name": drive_name,
+            "mimeType": mime_type,
+        },
+        media_body=media,
+        fields="id,webContentLink,webViewLink",
+    ).execute()
+    file_id = str(uploaded.get("id", "") or "").strip()
+    if not file_id:
+        return image
+
+    _make_drive_file_public(file_id)
+    updated = dict(image)
+    source_uri = str(uploaded.get("webContentLink", "") or "").strip()
+    if not source_uri:
+        source_uri = f"https://drive.google.com/uc?export=download&id={file_id}"
+    updated["source_uri"] = source_uri
+    updated["drive_file_id"] = file_id
+    if extension and "name" not in updated:
+        updated["name"] = f"{fallback_name}{extension}"
+    return updated
+
+
+def _materialize_question_images(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Upload any embedded question images and replace them with source URIs."""
+    materialized: list[dict[str, Any]] = []
+    for question_index, question in enumerate(questions, 1):
+        updated_question = dict(question)
+        images = question.get("images", [])
+        if not isinstance(images, list) or not images:
+            materialized.append(updated_question)
+            continue
+
+        uploaded_images: list[dict[str, Any]] = []
+        for image_index, image in enumerate(images, 1):
+            if not isinstance(image, dict):
+                continue
+            fallback_name = f"form-support-image-{question_index}-{image_index}"
+            uploaded_images.append(_upload_support_image_to_drive(image, fallback_name))
+        updated_question["images"] = uploaded_images
+        materialized.append(updated_question)
+    return materialized
+
+
 def _share_native_link_targets_with_actor(form_id: str, spreadsheet_id: str, actor_email: str) -> None:
     """Share both form and spreadsheet with the shared Apps Script actor account."""
     _share_drive_file_with_actor(form_id, actor_email)
@@ -1694,6 +1814,7 @@ def _normalize_question_dict(raw_question: dict[str, Any], index: int) -> dict[s
     help_text = str(
         raw_question.get("description", "") or raw_question.get("help_text", "") or ""
     ).strip()
+    images = raw_question.get("images", [])
 
     return {
         "title": title,
@@ -1701,6 +1822,7 @@ def _normalize_question_dict(raw_question: dict[str, Any], index: int) -> dict[s
         "required": required,
         "options": options if isinstance(options, list) else [],
         "description": help_text,
+        "images": images if isinstance(images, list) else [],
     }
 
 
@@ -2395,51 +2517,89 @@ def _build_form_item(question: dict[str, Any]) -> dict[str, Any]:
     description = str(question.get("description", "") or "").strip()
     if description:
         item["description"] = description
-
     if question_type in {"section", "section_break", "page_break"}:
         item["pageBreakItem"] = {}
         return item
 
     if question_type in {"multiple_choice", "multiple-choice", "radio"}:
-        options = [str(option).strip() for option in question.get("options", []) if str(option).strip()]
-        if len(options) < 2:
+        options_payload: list[dict[str, Any]] = []
+        for option_index, option in enumerate(question.get("options", [])):
+            if isinstance(option, dict):
+                value = str(option.get("value", "") or "").strip()
+                if not value:
+                    continue
+                option_payload: dict[str, Any] = {"value": value}
+                option_images = option.get("images", [])
+                if isinstance(option_images, list) and option_images:
+                    first_image = option_images[0]
+                    if isinstance(first_image, dict):
+                        source_uri = str(first_image.get("source_uri", "") or "").strip()
+                        if source_uri:
+                            option_payload["image"] = {"sourceUri": source_uri}
+                            alt_text = str(first_image.get("alt_text", "") or "").strip()
+                            if alt_text:
+                                option_payload["image"]["altText"] = alt_text
+                options_payload.append(option_payload)
+            else:
+                value = str(option).strip()
+                if value:
+                    options_payload.append({"value": value})
+        if len(options_payload) < 2:
             raise RuntimeError(f"Multiple-choice question '{question['title']}' needs at least 2 options.")
         item["questionItem"] = {
             "question": {
                 "required": required,
                 "choiceQuestion": {
                     "type": "RADIO",
-                    "options": [{"value": option} for option in options],
+                    "options": options_payload,
                 },
             }
         }
         return item
 
     if question_type in {"checkbox", "checkboxes"}:
-        options = [str(option).strip() for option in question.get("options", []) if str(option).strip()]
-        if len(options) < 2:
+        options_payload: list[dict[str, Any]] = []
+        for option in question.get("options", []):
+            if isinstance(option, dict):
+                value = str(option.get("value", "") or "").strip()
+                if value:
+                    options_payload.append({"value": value})
+            else:
+                value = str(option).strip()
+                if value:
+                    options_payload.append({"value": value})
+        if len(options_payload) < 2:
             raise RuntimeError(f"Checkbox question '{question['title']}' needs at least 2 options.")
         item["questionItem"] = {
             "question": {
                 "required": required,
                 "choiceQuestion": {
                     "type": "CHECKBOX",
-                    "options": [{"value": option} for option in options],
+                    "options": options_payload,
                 },
             }
         }
         return item
 
     if question_type in {"dropdown", "drop_down"}:
-        options = [str(option).strip() for option in question.get("options", []) if str(option).strip()]
-        if len(options) < 2:
+        options_payload: list[dict[str, Any]] = []
+        for option in question.get("options", []):
+            if isinstance(option, dict):
+                value = str(option.get("value", "") or "").strip()
+                if value:
+                    options_payload.append({"value": value})
+            else:
+                value = str(option).strip()
+                if value:
+                    options_payload.append({"value": value})
+        if len(options_payload) < 2:
             raise RuntimeError(f"Dropdown question '{question['title']}' needs at least 2 options.")
         item["questionItem"] = {
             "question": {
                 "required": required,
                 "choiceQuestion": {
                     "type": "DROP_DOWN",
-                    "options": [{"value": option} for option in options],
+                    "options": options_payload,
                 },
             }
         }
@@ -2452,6 +2612,66 @@ def _build_form_item(question: dict[str, Any]) -> dict[str, Any]:
         }
     }
     return item
+
+
+def _build_form_items(question: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build one or more Google Forms item payloads from a normalized question."""
+    images = [
+        image
+        for image in question.get("images", [])
+        if isinstance(image, dict) and str(image.get("source_uri", "") or "").strip()
+    ]
+    items: list[dict[str, Any]] = []
+    for image in images:
+        image_item: dict[str, Any] = {
+            "title": str(image.get("alt_text", "") or "").strip()
+            or f"Image for {str(question.get('title', '') or '').strip()}",
+            "imageItem": {
+                "image": {
+                    "sourceUri": str(image.get("source_uri", "") or "").strip(),
+                }
+            },
+        }
+        width = image.get("width")
+        if isinstance(width, int) and 0 < width <= 740:
+            image_item["imageItem"]["image"]["properties"] = {"width": width}
+        alt_text = str(image.get("alt_text", "") or "").strip()
+        if alt_text:
+            image_item["imageItem"]["image"]["altText"] = alt_text
+        items.append(image_item)
+
+    for option_index, option in enumerate(question.get("options", [])):
+        if not isinstance(option, dict):
+            continue
+        extra_images = option.get("extra_images", [])
+        if not isinstance(extra_images, list):
+            continue
+        option_label = str(option.get("label", "") or _option_label_for_index(option_index)).strip()
+        option_value = str(option.get("value", "") or "").strip()
+        for image in extra_images:
+            if not isinstance(image, dict) or not str(image.get("source_uri", "") or "").strip():
+                continue
+            image_item: dict[str, Any] = {
+                "title": str(image.get("alt_text", "") or "").strip()
+                or f"Additional image for choice {option_label}",
+                "description": f"Choice {option_label}: {option_value}".strip(),
+                "imageItem": {
+                    "image": {
+                        "sourceUri": str(image.get("source_uri", "") or "").strip(),
+                    }
+                },
+            }
+            width = image.get("width")
+            if isinstance(width, int) and 0 < width <= 740:
+                image_item["imageItem"]["image"]["properties"] = {"width": width}
+            alt_text = str(image.get("alt_text", "") or "").strip()
+            if alt_text:
+                image_item["imageItem"]["image"]["altText"] = alt_text
+            items.append(image_item)
+
+    primary_item = _build_form_item(question)
+    items.append(primary_item)
+    return items
 
 
 def _ensure_default_respondent_questions(
@@ -2535,15 +2755,18 @@ def _apply_form_batch_updates(
             }
         )
 
-    for index, question in enumerate(questions):
-        requests.append(
-            {
-                "createItem": {
-                    "item": _build_form_item(question),
-                    "location": {"index": index},
+    item_index = 0
+    for question in questions:
+        for item in _build_form_items(question):
+            requests.append(
+                {
+                    "createItem": {
+                        "item": item,
+                        "location": {"index": item_index},
+                    }
                 }
-            }
-        )
+            )
+            item_index += 1
 
     if not requests:
         return
@@ -3226,6 +3449,8 @@ def create_form_with_response_sheet(
     form_id = form_response.get("formId", "")
     if not form_id:
         raise RuntimeError("Google Forms API did not return a formId.")
+
+    questions = _materialize_question_images(questions)
 
     _apply_form_batch_updates(
         forms_service=forms_service,
@@ -4042,6 +4267,356 @@ def extract_docx_text(file_bytes: bytes) -> str:
     return "\n".join(cleaned_parts).strip()
 
 
+def extract_docx_segments(file_bytes: bytes) -> list[dict[str, Any]]:
+    """Extract ordered DOCX text/image segments for higher-fidelity form reconstruction."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as docx:
+            xml_bytes = docx.read("word/document.xml")
+            try:
+                rels_bytes = docx.read("word/_rels/document.xml.rels")
+            except KeyError:
+                rels_bytes = b""
+
+            media_bytes_by_name = {
+                name.rsplit("/", 1)[-1]: docx.read(name)
+                for name in docx.namelist()
+                if name.startswith("word/media/")
+            }
+    except Exception:
+        return []
+
+    try:
+        root = ElementTree.fromstring(xml_bytes)
+    except ElementTree.ParseError:
+        return []
+
+    rel_namespace = {
+        "rel": "http://schemas.openxmlformats.org/package/2006/relationships"
+    }
+    relationship_targets: dict[str, str] = {}
+    if rels_bytes:
+        try:
+            rel_root = ElementTree.fromstring(rels_bytes)
+            for rel in rel_root.findall(".//rel:Relationship", rel_namespace):
+                rel_id = rel.get("Id", "").strip()
+                target = rel.get("Target", "").strip()
+                if rel_id and target:
+                    relationship_targets[rel_id] = target.rsplit("/", 1)[-1]
+        except ElementTree.ParseError:
+            relationship_targets = {}
+
+    namespace = {
+        "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "pic": "http://schemas.openxmlformats.org/drawingml/2006/picture",
+        "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+        "v": "urn:schemas-microsoft-com:vml",
+        "o": "urn:schemas-microsoft-com:office:office",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    }
+
+    def paragraph_style_prefix(paragraph: ElementTree.Element) -> str:
+        style = paragraph.find("./w:pPr/w:pStyle", namespace)
+        style_val = style.get(f"{{{namespace['w']}}}val", "") if style is not None else ""
+        if not style_val:
+            return ""
+        lowered = style_val.casefold()
+        if lowered.startswith("heading"):
+            level_match = re.search(r"(\d+)", style_val)
+            level = max(1, min(6, int(level_match.group(1)))) if level_match else 1
+            return "#" * level + " "
+        if lowered in {"title", "subtitle"}:
+            return "# "
+        return ""
+
+    def build_image_asset(
+        rel_id: str | None,
+        label: str | None,
+        fallback_index: int,
+    ) -> dict[str, Any] | None:
+        rel_id = (rel_id or "").strip()
+        media_name = relationship_targets.get(rel_id, "")
+        if not media_name:
+            return None
+        image_bytes = media_bytes_by_name.get(media_name)
+        if not image_bytes:
+            return None
+
+        extension = Path(media_name).suffix.casefold()
+        mime_type = IMAGE_MIME_BY_EXTENSION.get(extension, "application/octet-stream")
+        cleaned_label = (label or "").strip()
+        alt_text = cleaned_label or f"Embedded image {fallback_index}"
+        return {
+            "name": media_name,
+            "alt_text": alt_text,
+            "mime_type": mime_type,
+            "data_base64": base64.b64encode(image_bytes).decode("ascii"),
+        }
+
+    image_counter = 0
+
+    def extract_paragraph_images(element: ElementTree.Element) -> list[dict[str, Any]]:
+        nonlocal image_counter
+        images: list[dict[str, Any]] = []
+
+        for node in element.findall(".//wp:docPr", namespace):
+            rel_parent = None
+            for parent in element.findall(".//a:blip", namespace):
+                rel_parent = parent
+                break
+            rel_id = rel_parent.get(f"{{{namespace['r']}}}embed", "") if rel_parent is not None else ""
+            asset = build_image_asset(
+                rel_id,
+                node.get("descr", "").strip()
+                or node.get("title", "").strip()
+                or node.get("name", "").strip(),
+                image_counter + 1,
+            )
+            if asset:
+                image_counter += 1
+                images.append(asset)
+
+        for node in element.findall(".//v:imagedata", namespace):
+            rel_id = (
+                node.get(f"{{{namespace['r']}}}id", "").strip()
+                or node.get(f"{{{namespace['o']}}}relid", "").strip()
+            )
+            asset = build_image_asset(rel_id, "", image_counter + 1)
+            if asset:
+                image_counter += 1
+                images.append(asset)
+
+        deduped: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, str]] = set()
+        for image in images:
+            key = (
+                str(image.get("name", "")),
+                str(image.get("data_base64", ""))[:32],
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(image)
+        return deduped
+
+    def render_paragraph(paragraph: ElementTree.Element) -> list[dict[str, Any]]:
+        runs = [
+            text_node.text or ""
+            for text_node in paragraph.findall(".//w:t", namespace)
+        ]
+        text = "".join(runs).strip()
+        images = extract_paragraph_images(paragraph)
+        if not text and not images:
+            return []
+        return [
+            {
+                "text": f"{paragraph_style_prefix(paragraph)}{text}".strip(),
+                "images": images,
+            }
+        ]
+
+    def render_table(table: ElementTree.Element) -> list[dict[str, Any]]:
+        segments: list[dict[str, Any]] = [{"text": "[Table]", "images": []}]
+        for row in table.findall("./w:tr", namespace):
+            cell_texts: list[str] = []
+            row_images: list[dict[str, Any]] = []
+            for cell in row.findall("./w:tc", namespace):
+                cell_parts: list[str] = []
+                for child in list(cell):
+                    tag = child.tag.rsplit("}", 1)[-1]
+                    if tag == "p":
+                        for segment in render_paragraph(child):
+                            if segment["text"]:
+                                cell_parts.append(segment["text"])
+                            row_images.extend(segment.get("images", []))
+                    elif tag == "tbl":
+                        for segment in render_table(child):
+                            if segment["text"]:
+                                cell_parts.append(segment["text"])
+                            row_images.extend(segment.get("images", []))
+                cell_texts.append(" ".join(part.strip() for part in cell_parts if part.strip()).strip())
+            if any(cell_texts) or row_images:
+                segments.append(
+                    {
+                        "text": " | ".join(cell or " " for cell in cell_texts).strip(),
+                        "images": row_images,
+                    }
+                )
+        return segments
+
+    body = root.find("./w:body", namespace)
+    if body is None:
+        return []
+
+    segments: list[dict[str, Any]] = []
+    for child in list(body):
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            segments.extend(render_paragraph(child))
+        elif tag == "tbl":
+            segments.extend(render_table(child))
+    return [segment for segment in segments if segment.get("text") or segment.get("images")]
+
+
+def _normalize_match_text(text: str) -> str:
+    """Normalize text for loose matching between extracted source and parsed questions."""
+    lowered = str(text or "").casefold()
+    lowered = re.sub(r"\s+", " ", lowered)
+    lowered = lowered.replace("“", '"').replace("”", '"')
+    lowered = lowered.replace("‘", "'").replace("’", "'")
+    lowered = lowered.replace("\u00a0", " ")
+    return lowered.strip(" .:-")
+
+
+def _extract_option_marker(text: str) -> tuple[str, str] | None:
+    """Extract a leading Thai/English option marker from a line."""
+    match = re.match(r"^\s*([A-Da-d]|[\u0E01-\u0E2E])[.)]\s*(.*)$", str(text or "").strip())
+    if not match:
+        return None
+    return match.group(1).strip(), match.group(2).strip()
+
+
+def _option_label_for_index(index: int) -> str:
+    """Return a human-readable option label for the given zero-based index."""
+    thai_labels = ["ก", "ข", "ค", "ง", "จ", "ฉ", "ช", "ซ"]
+    if 0 <= index < len(thai_labels):
+        return thai_labels[index]
+    return chr(ord("A") + index)
+
+
+def extract_docx_questions_with_images(file_bytes: bytes) -> list[dict[str, Any]]:
+    """Extract questions from a DOCX and attach embedded image assets to the nearest question."""
+    segments = extract_docx_segments(file_bytes)
+    if not segments:
+        return []
+
+    text = "\n".join(
+        segment.get("text", "").strip()
+        for segment in segments
+        if str(segment.get("text", "")).strip()
+    ).strip()
+    if not text:
+        return []
+
+    questions = extract_questions_from_reference_text(text)
+    if not questions:
+        return []
+
+    normalized_titles = [_normalize_match_text(question.get("title", "")) for question in questions]
+    for question in questions:
+        raw_options = question.get("options", [])
+        structured_options: list[dict[str, Any]] = []
+        if isinstance(raw_options, list):
+            for option_index, option in enumerate(raw_options):
+                if isinstance(option, dict):
+                    structured_option = dict(option)
+                    structured_option.setdefault("images", [])
+                    structured_option.setdefault("extra_images", [])
+                    structured_options.append(structured_option)
+                    continue
+                structured_options.append(
+                    {
+                        "value": str(option or "").strip(),
+                        "label": _option_label_for_index(option_index),
+                        "images": [],
+                        "extra_images": [],
+                    }
+                )
+        question["options"] = structured_options
+
+    question_index = -1
+    current_option_index: int | None = None
+
+    for segment in segments:
+        segment_text = str(segment.get("text", "") or "").strip()
+        normalized_segment_text = _normalize_match_text(segment_text)
+        if normalized_segment_text:
+            next_index = question_index + 1
+            if next_index < len(normalized_titles):
+                target = normalized_titles[next_index]
+                if target and (
+                    normalized_segment_text == target
+                    or normalized_segment_text.startswith(target)
+                    or target.startswith(normalized_segment_text)
+                ):
+                    question_index = next_index
+                    current_option_index = None
+                    continue
+
+            if question_index >= 0:
+                option_match = _extract_option_marker(segment_text)
+                if option_match:
+                    option_label, option_body = option_match
+                    options = questions[question_index].get("options", [])
+                    resolved_option_index: int | None = None
+                    if isinstance(options, list):
+                        for candidate_index, option in enumerate(options):
+                            if not isinstance(option, dict):
+                                continue
+                            label = str(option.get("label", "") or "").strip()
+                            value = _normalize_match_text(option.get("value", ""))
+                            if label.casefold() == option_label.casefold():
+                                resolved_option_index = candidate_index
+                                if option_body:
+                                    normalized_body = _normalize_match_text(option_body)
+                                    if normalized_body and value and normalized_body not in value and value not in normalized_body:
+                                        continue
+                                break
+                    current_option_index = resolved_option_index
+                else:
+                    current_option_index = None
+
+        images = segment.get("images", [])
+        if not images or question_index < 0 or question_index >= len(questions):
+            continue
+
+        if current_option_index is not None:
+            options = questions[question_index].get("options", [])
+            if isinstance(options, list) and 0 <= current_option_index < len(options):
+                option = options[current_option_index]
+                if isinstance(option, dict):
+                    option_images = option.setdefault("images", [])
+                    extra_images = option.setdefault("extra_images", [])
+                    for image in images:
+                        if not isinstance(image, dict):
+                            continue
+                        image_name = str(image.get("name", "") or "")
+                        existing = [
+                            *[
+                                str(existing_image.get("name", "") or "")
+                                for existing_image in option_images
+                                if isinstance(existing_image, dict)
+                            ],
+                            *[
+                                str(existing_image.get("name", "") or "")
+                                for existing_image in extra_images
+                                if isinstance(existing_image, dict)
+                            ],
+                        ]
+                        if image_name in existing:
+                            continue
+                        if not option_images:
+                            option_images.append(image)
+                        else:
+                            extra_images.append(image)
+                    continue
+
+        destination = questions[question_index].setdefault("images", [])
+        if not isinstance(destination, list):
+            destination = []
+            questions[question_index]["images"] = destination
+
+        for image in images:
+            if not isinstance(image, dict):
+                continue
+            image_name = str(image.get("name", "") or "")
+            if any(str(existing.get("name", "") or "") == image_name for existing in destination):
+                continue
+            destination.append(image)
+
+    return questions
+
+
 def xml_text_nodes(xml_bytes: bytes, tag_suffix: str = "t") -> list[str]:
     """Collect text nodes by XML tag suffix across Office XML namespaces."""
     try:
@@ -4454,6 +5029,7 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
         return None
 
     latest_human_content = content_to_text(messages[latest_human_index].content).strip()
+    latest_docx_bytes = extract_latest_docx_bytes(messages)
     embedded_file_context = extract_embedded_file_context(latest_human_content)
     latest_user_instruction = strip_embedded_file_context(latest_human_content)
     effective_reference_text = embedded_file_context.strip()
@@ -4477,11 +5053,11 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
         return None
 
     parsing_source = effective_creation_brief or latest_human_content
-    file_questions = (
-        extract_questions_from_reference_text(effective_reference_text)
-        if effective_reference_text
-        else []
-    )
+    file_questions: list[dict[str, Any]] = []
+    if latest_docx_bytes:
+        file_questions = extract_docx_questions_with_images(latest_docx_bytes)
+    if not file_questions and effective_reference_text:
+        file_questions = extract_questions_from_reference_text(effective_reference_text)
 
     title = extract_form_title(parsing_source).strip() or "Generated Google Form"
     description = extract_form_description(parsing_source).strip()
