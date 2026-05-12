@@ -179,8 +179,9 @@ Work deliberately:
   - For requests such as "analyze this spreadsheet", "simple summary", or
     similarly broad analysis asks, decide the analysis plan yourself after
     reading the spreadsheet structure.
-  - Report the spreadsheet/tab used, the row scope, the key findings, and any
+- Report the spreadsheet/tab used, the row scope, the key findings, and any
     chart or summary tab created.
+- Reply in the same language as the user's most recent message whenever practical.
 """
 
 OLD_UPLOAD_CONTEXT_RE = re.compile(
@@ -338,6 +339,71 @@ def looks_like_form_creation_request(text: str) -> bool:
     return any(keyword in lowered for keyword in creation_keywords)
 
 
+def _trim_form_topic_tail(text: str) -> str:
+    """Trim trailing requirement clauses from an inferred topic string."""
+    cleaned = re.sub(r"\s+", " ", text).strip().strip(" .,:;-")
+    split_patterns = (
+        r"\s+with\s+",
+        r"\s+including\s+",
+        r"\s+having\s+",
+        r"\s+and\s+",
+        r"\s+จำนวน\s+\d+\s+ข้อ",
+        r"\s+โดยมี\s+",
+        r"\s+พร้อม\s+",
+        r"\s+มี\s+(?:ชื่อ|หน่วยงาน|เบอร์|อีเมล|แบบทดสอบ|คำถาม)",
+        r"\s+และ(?:มี|แบบทดสอบ|คำถาม)",
+    )
+    for pattern in split_patterns:
+        parts = re.split(pattern, cleaned, maxsplit=1, flags=re.IGNORECASE)
+        if parts:
+            cleaned = parts[0].strip().strip(" .,:;-")
+    return cleaned
+
+
+def extract_form_topic(text: str) -> str:
+    """Extract the main subject/topic of the requested form when possible."""
+    lowered = text.lower()
+    patterns = (
+        r"(?:related to|about|for)\s+([^\n.,]+)",
+        r"(?:เกี่ยวกับ|เรื่อง)\s*([^\n.,]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            topic = _trim_form_topic_tail(match.group(1))
+            if topic:
+                return topic
+
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    cleaned = re.sub(
+        r"^(create|make|generate|build)\s+(a|an)?\s*(google\s+form|form)\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip(" .,:;-")
+    cleaned = re.sub(
+        r"^(สร้าง|ทำ|ช่วยสร้าง)\s*(google\s+form|ฟอร์ม|แบบฟอร์ม|แบบทดสอบ)?\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip(" .,:;-")
+    return _trim_form_topic_tail(cleaned[:120].strip())
+
+
+def infer_default_question_count(text: str) -> int:
+    """Infer a sensible default question count for short/simple prompts."""
+    explicit_count = extract_question_count(text)
+    if explicit_count:
+        return explicit_count
+
+    lowered = text.casefold()
+    if any(keyword in lowered for keyword in ("pre-test", "pretest", "post-test", "posttest", "quiz", "test", "แบบทดสอบ")):
+        return 10
+    if any(keyword in lowered for keyword in ("feedback", "survey", "satisfaction", "rating", "แบบประเมิน", "ความพึงพอใจ")):
+        return 5
+    return 0
+
+
 def extract_form_title(text: str) -> str:
     """Extract a form title from common prompt patterns."""
     lines = [line.rstrip() for line in text.splitlines()]
@@ -351,7 +417,18 @@ def extract_form_title(text: str) -> str:
             candidate = line.split(":", 1)[1].strip()
             if candidate:
                 return candidate
-    return ""
+
+    topic = extract_form_topic(text)
+    lowered = text.casefold()
+    if any(keyword in lowered for keyword in ("pre-test", "pretest", "แบบทดสอบก่อน", "แบบทดสอบ")):
+        return f"แบบทดสอบก่อนการอบรม {topic}".strip() if ("thai" in lowered or "ภาษาไทย" in lowered or re.search(r"[\u0E00-\u0E7F]", text)) else f"Pre-test Form - {topic}".strip(" -")
+    if any(keyword in lowered for keyword in ("post-test", "posttest", "แบบทดสอบหลัง")):
+        return f"แบบทดสอบหลังการอบรม {topic}".strip() if ("thai" in lowered or "ภาษาไทย" in lowered or re.search(r"[\u0E00-\u0E7F]", text)) else f"Post-test Form - {topic}".strip(" -")
+    if any(keyword in lowered for keyword in ("feedback", "survey", "satisfaction", "แบบประเมิน", "ความพึงพอใจ")):
+        return f"แบบประเมิน {topic}".strip() if ("thai" in lowered or "ภาษาไทย" in lowered or re.search(r"[\u0E00-\u0E7F]", text)) else f"Feedback Form - {topic}".strip(" -")
+    if topic:
+        return topic
+    return "Generated Google Form"
 
 
 def extract_form_description(text: str) -> str:
@@ -382,7 +459,85 @@ def extract_form_description(text: str) -> str:
                 collected.append(line)
             elif collected:
                 break
-    return "\n".join(collected).strip()
+    description = "\n".join(collected).strip()
+    if description:
+        return description
+
+    topic = extract_form_topic(text)
+    lowered = text.casefold()
+    is_thai = "thai" in lowered or "ภาษาไทย" in lowered or bool(re.search(r"[\u0E00-\u0E7F]", text))
+    question_count = infer_default_question_count(text)
+    if any(keyword in lowered for keyword in ("pre-test", "pretest", "post-test", "posttest", "quiz", "test", "แบบทดสอบ")):
+        if is_thai:
+            count_text = f" จำนวน {question_count} ข้อ" if question_count else ""
+            return f"แบบฟอร์มนี้ใช้สำหรับแบบทดสอบเกี่ยวกับ {topic}{count_text}".strip()
+        count_text = f" with {question_count} questions" if question_count else ""
+        return f"This form is for a test about {topic}{count_text}.".strip()
+    if any(keyword in lowered for keyword in ("feedback", "survey", "satisfaction", "แบบประเมิน", "ความพึงพอใจ")):
+        if is_thai:
+            return f"แบบฟอร์มนี้ใช้สำหรับรวบรวมความคิดเห็นและข้อเสนอแนะเกี่ยวกับ {topic}".strip()
+        return f"This form collects feedback about {topic}.".strip()
+    if topic:
+        if is_thai:
+            return f"แบบฟอร์มนี้เกี่ยวกับ {topic}".strip()
+        return f"This form is about {topic}.".strip()
+    return ""
+
+
+def infer_default_section_structure(
+    text: str,
+    respondent_questions: list[dict[str, Any]],
+    expected_question_count: int,
+) -> dict[str, dict[str, str]]:
+    """Infer a simple two-part structure for short natural prompts."""
+    if not respondent_questions or expected_question_count <= 0:
+        return {}
+
+    lowered = text.casefold()
+    is_thai = "thai" in lowered or "ภาษาไทย" in lowered or bool(re.search(r"[\u0E00-\u0E7F]", text))
+
+    if any(keyword in lowered for keyword in ("pre-test", "pretest", "แบบทดสอบก่อน")):
+        if is_thai:
+            return {
+                "section_1": {"title": "ข้อมูลผู้เข้าอบรม"},
+                "section_2": {"title": "แบบทดสอบก่อนการอบรม"},
+            }
+        return {
+            "section_1": {"title": "Participant Information"},
+            "section_2": {"title": "Pre-test"},
+        }
+
+    if any(keyword in lowered for keyword in ("post-test", "posttest", "แบบทดสอบหลัง")):
+        if is_thai:
+            return {
+                "section_1": {"title": "ข้อมูลผู้เข้าอบรม"},
+                "section_2": {"title": "แบบทดสอบหลังการอบรม"},
+            }
+        return {
+            "section_1": {"title": "Participant Information"},
+            "section_2": {"title": "Post-test"},
+        }
+
+    if any(keyword in lowered for keyword in ("feedback", "survey", "แบบประเมิน", "ความพึงพอใจ")):
+        if is_thai:
+            return {
+                "section_1": {"title": "ข้อมูลผู้ตอบแบบประเมิน"},
+                "section_2": {"title": "แบบประเมิน"},
+            }
+        return {
+            "section_1": {"title": "Respondent Information"},
+            "section_2": {"title": "Feedback Questions"},
+        }
+
+    if is_thai:
+        return {
+            "section_1": {"title": "ข้อมูลผู้เข้าอบรม"},
+            "section_2": {"title": "คำถามหลัก"},
+        }
+    return {
+        "section_1": {"title": "Participant Information"},
+        "section_2": {"title": "Main Questions"},
+    }
 
 
 def extract_question_count(text: str) -> int | None:
@@ -400,6 +555,51 @@ def extract_question_count(text: str) -> int | None:
             except ValueError:
                 return None
     return None
+
+
+def extract_inline_respondent_questions(text: str) -> list[dict[str, Any]]:
+    """Extract simple respondent fields mentioned inline in natural prompts."""
+    lowered = text.casefold()
+    keyword_map: list[tuple[str, str]] = [
+        ("name", "Name"),
+        ("full name", "Full Name"),
+        ("department", "Department"),
+        ("organization", "Organization"),
+        ("company", "Company"),
+        ("school", "School"),
+        ("phone", "Phone"),
+        ("email", "Email"),
+        ("role", "Role"),
+        ("position", "Position"),
+        ("ชื่อ", "ชื่อ-นามสกุล"),
+        ("หน่วยงาน", "หน่วยงาน"),
+        ("สถานศึกษา", "สถานศึกษา"),
+        ("โทร", "เบอร์โทรศัพท์"),
+        ("อีเมล", "อีเมล"),
+        ("ตำแหน่ง", "ตำแหน่ง"),
+    ]
+    matches: list[tuple[int, str]] = []
+    for keyword, label in keyword_map:
+        position = lowered.find(keyword.casefold())
+        if position != -1:
+            matches.append((position, label))
+    matches.sort(key=lambda item: item[0])
+
+    seen: set[str] = set()
+    questions: list[dict[str, Any]] = []
+    for _position, label in matches:
+        normalized = label.casefold()
+        if normalized in seen:
+            continue
+        questions.append(
+            {
+                "title": label,
+                "type": "text",
+                "required": True,
+            }
+        )
+        seen.add(normalized)
+    return questions
 
 
 def should_include_default_respondent_info(text: str) -> bool:
@@ -580,9 +780,17 @@ def compress_form_creation_request(text: str) -> str:
     """Condense a long form-creation prompt into a compact structured task."""
     title = extract_form_title(text)
     description = extract_form_description(text)
-    question_count = extract_question_count(text) or 0
+    question_count = infer_default_question_count(text)
     respondent_questions = extract_requested_respondent_questions(text)
+    if not respondent_questions:
+        respondent_questions = extract_inline_respondent_questions(text)
     section_structure = extract_requested_section_structure(text)
+    if not section_structure:
+        section_structure = infer_default_section_structure(
+            text,
+            respondent_questions,
+            question_count,
+        )
     lowered = text.lower()
 
     requirement_lines: list[str] = []
@@ -1999,6 +2207,85 @@ def _build_analysis_ready_table(rows: list[list[Any]]) -> tuple[list[str], list[
     return normalized_headers, cleaned_rows, header_row_index
 
 
+def _contains_thai(text: str) -> bool:
+    return bool(re.search(r"[\u0E00-\u0E7F]", text or ""))
+
+
+def infer_user_language(text: str) -> str:
+    """Infer whether the user's latest message is primarily Thai or English."""
+    if _contains_thai(text):
+        return "th"
+    return "en"
+
+
+def _sanitize_sheet_title(title: str, fallback: str) -> str:
+    """Sanitize a generated sheet title to comply with Google Sheets limits."""
+    cleaned = re.sub(r"[:\\/?*\[\]]", " ", str(title or "")).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if not cleaned:
+        cleaned = fallback
+    return cleaned[:100].strip()
+
+
+def _looks_like_generated_analysis_sheet(title: str) -> bool:
+    lowered = str(title or "").casefold()
+    markers = (
+        "response details",
+        "question summary",
+        "analysis ready",
+        "analysis summary",
+        "รายละเอียดคำตอบ",
+        "สรุปคำตอบ",
+        "สรุปรายข้อ",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _derive_analysis_sheet_names(
+    source_title: str,
+    headers: list[str],
+    requested_output_sheet_name: str,
+) -> tuple[str, str]:
+    """Derive user-friendly sheet names from the source tab and detected language."""
+    if requested_output_sheet_name.strip():
+        detailed_name = _sanitize_sheet_title(
+            requested_output_sheet_name.strip(),
+            "Response Details",
+        )
+        summary_name = _sanitize_sheet_title(
+            (
+                f"{detailed_name} - สรุปคำตอบรายข้อ"
+                if _contains_thai(detailed_name)
+                else f"{detailed_name} - Question Summary"
+            ),
+            "Question Summary" if not _contains_thai(detailed_name) else "สรุปคำตอบรายข้อ",
+        )
+        return detailed_name, summary_name
+
+    language_seed = " ".join([source_title, *headers[:5]])
+    is_thai = _contains_thai(language_seed)
+    base_title = source_title.strip() or ("คำตอบแบบฟอร์ม" if is_thai else "Form Responses")
+    if is_thai:
+        detailed_name = _sanitize_sheet_title(
+            f"{base_title} - รายละเอียดคำตอบ",
+            "รายละเอียดคำตอบ",
+        )
+        summary_name = _sanitize_sheet_title(
+            f"{base_title} - สรุปคำตอบรายข้อ",
+            "สรุปคำตอบรายข้อ",
+        )
+    else:
+        detailed_name = _sanitize_sheet_title(
+            f"{base_title} - Response Details",
+            "Response Details",
+        )
+        summary_name = _sanitize_sheet_title(
+            f"{base_title} - Question Summary",
+            "Question Summary",
+        )
+    return detailed_name, summary_name
+
+
 def _is_timestamp_header(header: str) -> bool:
     lowered = header.strip().casefold()
     return any(
@@ -2562,7 +2849,7 @@ def sync_form_responses_to_sheet(
 def format_response_sheet_for_analysis(
     spreadsheet_target: str,
     source_sheet_name: str = "",
-    output_sheet_name: str = "Analysis Ready",
+    output_sheet_name: str = "",
 ) -> str:
     """Format a raw Google Form response sheet into normalized analysis tables."""
     target = spreadsheet_target.strip()
@@ -2601,7 +2888,7 @@ def format_response_sheet_for_analysis(
         best_rows: list[list[Any]] = []
         for sheet in sheets:
             title = str(sheet.get("properties", {}).get("title", "") or "")
-            if not title or title == output_sheet_name:
+            if not title or _looks_like_generated_analysis_sheet(title):
                 continue
             values = (
                 service.spreadsheets()
@@ -2638,7 +2925,11 @@ def format_response_sheet_for_analysis(
         cleaned_rows,
     )
 
-    summary_sheet_name = f"{output_sheet_name} Summary"
+    output_sheet_name, summary_sheet_name = _derive_analysis_sheet_names(
+        source_title,
+        headers,
+        output_sheet_name,
+    )
     _ensure_sheet_exists(service, spreadsheet_id_value, output_sheet_name, sheets)
     _ensure_sheet_exists(service, spreadsheet_id_value, summary_sheet_name, sheets)
     destination_range = f"{_quote_sheet_title(output_sheet_name)}!A1"
@@ -2685,8 +2976,8 @@ def format_response_sheet_for_analysis(
             "rawHeaders": headers,
             "analysisHeaders": analysis_headers,
             "note": (
-                "The raw response data was normalized into one row per response answer, "
-                "and a separate summary sheet was created with counts and percentages by question."
+                "The raw response data was reorganized into a detailed response table, "
+                "and a separate question summary sheet was created with counts and percentages."
             ),
         },
         ensure_ascii=False,
@@ -3503,6 +3794,7 @@ def maybe_complete_manual_sheet_format_handoff(messages: list[AnyMessage]) -> AI
         return None
 
     latest_human_content = content_to_text(messages[latest_human_index].content)
+    user_language = infer_user_language(latest_human_content)
     targets = extract_spreadsheet_targets(latest_human_content)
     if not targets:
         return None
@@ -3573,30 +3865,53 @@ def maybe_complete_manual_sheet_format_handoff(messages: list[AnyMessage]) -> AI
             if spreadsheet_id
             else ""
         )
-        response_lines = [
-            "I formatted the linked response sheet for analysis.",
-            "",
-            f"- Spreadsheet: {spreadsheet_title or spreadsheet_id}",
-            f"- Source sheet: {source_sheet}",
-            f"- Normalized analysis sheet: {output_sheet}",
-            f"- Summary sheet: {summary_sheet}",
-            f"- Normalized rows written: {row_count}",
-            f"- Analysis columns: {column_count}",
-            f"- Summary rows written: {summary_row_count}",
-        ]
+        if user_language == "th":
+            response_lines = [
+                "ฉันจัดรูปแบบชีตคำตอบที่ลิงก์ไว้สำหรับการวิเคราะห์เรียบร้อยแล้ว",
+                "",
+                f"- สเปรดชีต: {spreadsheet_title or spreadsheet_id}",
+                f"- ชีตต้นฉบับ: {source_sheet}",
+                f"- ชีตรายละเอียดคำตอบ: {output_sheet}",
+                f"- ชีตสรุปคำตอบรายข้อ: {summary_sheet}",
+                f"- จำนวนแถวคำตอบที่เขียน: {row_count}",
+                f"- จำนวนคอลัมน์ในชีตรายละเอียด: {column_count}",
+                f"- จำนวนแถวในชีตสรุป: {summary_row_count}",
+            ]
+        else:
+            response_lines = [
+                "I formatted the linked response sheet for analysis.",
+                "",
+                f"- Spreadsheet: {spreadsheet_title or spreadsheet_id}",
+                f"- Source sheet: {source_sheet}",
+                f"- Detailed responses sheet: {output_sheet}",
+                f"- Question summary sheet: {summary_sheet}",
+                f"- Response rows written: {row_count}",
+                f"- Columns in detailed sheet: {column_count}",
+                f"- Summary rows written: {summary_row_count}",
+            ]
         if spreadsheet_url:
-            response_lines.extend(["", f"Spreadsheet link: {spreadsheet_url}"])
+            response_lines.extend(
+                ["", f"{'ลิงก์สเปรดชีต' if user_language == 'th' else 'Spreadsheet link'}: {spreadsheet_url}"]
+            )
         response_lines.extend(
             [
                 "",
-                "Use the normalized analysis sheet for row-level analysis and the summary sheet for counts, percentages, charts, and further analysis.",
+                (
+                    "ใช้ชีตรายละเอียดคำตอบสำหรับการวิเคราะห์รายแถว และใช้ชีตสรุปคำตอบรายข้อสำหรับการนับ เปอร์เซ็นต์ กราฟ และการวิเคราะห์ต่อ"
+                    if user_language == "th"
+                    else "Use the detailed responses sheet for row-level analysis and the question summary sheet for counts, percentages, charts, and further analysis."
+                ),
             ]
         )
         return AIMessage(content="\n".join(response_lines).strip())
     except Exception as exc:
         raise RuntimeError(
-            "I recognized the spreadsheet link handoff, but formatting the linked response sheet failed. "
-            f"Details: {exc}"
+            (
+                "ฉันตรวจพบว่าเป็นการส่งลิงก์สเปรดชีตกลับมา แต่การจัดรูปแบบชีตคำตอบล้มเหลว "
+                if user_language == "th"
+                else "I recognized the spreadsheet link handoff, but formatting the linked response sheet failed. "
+            )
+            + f"Details: {exc}"
         ) from exc
 
 
@@ -3612,6 +3927,7 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
         return None
 
     latest_human_content = content_to_text(messages[latest_human_index].content).strip()
+    user_language = infer_user_language(latest_human_content)
     if not latest_human_content or latest_human_content.startswith("FORM_CREATION_TASK"):
         return None
     if extract_spreadsheet_targets(latest_human_content):
@@ -3622,8 +3938,16 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
     title = extract_form_title(latest_human_content).strip() or "Generated Google Form"
     description = extract_form_description(latest_human_content).strip()
     respondent_questions = extract_requested_respondent_questions(latest_human_content)
+    if not respondent_questions:
+        respondent_questions = extract_inline_respondent_questions(latest_human_content)
+    expected_question_count = infer_default_question_count(latest_human_content)
     section_structure = extract_requested_section_structure(latest_human_content)
-    expected_question_count = extract_question_count(latest_human_content) or 0
+    if not section_structure:
+        section_structure = infer_default_section_structure(
+            latest_human_content,
+            respondent_questions,
+            expected_question_count,
+        )
 
     try:
         result = create_form_with_response_sheet.invoke(
@@ -3649,11 +3973,18 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
         if not isinstance(result, str):
             result = json.dumps(result, ensure_ascii=False, indent=2)
         payload = json.loads(result)
-        response_lines = [
-            "The Google Form has been successfully created.",
-            "",
-            f"- Title: {str(payload.get('title', '') or title)}",
-        ]
+        if user_language == "th":
+            response_lines = [
+                "สร้าง Google Form เรียบร้อยแล้ว",
+                "",
+                f"- ชื่อฟอร์ม: {str(payload.get('title', '') or title)}",
+            ]
+        else:
+            response_lines = [
+                "The Google Form has been successfully created.",
+                "",
+                f"- Title: {str(payload.get('title', '') or title)}",
+            ]
         form_url = str(payload.get("formUrl", "") or payload.get("editUrl", "") or "")
         responder_url = str(
             payload.get("responderUri", "") or payload.get("responseUrl", "") or ""
@@ -3661,21 +3992,35 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
         form_id = str(payload.get("formId", "") or "")
         question_count = int(payload.get("questionCount", 0) or 0)
         if form_id:
-            response_lines.append(f"- Form ID: {form_id}")
+            response_lines.append(f"- {'รหัสฟอร์ม' if user_language == 'th' else 'Form ID'}: {form_id}")
         if question_count:
-            response_lines.append(f"- Questions added: {question_count}")
+            response_lines.append(
+                f"- {'จำนวนคำถามที่เพิ่ม' if user_language == 'th' else 'Questions added'}: {question_count}"
+            )
         if form_url:
-            response_lines.extend(["", f"Form link: {form_url}"])
+            response_lines.extend(["", f"{'ลิงก์ฟอร์ม' if user_language == 'th' else 'Form link'}: {form_url}"])
         if responder_url:
-            response_lines.append(f"Responder link: {responder_url}")
+            response_lines.append(
+                f"{'ลิงก์สำหรับผู้ตอบ' if user_language == 'th' else 'Responder link'}: {responder_url}"
+            )
         next_step = str(payload.get("nextStep", "") or "").strip()
         if next_step:
-            response_lines.extend(["", next_step])
+            localized_next_step = next_step
+            if user_language == "th":
+                localized_next_step = (
+                    "ให้เชื่อมฟอร์มนี้กับ Google Spreadsheet ในหน้า Google Forms แบบ manual "
+                    "แล้วส่งลิงก์สเปรดชีตกลับมา เพื่อให้ฉันจัดรูปแบบข้อมูลคำตอบสำหรับการวิเคราะห์ต่อ"
+                )
+            response_lines.extend(["", localized_next_step])
         return AIMessage(content="\n".join(response_lines).strip())
     except Exception as exc:
         raise RuntimeError(
-            "I recognized this as a Google Form creation request, but the direct form creation flow failed. "
-            f"Details: {exc}"
+            (
+                "ฉันตรวจพบว่านี่เป็นคำขอสร้าง Google Form แต่การสร้างฟอร์มแบบตรงล้มเหลว "
+                if user_language == "th"
+                else "I recognized this as a Google Form creation request, but the direct form creation flow failed. "
+            )
+            + f"Details: {exc}"
         ) from exc
 
 
