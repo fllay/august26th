@@ -4,8 +4,8 @@ These instructions apply to this repository unless a more specific `AGENTS.md` e
 
 ## Project Context
 
-- Repository: `Google-form-agent-NECTEC`
-- Purpose: LangChain Deep Agent that creates Google Forms using OpenRouter as the LLM API and `matteoantoci/google-forms-mcp` as the Google Forms MCP server.
+- Repository: `august26th`
+- Purpose: LangChain Deep Agent that creates Google Forms and helps format linked Google Sheets response data for analysis.
 - Primary language/framework: Python 3.11+ package using `deepagents`, `langchain-openai`, and `langchain-mcp-adapters`.
 - Web UI: Next.js Agent Chat UI under `agent-chat-ui/`, connected to the LangGraph backend with assistant id `agent`.
 - MCP server: bundled under `mcp/google-forms-mcp` and built locally or inside the backend Docker image.
@@ -22,6 +22,19 @@ These instructions apply to this repository unless a more specific `AGENTS.md` e
 - For local text-only LLMs, uploaded PDF/DOC/DOCX files are converted to text before model calls; image uploads are retained as attachment context.
 - Configure the Web UI backend URLs through `.env` with `WEBUI_PUBLIC_API_URL` and `WEBUI_LANGGRAPH_API_URL`.
 - Run backend and web UI together with `docker compose up --build`; Docker Desktop must be running with the Linux engine.
+- Current product workflow is:
+  1. user asks the agent to create a form
+  2. agent creates the Google Form
+  3. user manually links the form to a Google Spreadsheet in Google Forms
+  4. user sends the spreadsheet link back
+  5. agent formats the linked response sheet into analysis-oriented tabs
+- Native automatic Google Forms -> Sheets linking is intentionally not part of the current flow.
+- The backend now prefers deterministic shortcuts for obvious handoffs:
+  - clear form-creation prompts can go straight into the local `create_form_with_response_sheet` tool path
+  - pasted linked spreadsheet URLs can go straight into `format_response_sheet_for_analysis`
+- The form formatter should produce analysis-oriented output, not just a cleaned copy of the raw response tab.
+- The agent should support simple natural prompts, especially short Thai prompts, without requiring heavily structured instructions.
+- The agent should reply in the user's language when practical; Thai users should get Thai-facing responses and English users should get English-facing responses.
 - Deployment target is not documented yet.
 
 ## Working Style
@@ -36,6 +49,8 @@ These instructions apply to this repository unless a more specific `AGENTS.md` e
 
 - When code or configuration is added later, run the relevant checks or tests if available.
 - If no automated checks exist, state what was inspected manually.
+- For backend changes, prefer `python -m compileall src`.
+- For Web UI changes, prefer `npm run build` in `agent-chat-ui/`.
 
 ## Handoff Notes
 
