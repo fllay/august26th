@@ -141,7 +141,8 @@ export async function describeContentBlockForModel(
   const mimeType = block.mimeType ?? "unknown type";
 
   if (block.type === "image") {
-    return "";
+    const text = await imageContentBlockToText(block);
+    return text ? `[Uploaded image: ${name} (${mimeType})]\n${text}` : "";
   }
 
   if (block.type !== "file") {
@@ -190,6 +191,31 @@ async function pdfContentBlockToText(
   }
 }
 
+async function imageContentBlockToText(
+  block: ContentBlock.Multimodal.Data,
+): Promise<string> {
+  if (typeof block.data !== "string" || !block.data) return "";
+  try {
+    const response = await fetch("/api/extract-file", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        mimeType: block.mimeType,
+        data: block.data,
+      }),
+    });
+
+    if (!response.ok) {
+      return "";
+    }
+
+    const result = (await response.json()) as { text?: unknown };
+    return typeof result.text === "string" ? result.text.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
 async function docxContentBlockToText(
   block: ContentBlock.Multimodal.Data,
 ): Promise<string> {
@@ -202,10 +228,100 @@ async function docxContentBlockToText(
 
     const parser = new DOMParser();
     const doc = parser.parseFromString(documentXml, "application/xml");
-    return Array.from(doc.getElementsByTagName("w:t"))
-      .map((node) => node.textContent ?? "")
-      .join("")
-      .trim();
+    const ns = {
+      w: "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+      wp: "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+      pic: "http://schemas.openxmlformats.org/drawingml/2006/picture",
+      a: "http://schemas.openxmlformats.org/drawingml/2006/main",
+      v: "urn:schemas-microsoft-com:vml",
+    };
+
+    const body = doc.getElementsByTagNameNS(ns.w, "body")[0];
+    if (!body) return "";
+
+    const extractImageMarkers = (element: Element): string[] => {
+      const markers: string[] = [];
+      const pushMarker = (label: string | null | undefined) => {
+        const normalized = (label ?? "").trim();
+        markers.push(
+          normalized ? `[Embedded image: ${normalized}]` : "[Embedded image]",
+        );
+      };
+
+      Array.from(element.getElementsByTagNameNS(ns.wp, "docPr")).forEach((node) =>
+        pushMarker(
+          node.getAttribute("descr") ||
+            node.getAttribute("title") ||
+            node.getAttribute("name"),
+        ),
+      );
+      Array.from(element.getElementsByTagNameNS(ns.pic, "cNvPr")).forEach((node) =>
+        pushMarker(
+          node.getAttribute("descr") ||
+            node.getAttribute("title") ||
+            node.getAttribute("name"),
+        ),
+      );
+      Array.from(element.getElementsByTagNameNS(ns.v, "shape")).forEach((node) =>
+        pushMarker(
+          node.getAttribute("alt") ||
+            node.getAttribute("title") ||
+            node.getAttribute("id"),
+        ),
+      );
+      if (
+        markers.length === 0 &&
+        (element.getElementsByTagNameNS(ns.a, "blip").length > 0 ||
+          element.getElementsByTagNameNS(ns.v, "imagedata").length > 0)
+      ) {
+        markers.push("[Embedded image]");
+      }
+      return Array.from(new Set(markers));
+    };
+
+    const renderParagraph = (paragraph: Element): string[] => {
+      const text = Array.from(paragraph.getElementsByTagNameNS(ns.w, "t"))
+        .map((node) => node.textContent ?? "")
+        .join("")
+        .trim();
+      const lines: string[] = [];
+      if (text) lines.push(text);
+      lines.push(...extractImageMarkers(paragraph));
+      return lines;
+    };
+
+    const renderTable = (table: Element): string[] => {
+      const lines = ["[Table]"];
+      const rows = Array.from(table.getElementsByTagNameNS(ns.w, "tr"));
+      for (const row of rows) {
+        const cells = Array.from(row.getElementsByTagNameNS(ns.w, "tc")).map(
+          (cell) => {
+            const parts: string[] = [];
+            Array.from(cell.children).forEach((child) => {
+              if (child.localName === "p") {
+                parts.push(...renderParagraph(child));
+              }
+            });
+            return parts.join(" ").trim();
+          },
+        );
+        if (cells.some(Boolean)) {
+          lines.push(cells.join(" | "));
+        }
+      }
+      return lines;
+    };
+
+    const parts: string[] = [];
+    Array.from(body.children).forEach((child) => {
+      if (child.localName === "p") {
+        parts.push(...renderParagraph(child));
+      } else if (child.localName === "tbl") {
+        parts.push(...renderTable(child));
+      }
+    });
+
+    return parts.filter(Boolean).join("\n").trim();
   } catch {
     return "";
   }

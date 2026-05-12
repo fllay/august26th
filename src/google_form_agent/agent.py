@@ -257,6 +257,36 @@ def normalize_uploaded_file_context(text: str) -> str:
     )
 
 
+def extract_embedded_file_context(text: str) -> str:
+    """Extract already-processed uploaded-file text from a message body."""
+    matches = list(FILE_TEXT_RE.finditer(text))
+    if not matches:
+        return ""
+    cleaned_contexts = [
+        clean_extracted_file_text(match.group("context"))
+        for match in matches
+        if clean_extracted_file_text(match.group("context"))
+    ]
+    if not cleaned_contexts:
+        return ""
+    return max(cleaned_contexts, key=len)
+
+
+def strip_embedded_file_context(text: str) -> str:
+    """Remove uploaded-file control markers so user intent can be parsed cleanly."""
+    normalized = normalize_uploaded_file_context(text)
+    stripped = FILE_TEXT_RE.sub("", normalized)
+    stripped = stripped.replace(
+        "The uploaded file has already been processed by the application. Do not use tools. Do not say you cannot access it.",
+        "",
+    )
+    stripped = stripped.replace(
+        "When the user asks for text in the uploaded file, return only the text between FILE_TEXT markers.",
+        "",
+    )
+    return re.sub(r"\n{3,}", "\n\n", stripped).strip()
+
+
 def extract_spreadsheet_targets(text: str) -> list[str]:
     """Extract likely Google Sheets URLs or spreadsheet IDs from user text."""
     targets: list[str] = []
@@ -555,6 +585,26 @@ def extract_question_count(text: str) -> int | None:
             except ValueError:
                 return None
     return None
+
+
+def prefers_exact_source_following(text: str) -> bool:
+    """Return whether the user wants the attached source followed closely."""
+    lowered = text.casefold()
+    keywords = (
+        "follow the file",
+        "follow the attached file",
+        "follow exactly",
+        "use the file as source of truth",
+        "use the attached file as source of truth",
+        "à¸¢à¸¶à¸”à¸•à¸²à¸¡à¹„à¸Ÿà¸¥à¹Œ",
+        "à¸¢à¸¶à¸”à¸•à¸²à¸¡à¹„à¸Ÿà¸¥à¹Œà¹à¸™à¸š",
+        "à¸•à¸²à¸¡à¹„à¸Ÿà¸¥à¹Œà¹à¸™à¸š",
+        "à¸•à¸²à¸¡à¸•à¹‰à¸™à¸‰à¸šà¸±à¸š",
+        "à¹ƒà¸«à¹‰à¸•à¸£à¸‡à¸•à¸²à¸¡à¹„à¸Ÿà¸¥à¹Œ",
+        "à¹ƒà¸«à¹‰à¸•à¸£à¸‡à¸•à¸²à¸¡à¸•à¹‰à¸™à¸‰à¸šà¸±à¸š",
+        "à¸•à¹‰à¸™à¸‰à¸šà¸±à¸šà¸«à¸¥à¸±à¸",
+    )
+    return any(keyword in lowered for keyword in keywords)
 
 
 def extract_inline_respondent_questions(text: str) -> list[dict[str, Any]]:
@@ -1829,6 +1879,371 @@ def _parse_questions_text_rich(questions_text: str) -> list[dict[str, Any]]:
     return questions
 
 
+def extract_questions_from_reference_text(reference_text: str) -> list[dict[str, Any]]:
+    """Extract concrete questions from uploaded reference text when possible."""
+    def infer_choice_count_from_reference(text: str) -> int | None:
+        thai_choice_markers = ("ก.", "ข.", "ค.", "ง.")
+        if all(marker in text for marker in thai_choice_markers):
+            return 4
+        english_choice_markers = ("A.", "B.", "C.", "D.")
+        if all(marker in text for marker in english_choice_markers):
+            return 4
+        return None
+
+    inferred_choice_count = infer_choice_count_from_reference(reference_text)
+
+    def split_inline_choice_line(text: str) -> list[str]:
+        segments = re.split(
+            r"(?=(?:[A-Da-d]|[\u0E01-\u0E2E])[.)]\s*)",
+            text.strip(),
+        )
+        options: list[str] = []
+        for segment in segments:
+            normalized = segment.strip()
+            if not normalized:
+                continue
+            match = re.match(r"^(?:[A-Da-d]|[\u0E01-\u0E2E])[.)]\s*(.*)$", normalized)
+            if not match:
+                continue
+            option_text = match.group(1).strip()
+            options.append(option_text)
+        return options
+
+    def is_valid_extracted_question(question: dict[str, Any]) -> bool:
+        title = str(question.get("title", "") or "").strip()
+        if not title:
+            return False
+
+        lowered_title = title.casefold()
+        if lowered_title in {
+            "แบบทดสอบก่อนเรียน",
+            "แบบทดสอบก่อนการอบรม",
+            "แบบทดสอบหลังเรียน",
+            "แบบทดสอบหลังการอบรม",
+            "pre-test",
+            "post-test",
+            "participant information",
+            "respondent information",
+        }:
+            return False
+
+        question_type = str(question.get("type", "multiple_choice") or "multiple_choice").strip().lower()
+        options = [
+            str(option).strip()
+            for option in question.get("options", [])
+            if str(option).strip()
+        ]
+        if question_type in {"text", "short_answer"}:
+            return True
+        if question_type in {"multiple_choice", "multiple-choice", "radio", "checkbox", "checkboxes", "dropdown", "drop_down"}:
+            return len(options) >= 1
+        return True
+
+    def normalize_extracted_questions(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for question in questions:
+            normalized_question = dict(question)
+            question_type = str(normalized_question.get("type", "multiple_choice") or "multiple_choice").strip().lower()
+            options = [
+                str(option).strip()
+                for option in normalized_question.get("options", [])
+                if str(option).strip()
+            ]
+            expanded_options: list[str] = []
+            for option in options:
+                inline_split = split_inline_choice_line(option)
+                if len(inline_split) >= 2:
+                    expanded_options.extend(inline_split)
+                else:
+                    expanded_options.append(option)
+            options = expanded_options
+            if inferred_choice_count and question_type in {
+                "multiple_choice",
+                "multiple-choice",
+                "radio",
+            }:
+                options = options[:inferred_choice_count]
+            if question_type in {
+                "multiple_choice",
+                "multiple-choice",
+                "radio",
+                "checkbox",
+                "checkboxes",
+                "dropdown",
+                "drop_down",
+            } and not options:
+                normalized_question["type"] = "text"
+            elif question_type in {
+                "multiple_choice",
+                "multiple-choice",
+                "radio",
+            } and len(options) == 1:
+                normalized_question["type"] = "text"
+            normalized_question["options"] = options
+            if is_valid_extracted_question(normalized_question):
+                normalized.append(normalized_question)
+        return normalized
+
+    def parse_thai_exam_questions(text: str) -> list[dict[str, Any]]:
+        lines = [line.rstrip() for line in text.replace("\r\n", "\n").splitlines()]
+        questions: list[dict[str, Any]] = []
+        current_question: dict[str, Any] | None = None
+
+        question_start_re = re.compile(r"^\s*(\d+)[.)]\s+(.+)$")
+        option_start_re = re.compile(r"^\s*([A-Da-d]|[\u0E01-\u0E2E])[.)]\s*(.*)$")
+        answer_blank_re = re.compile(
+            r"^\s*(?:[._\-]{5,}|[.…·•\s]{8,})\s*$"
+        )
+
+        def is_skippable_line(text: str) -> bool:
+            if not text:
+                return True
+            if text in {"[Table]"} or text.startswith("[Embedded image"):
+                return True
+            return _is_instructional_prompt_line(text)
+
+        def next_meaningful_lines(start_index: int, limit: int = 8) -> list[str]:
+            meaningful: list[str] = []
+            for candidate in lines[start_index : start_index + limit]:
+                stripped_candidate = candidate.strip()
+                if is_skippable_line(stripped_candidate):
+                    continue
+                meaningful.append(stripped_candidate)
+            return meaningful
+
+        def looks_like_question_sublist(start_index: int) -> bool:
+            lookahead = next_meaningful_lines(start_index)
+            numbered_prefix_count = 0
+            option_marker_found = False
+            for candidate in lookahead:
+                if option_start_re.match(candidate):
+                    option_marker_found = True
+                    break
+                numbered_match = question_start_re.match(candidate)
+                if numbered_match and int(numbered_match.group(1)) <= 5:
+                    numbered_prefix_count += 1
+                    continue
+                break
+            return numbered_prefix_count >= 2 and option_marker_found
+
+        def begins_numbered_subitem_sequence(start_index: int) -> bool:
+            lookahead = next_meaningful_lines(start_index)
+            numbered_prefix_count = 0
+            option_marker_found = False
+            for candidate in lookahead:
+                if option_start_re.match(candidate):
+                    option_marker_found = True
+                    break
+                numbered_match = question_start_re.match(candidate)
+                if numbered_match and int(numbered_match.group(1)) <= 5:
+                    numbered_prefix_count += 1
+                    continue
+                break
+            return numbered_prefix_count >= 1 and option_marker_found
+
+        def looks_like_question_title(start_index: int) -> bool:
+            lookahead = next_meaningful_lines(start_index)
+            if not lookahead:
+                return False
+            first = lookahead[0]
+            if option_start_re.match(first):
+                return False
+            if answer_blank_re.match(first):
+                return False
+
+            option_marker_count = 0
+            numbered_subitem_count = 0
+            for candidate in lookahead[1:]:
+                if option_start_re.match(candidate):
+                    option_marker_count += 1
+                    if option_marker_count >= 2:
+                        return True
+                    if numbered_subitem_count >= 2:
+                        return True
+                    continue
+                if answer_blank_re.match(candidate):
+                    return True
+                numbered_match = question_start_re.match(candidate)
+                if numbered_match and int(numbered_match.group(1)) <= 5:
+                    numbered_subitem_count += 1
+                    continue
+                break
+            return False
+
+        def flush_current() -> None:
+            nonlocal current_question
+            if current_question and is_valid_extracted_question(current_question):
+                questions.append(
+                    _normalize_question_dict(current_question, len(questions) + 1)
+                )
+            current_question = None
+
+        for line_index, raw_line in enumerate(lines):
+            stripped = raw_line.strip()
+            if is_skippable_line(stripped):
+                continue
+
+            question_match = question_start_re.match(stripped)
+            if question_match:
+                if (
+                    current_question is not None
+                    and not current_question.get("options")
+                    and int(question_match.group(1)) <= 5
+                    and (
+                        looks_like_question_sublist(line_index)
+                        or bool(current_question.get("_collect_numbered_subitems"))
+                    )
+                ):
+                    description = str(current_question.get("description", "") or "").strip()
+                    addition = stripped
+                    current_question["description"] = (
+                        f"{description}\n{addition}".strip() if description else addition
+                    )
+                    current_question["_collect_numbered_subitems"] = True
+                    continue
+                flush_current()
+                current_question = {
+                    "title": question_match.group(2).strip(),
+                    "type": "multiple_choice",
+                    "required": True,
+                    "options": [],
+                    "description": "",
+                    "_collect_numbered_subitems": begins_numbered_subitem_sequence(
+                        line_index
+                    ),
+                }
+                continue
+
+            if current_question is None:
+                if looks_like_question_title(line_index):
+                    current_question = {
+                        "title": stripped,
+                        "type": "multiple_choice",
+                        "required": True,
+                        "options": [],
+                        "description": "",
+                        "_collect_numbered_subitems": begins_numbered_subitem_sequence(
+                            line_index + 1
+                        ),
+                    }
+                continue
+
+            option_match = option_start_re.match(stripped)
+            if option_match:
+                option_label = option_match.group(1).strip()
+                option_text = option_match.group(2).strip()
+                if option_text and not _is_placeholder_content(option_text):
+                    inline_split = split_inline_choice_line(stripped)
+                    if len(inline_split) >= 2:
+                        current_question["options"].extend(
+                            option for option in inline_split if option and not _is_placeholder_content(option)
+                        )
+                    else:
+                        current_question["options"].append(option_text)
+                else:
+                    current_question["options"].append(f"ตัวเลือก {option_label} (จากภาพ)")
+                continue
+
+            if answer_blank_re.match(stripped):
+                current_question["type"] = "text"
+                continue
+
+            if current_question.get("options"):
+                flush_current()
+                if looks_like_question_title(line_index):
+                    current_question = {
+                        "title": stripped,
+                        "type": "multiple_choice",
+                        "required": True,
+                        "options": [],
+                        "description": "",
+                        "_collect_numbered_subitems": begins_numbered_subitem_sequence(
+                            line_index + 1
+                        ),
+                    }
+                continue
+
+            if looks_like_question_title(line_index):
+                flush_current()
+                current_question = {
+                    "title": stripped,
+                    "type": "multiple_choice",
+                    "required": True,
+                    "options": [],
+                    "description": "",
+                    "_collect_numbered_subitems": begins_numbered_subitem_sequence(
+                        line_index + 1
+                    ),
+                }
+                continue
+
+            title = str(current_question.get("title", "") or "").strip()
+            current_question["title"] = f"{title} {stripped}".strip()
+
+        flush_current()
+        return questions
+
+    text = clean_extracted_file_text(reference_text)
+    if not text:
+        return []
+
+    thai_exam_parsed = parse_thai_exam_questions(text)
+    if thai_exam_parsed:
+        return normalize_extracted_questions(thai_exam_parsed)
+
+    parsed = _parse_questions_text_rich(text)
+    if parsed:
+        return normalize_extracted_questions(parsed)
+
+    lines = [line.rstrip() for line in text.replace("\r\n", "\n").splitlines()]
+    questions: list[dict[str, Any]] = []
+    current_question: dict[str, Any] | None = None
+
+    question_start_re = re.compile(r"^\s*(\d+)[.)]\s+(.+)$")
+    option_re = re.compile(
+        r"^\s*(?:[-*]|\(?[A-Da-d]\)?[.)]|[\u0E01-\u0E2E][.)]|\d+[.)])\s+(.+)$"
+    )
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not stripped or _is_instructional_prompt_line(stripped):
+            continue
+
+        question_match = question_start_re.match(stripped)
+        if question_match:
+            candidate_title = question_match.group(2).strip()
+            if current_question and str(current_question.get("title", "")).strip():
+                questions.append(
+                    _normalize_question_dict(current_question, len(questions) + 1)
+                )
+            current_question = {
+                "title": candidate_title,
+                "type": "multiple_choice",
+                "required": True,
+                "options": [],
+                "description": "",
+            }
+            continue
+
+        if current_question is None:
+            continue
+
+        option_match = option_re.match(stripped)
+        if option_match:
+            option = option_match.group(1).strip()
+            if option and not _is_placeholder_content(option):
+                current_question.setdefault("options", []).append(option)
+            continue
+
+        if not current_question.get("description") and stripped:
+            current_question["description"] = stripped
+
+    if current_question and str(current_question.get("title", "")).strip():
+        questions.append(_normalize_question_dict(current_question, len(questions) + 1))
+
+    return normalize_extracted_questions(questions)
+
+
 def _parse_questions_input(questions_json: str, questions_text: str) -> list[dict[str, Any]]:
     """Parse questions from structured JSON first, then plain-text fallback."""
     if questions_json.strip():
@@ -2728,6 +3143,7 @@ def create_form_with_response_sheet(
     section_structure_json: str = "",
     expected_question_count: int = 0,
     source_prompt: str = "",
+    strict_source_questions: bool = False,
 ) -> str:
     """Create a Google Form and optionally add description/questions."""
     if not title.strip():
@@ -2746,7 +3162,15 @@ def create_form_with_response_sheet(
     if not section_structure and normalized_source_prompt:
         section_structure = extract_requested_section_structure(normalized_source_prompt)
 
+    if strict_source_questions and questions:
+        effective_expected_question_count = max(
+            0,
+            _count_non_section_questions(questions) - len(respondent_questions),
+        )
+
     if (
+        not strict_source_questions
+        and
         effective_expected_question_count > 0
         and _count_non_section_questions(questions) - len(respondent_questions) < effective_expected_question_count
         and normalized_source_prompt
@@ -2768,7 +3192,7 @@ def create_form_with_response_sheet(
         respondent_questions,
         section_structure,
     )
-    if effective_expected_question_count > 0:
+    if not strict_source_questions and effective_expected_question_count > 0:
         actual_main_question_count = (
             _count_non_section_questions(questions) - len(respondent_questions)
         )
@@ -3489,10 +3913,15 @@ def extract_doc_text(file_bytes: bytes) -> str:
 
 
 def extract_docx_text(file_bytes: bytes) -> str:
-    """Extract text from a DOCX using only the Python standard library."""
+    """Extract structured text from a DOCX using only the Python standard library."""
     try:
         with zipfile.ZipFile(io.BytesIO(file_bytes)) as docx:
             xml_bytes = docx.read("word/document.xml")
+            media_names = {
+                name.rsplit("/", 1)[-1]
+                for name in docx.namelist()
+                if name.startswith("word/media/")
+            }
     except Exception:
         return ""
 
@@ -3501,18 +3930,116 @@ def extract_docx_text(file_bytes: bytes) -> str:
     except ElementTree.ParseError:
         return ""
 
-    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-    paragraphs: list[str] = []
-    for paragraph in root.findall(".//w:p", namespace):
+    namespace = {
+        "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "pic": "http://schemas.openxmlformats.org/drawingml/2006/picture",
+        "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+        "v": "urn:schemas-microsoft-com:vml",
+        "o": "urn:schemas-microsoft-com:office:office",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    }
+
+    def paragraph_style_prefix(paragraph: ElementTree.Element) -> str:
+        style = paragraph.find("./w:pPr/w:pStyle", namespace)
+        style_val = style.get(f"{{{namespace['w']}}}val", "") if style is not None else ""
+        if not style_val:
+            return ""
+        lowered = style_val.casefold()
+        if lowered.startswith("heading"):
+            level_match = re.search(r"(\d+)", style_val)
+            level = max(1, min(6, int(level_match.group(1)))) if level_match else 1
+            return "#" * level + " "
+        if lowered in {"title", "subtitle"}:
+            return "# "
+        return ""
+
+    def extract_image_markers(element: ElementTree.Element) -> list[str]:
+        markers: list[str] = []
+
+        doc_props = element.findall(".//wp:docPr", namespace)
+        pic_props = element.findall(".//pic:cNvPr", namespace)
+        v_shapes = element.findall(".//v:shape", namespace)
+
+        for node in [*doc_props, *pic_props]:
+            label = (
+                node.get("descr", "").strip()
+                or node.get("title", "").strip()
+                or node.get("name", "").strip()
+            )
+            markers.append(f"[Embedded image: {label}]" if label else "[Embedded image]")
+
+        for shape in v_shapes:
+            label = (
+                shape.get("alt", "").strip()
+                or shape.get("title", "").strip()
+                or shape.get("id", "").strip()
+            )
+            markers.append(f"[Embedded image: {label}]" if label else "[Embedded image]")
+
+        if not markers:
+            blips = element.findall(".//a:blip", namespace)
+            imagedata = element.findall(".//v:imagedata", namespace)
+            image_refs = len(blips) + len(imagedata)
+            if image_refs:
+                markers.extend("[Embedded image]" for _ in range(image_refs))
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for marker in markers:
+            if marker not in seen:
+                deduped.append(marker)
+                seen.add(marker)
+        return deduped
+
+    def render_paragraph(paragraph: ElementTree.Element) -> list[str]:
         runs = [
             text_node.text or ""
             for text_node in paragraph.findall(".//w:t", namespace)
         ]
         text = "".join(runs).strip()
+        markers = extract_image_markers(paragraph)
+        lines: list[str] = []
         if text:
-            paragraphs.append(text)
+            lines.append(f"{paragraph_style_prefix(paragraph)}{text}".strip())
+        lines.extend(markers)
+        return lines
 
-    return "\n".join(paragraphs).strip()
+    def render_table(table: ElementTree.Element) -> list[str]:
+        lines: list[str] = ["[Table]"]
+        for row in table.findall("./w:tr", namespace):
+            cells: list[str] = []
+            for cell in row.findall("./w:tc", namespace):
+                cell_parts: list[str] = []
+                for child in list(cell):
+                    tag = child.tag.rsplit("}", 1)[-1]
+                    if tag == "p":
+                        cell_parts.extend(render_paragraph(child))
+                    elif tag == "tbl":
+                        cell_parts.extend(render_table(child))
+                cell_text = " ".join(part.strip() for part in cell_parts if part.strip()).strip()
+                cells.append(cell_text)
+            if any(cells):
+                lines.append(" | ".join(cell or " " for cell in cells))
+        return lines
+
+    body = root.find("./w:body", namespace)
+    if body is None:
+        return ""
+
+    parts: list[str] = []
+    for child in list(body):
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            parts.extend(render_paragraph(child))
+        elif tag == "tbl":
+            parts.extend(render_table(child))
+
+    if media_names and not any("[Embedded image" in part for part in parts):
+        parts.append(f"[Embedded images: {len(media_names)}]")
+
+    cleaned_parts = [part.strip() for part in parts if part and part.strip()]
+    return "\n".join(cleaned_parts).strip()
 
 
 def xml_text_nodes(xml_bytes: bytes, tag_suffix: str = "t") -> list[str]:
@@ -3927,26 +4454,72 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
         return None
 
     latest_human_content = content_to_text(messages[latest_human_index].content).strip()
+    embedded_file_context = extract_embedded_file_context(latest_human_content)
+    latest_user_instruction = strip_embedded_file_context(latest_human_content)
+    effective_reference_text = embedded_file_context.strip()
+    effective_creation_brief = latest_user_instruction.strip()
+    exact_source_mode = bool(effective_reference_text) and prefers_exact_source_following(
+        latest_user_instruction or latest_human_content
+    )
+    if effective_reference_text:
+        effective_creation_brief = (
+            f"{effective_creation_brief}\n\n"
+            "Reference material from uploaded file:\n"
+            f"{effective_reference_text}"
+        ).strip()
+
     user_language = infer_user_language(latest_human_content)
     if not latest_human_content or latest_human_content.startswith("FORM_CREATION_TASK"):
         return None
-    if extract_spreadsheet_targets(latest_human_content):
+    if extract_spreadsheet_targets(latest_user_instruction or latest_human_content):
         return None
-    if not looks_like_form_creation_request(latest_human_content):
+    if not looks_like_form_creation_request(latest_user_instruction or latest_human_content):
         return None
 
-    title = extract_form_title(latest_human_content).strip() or "Generated Google Form"
-    description = extract_form_description(latest_human_content).strip()
-    respondent_questions = extract_requested_respondent_questions(latest_human_content)
+    parsing_source = effective_creation_brief or latest_human_content
+    file_questions = (
+        extract_questions_from_reference_text(effective_reference_text)
+        if effective_reference_text
+        else []
+    )
+
+    title = extract_form_title(parsing_source).strip() or "Generated Google Form"
+    description = extract_form_description(parsing_source).strip()
+    respondent_questions = extract_requested_respondent_questions(parsing_source)
     if not respondent_questions:
-        respondent_questions = extract_inline_respondent_questions(latest_human_content)
-    expected_question_count = infer_default_question_count(latest_human_content)
-    section_structure = extract_requested_section_structure(latest_human_content)
+        respondent_questions = extract_inline_respondent_questions(parsing_source)
+    if not respondent_questions and effective_reference_text:
+        respondent_questions = extract_requested_respondent_questions(effective_reference_text)
+    expected_question_count = 0 if exact_source_mode else infer_default_question_count(parsing_source)
+    section_structure = extract_requested_section_structure(parsing_source)
     if not section_structure:
         section_structure = infer_default_section_structure(
-            latest_human_content,
+            parsing_source,
             respondent_questions,
             expected_question_count,
+        )
+    if not section_structure and effective_reference_text:
+        section_structure = extract_requested_section_structure(effective_reference_text)
+
+    if effective_reference_text and file_questions:
+        file_main_question_count = _count_non_section_questions(file_questions) - len(
+            respondent_questions
+        )
+        if file_main_question_count > 0:
+            expected_question_count = file_main_question_count
+        if (
+            not exact_source_mode
+            and
+            infer_default_question_count(latest_user_instruction or latest_human_content) > 0
+            and file_main_question_count > 0
+            and expected_question_count != file_main_question_count
+        ):
+            expected_question_count = file_main_question_count
+
+    if exact_source_mode and effective_reference_text and not file_questions:
+        raise RuntimeError(
+            "à¸‰à¸±à¸™à¸•à¹‰à¸­à¸‡à¸¢à¸¶à¸”à¸•à¸²à¸¡à¹„à¸Ÿà¸¥à¹Œà¹à¸™à¸šà¹€à¸›à¹‡à¸™à¸«à¸¥à¸±à¸ à¹à¸•à¹ˆà¸¢à¸±à¸‡à¸­à¹ˆà¸²à¸™à¸„à¸³à¸–à¸²à¸¡à¹à¸¥à¸°à¸•à¸±à¸§à¹€à¸¥à¸·à¸­à¸à¸ˆà¸²à¸à¹„à¸Ÿà¸¥à¹Œà¹„à¸”à¹‰à¹„à¸¡à¹ˆà¸Šà¸±à¸”à¹€à¸ˆà¸™ "
+            "à¸à¸£à¸¸à¸“à¸²à¹à¸™à¸šà¹„à¸Ÿà¸¥à¹Œà¸—à¸µà¹ˆà¸„à¸¡à¸Šà¸±à¸”à¸à¸§à¹ˆà¸²à¸™à¸µà¹‰ à¸«à¸£à¸·à¸­à¹à¸™à¸šà¹„à¸Ÿà¸¥à¹Œ DOCX/PDF à¸—à¸µà¹ˆà¸¡à¸µà¸‚à¹‰à¸­à¸„à¸§à¸²à¸¡à¹€à¸¥à¸·à¸­à¸à¹„à¸”à¹‰à¹‚à¸”à¸¢à¸•à¸£à¸‡"
         )
 
     try:
@@ -3954,6 +4527,11 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
             {
                 "title": title,
                 "description": description,
+                "questions_json": (
+                    json.dumps(file_questions, ensure_ascii=False)
+                    if file_questions
+                    else ""
+                ),
                 "respondent_questions_json": json.dumps(
                     respondent_questions,
                     ensure_ascii=False,
@@ -3967,7 +4545,8 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
                 if section_structure
                 else "",
                 "expected_question_count": expected_question_count,
-                "source_prompt": latest_human_content,
+                "source_prompt": effective_creation_brief or latest_human_content,
+                "strict_source_questions": bool(file_questions) or exact_source_mode,
             }
         )
         if not isinstance(result, str):
@@ -3985,6 +4564,10 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
                 "",
                 f"- Title: {str(payload.get('title', '') or title)}",
             ]
+        if effective_reference_text and file_questions:
+            response_lines.append(
+                f"- {'ใช้คำถามจากไฟล์แนบเป็นหลัก' if user_language == 'th' else 'Primary question source'}: {'ไฟล์แนบที่อัปโหลด' if user_language == 'th' else 'uploaded file'}"
+            )
         form_url = str(payload.get("formUrl", "") or payload.get("editUrl", "") or "")
         responder_url = str(
             payload.get("responderUri", "") or payload.get("responseUrl", "") or ""

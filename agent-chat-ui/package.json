@@ -55,6 +55,7 @@
     "sonner": "^2.0.1",
     "tailwind-merge": "^3.0.2",
     "tailwindcss-animate": "^1.0.7",
+    "tesseract.js": "^7.0.0",
     "use-stick-to-bottom": "^1.0.46",
     "uuid": "^11.1.0",
     "xlsx": "^0.18.5",
