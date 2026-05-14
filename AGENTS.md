@@ -30,8 +30,8 @@ These instructions apply to this repository unless a more specific `AGENTS.md` e
   1. user asks the agent to create a form
   2. agent creates the Google Form
   3. agent automatically creates and links the response Google Spreadsheet through Apps Script
-  4. user can send the returned spreadsheet link back
-  5. agent formats the linked response sheet into analysis-oriented tabs
+  4. agent immediately tries to post-process the linked response sheet
+  5. user can still send the returned spreadsheet link back for reformatting or deeper analysis
 - Native automatic Google Forms -> Sheets linking is part of the current flow when Apps Script runtime/scopes are configured.
 - The backend now prefers deterministic shortcuts for obvious handoffs:
   - clear form-creation prompts can go straight into the local `create_form_with_response_sheet` tool path
@@ -40,7 +40,13 @@ These instructions apply to this repository unless a more specific `AGENTS.md` e
   - respondent-information fields should be inferred from the user's prompt, not from uploaded reference documents
   - uploaded files may define the quiz/test questions and answer key, but should not invent extra participant fields
   - exact-source mode should prefer the uploaded source's real question count over any default generated count
-- The form formatter should produce analysis-oriented output, not just a cleaned copy of the raw response tab.
+- The form formatter currently produces a small set of post-processed tabs:
+  - a cleaned wide `Processed Responses`-style sheet that stays close to the raw response layout
+  - a long-form `Response Details` analysis sheet
+  - a `Question Summary` sheet with grouped counts/percentages
+- Immediate post-processing after linking should be best-effort:
+  - if the response sheet is already usable, create the processed/analysis tabs right away
+  - if the linked sheet is still empty or not ready, do not fail form creation; report that post-processing is waiting for first responses
 - The agent should support simple natural prompts, especially short Thai prompts, without requiring heavily structured instructions.
 - The agent should reply in the user's language when practical; Thai users should get Thai-facing responses and English users should get English-facing responses.
 - Quiz behavior should be inferred from user intent/context, not only from the presence of answer keys:
