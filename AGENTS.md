@@ -20,6 +20,10 @@ These instructions apply to this repository unless a more specific `AGENTS.md` e
 - Configure OpenRouter fallbacks with `OPENROUTER_MODEL_2` and `OPENROUTER_MODEL_3`.
 - Configure local OpenAI-compatible LLM servers with `LOCAL_LLM_BASE_URL`, `LOCAL_LLM_MODEL`, and optional `LOCAL_LLM_API_KEY`.
 - For local text-only LLMs, uploaded PDF/DOC/DOCX files are converted to text before model calls; image uploads are retained as attachment context.
+- Uploaded DOCX files are treated as structured source material, not just loose reference text:
+  - embedded images are extracted and preserved in document order
+  - image-only paragraphs can be mapped to the following image-based question when the question title explicitly refers to an image
+  - multiple images inside one answer choice may be merged into a single composite image because Google Forms only supports one native image per option
 - Configure the Web UI backend URLs through `.env` with `WEBUI_PUBLIC_API_URL` and `WEBUI_LANGGRAPH_API_URL`.
 - Run backend and web UI together with `docker compose up --build`; Docker Desktop must be running with the Linux engine.
 - Current product workflow is:
@@ -32,9 +36,21 @@ These instructions apply to this repository unless a more specific `AGENTS.md` e
 - The backend now prefers deterministic shortcuts for obvious handoffs:
   - clear form-creation prompts can go straight into the local `create_form_with_response_sheet` tool path
   - pasted linked spreadsheet URLs can go straight into `format_response_sheet_for_analysis`
+- For direct form creation, keep these behavioral rules aligned with the current backend:
+  - respondent-information fields should be inferred from the user's prompt, not from uploaded reference documents
+  - uploaded files may define the quiz/test questions and answer key, but should not invent extra participant fields
+  - exact-source mode should prefer the uploaded source's real question count over any default generated count
 - The form formatter should produce analysis-oriented output, not just a cleaned copy of the raw response tab.
 - The agent should support simple natural prompts, especially short Thai prompts, without requiring heavily structured instructions.
 - The agent should reply in the user's language when practical; Thai users should get Thai-facing responses and English users should get English-facing responses.
+- Quiz behavior should be inferred from user intent/context, not only from the presence of answer keys:
+  - obvious quiz/test/pre-test/post-test/exam wording should enable quiz mode
+  - feedback/registration/survey contexts should stay non-quiz unless the user explicitly asks otherwise
+  - if an uploaded source includes answer signals and the request is clearly a test, the generated form should be created as a quiz with grading metadata
+- Current DOCX answer-key detection supports several common answer signals:
+  - highlighted option text
+  - shaded option text/cells
+  - non-default colored option text commonly used to mark correct answers
 - Deployment target is not documented yet.
 
 ## Working Style

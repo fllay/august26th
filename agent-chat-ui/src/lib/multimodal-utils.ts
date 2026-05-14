@@ -224,57 +224,157 @@ async function docxContentBlockToText(
     const zip = await import("jszip");
     const archive = await zip.default.loadAsync(base64ToUint8Array(block.data));
     const documentXml = await archive.file("word/document.xml")?.async("text");
+    const relsXml =
+      (await archive.file("word/_rels/document.xml.rels")?.async("text")) ?? "";
     if (!documentXml) return "";
 
     const parser = new DOMParser();
     const doc = parser.parseFromString(documentXml, "application/xml");
+    const relDoc = relsXml
+      ? parser.parseFromString(relsXml, "application/xml")
+      : null;
     const ns = {
       w: "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
       wp: "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
       pic: "http://schemas.openxmlformats.org/drawingml/2006/picture",
       a: "http://schemas.openxmlformats.org/drawingml/2006/main",
       v: "urn:schemas-microsoft-com:vml",
+      r: "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+      rel: "http://schemas.openxmlformats.org/package/2006/relationships",
     };
 
     const body = doc.getElementsByTagNameNS(ns.w, "body")[0];
     if (!body) return "";
 
+    const relationshipTargets = new Map<string, string>();
+    if (relDoc) {
+      Array.from(
+        relDoc.getElementsByTagNameNS(ns.rel, "Relationship"),
+      ).forEach((node) => {
+        const relId = node.getAttribute("Id") ?? "";
+        const target = node.getAttribute("Target") ?? "";
+        if (relId && target) {
+          relationshipTargets.set(relId, target.split("/").pop() ?? target);
+        }
+      });
+    }
+
+    const mediaBase64ByName = new Map<string, string>();
+    Object.keys(archive.files)
+      .filter((name) => name.startsWith("word/media/"))
+      .forEach(async () => {});
+    await Promise.all(
+      Object.keys(archive.files)
+        .filter((name) => name.startsWith("word/media/"))
+        .map(async (name) => {
+          const file = archive.file(name);
+          if (!file) return;
+          const mediaBase64 = await file.async("base64");
+          mediaBase64ByName.set(name.split("/").pop() ?? name, mediaBase64);
+        }),
+    );
+
+    const serializeEmbeddedImage = (
+      label: string | null | undefined,
+      mimeType: string,
+      name: string,
+      dataBase64: string,
+    ): string => {
+      const normalized = (label ?? "").trim().replace(/"/g, "'");
+      const safeName = (name ?? "").trim().replace(/"/g, "'");
+      return [
+        `<<<EMBEDDED_IMAGE name="${safeName}" mime="${mimeType}"${normalized ? ` alt="${normalized}"` : ""}>>>`,
+        dataBase64,
+        "<<<END_EMBEDDED_IMAGE>>>",
+      ].join("\n");
+    };
+
+    const extensionToMime = (fileName: string): string => {
+      const ext = fileName.toLowerCase().split(".").pop() ?? "";
+      switch (ext) {
+        case "png":
+          return "image/png";
+        case "jpg":
+        case "jpeg":
+          return "image/jpeg";
+        case "gif":
+          return "image/gif";
+        case "bmp":
+          return "image/bmp";
+        case "webp":
+          return "image/webp";
+        case "svg":
+          return "image/svg+xml";
+        case "tif":
+        case "tiff":
+          return "image/tiff";
+        default:
+          return "application/octet-stream";
+      }
+    };
+
     const extractImageMarkers = (element: Element): string[] => {
       const markers: string[] = [];
-      const pushMarker = (label: string | null | undefined) => {
+      const pushMarker = (
+        label: string | null | undefined,
+        relId: string | null | undefined,
+      ) => {
         const normalized = (label ?? "").trim();
+        const mediaName = relationshipTargets.get((relId ?? "").trim());
+        const mediaBase64 = mediaName ? mediaBase64ByName.get(mediaName) : "";
+        if (!mediaName || !mediaBase64) {
+          markers.push(
+            normalized ? `[Embedded image: ${normalized}]` : "[Embedded image]",
+          );
+          return;
+        }
         markers.push(
-          normalized ? `[Embedded image: ${normalized}]` : "[Embedded image]",
+          serializeEmbeddedImage(
+            normalized,
+            extensionToMime(mediaName),
+            mediaName,
+            mediaBase64,
+          ),
         );
       };
 
-      Array.from(element.getElementsByTagNameNS(ns.wp, "docPr")).forEach((node) =>
+      const blips = Array.from(element.getElementsByTagNameNS(ns.a, "blip"));
+      const vImages = Array.from(element.getElementsByTagNameNS(ns.v, "imagedata"));
+      const docProps = Array.from(element.getElementsByTagNameNS(ns.wp, "docPr"));
+      const picProps = Array.from(element.getElementsByTagNameNS(ns.pic, "cNvPr"));
+
+      docProps.forEach((node, index) =>
         pushMarker(
           node.getAttribute("descr") ||
             node.getAttribute("title") ||
             node.getAttribute("name"),
+          blips[index]?.getAttributeNS(ns.r, "embed") ||
+            blips[index]?.getAttribute("r:embed"),
         ),
       );
-      Array.from(element.getElementsByTagNameNS(ns.pic, "cNvPr")).forEach((node) =>
+      picProps.forEach((node, index) =>
         pushMarker(
           node.getAttribute("descr") ||
             node.getAttribute("title") ||
             node.getAttribute("name"),
+          blips[index]?.getAttributeNS(ns.r, "embed") ||
+            blips[index]?.getAttribute("r:embed"),
         ),
       );
-      Array.from(element.getElementsByTagNameNS(ns.v, "shape")).forEach((node) =>
+      vImages.forEach((node) =>
         pushMarker(
-          node.getAttribute("alt") ||
-            node.getAttribute("title") ||
-            node.getAttribute("id"),
+          node.getAttribute("title") || node.getAttribute("alt") || node.getAttribute("id"),
+          node.getAttributeNS(ns.r, "id") ||
+            node.getAttribute("r:id"),
         ),
       );
-      if (
-        markers.length === 0 &&
-        (element.getElementsByTagNameNS(ns.a, "blip").length > 0 ||
-          element.getElementsByTagNameNS(ns.v, "imagedata").length > 0)
-      ) {
-        markers.push("[Embedded image]");
+      if (markers.length === 0 && blips.length > 0) {
+        blips.forEach((blip) =>
+          pushMarker(
+            "",
+            blip.getAttributeNS(ns.r, "embed") || blip.getAttribute("r:embed"),
+          ),
+        );
       }
       return Array.from(new Set(markers));
     };

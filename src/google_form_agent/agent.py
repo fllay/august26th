@@ -11,6 +11,7 @@ import io
 import json
 import os
 import re
+import time
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 import zipfile
@@ -18,6 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
+from PIL import Image
 
 from deepagents import create_deep_agent
 from deepagents.backends.filesystem import FilesystemBackend
@@ -50,6 +52,14 @@ GOOGLE_WORKSPACE_SCOPES = [
     "https://www.googleapis.com/auth/forms.responses.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
+]
+GOOGLE_APPS_SCRIPT_SCOPES = [
+    "https://www.googleapis.com/auth/forms",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/script.projects",
+    "https://www.googleapis.com/auth/script.deployments",
+    "https://www.googleapis.com/auth/script.scriptapp",
 ]
 DEFAULT_RESPONDENT_INFO_QUESTIONS = [
     {"title": "ชื่อ-นามสกุล", "type": "text", "required": True},
@@ -206,6 +216,10 @@ FILE_TEXT_RE = re.compile(
     r"<<<FILE_TEXT>>>\s*(?P<context>[\s\S]*?)\s*<<<END_FILE_TEXT>>>",
     re.IGNORECASE,
 )
+EMBEDDED_IMAGE_BLOCK_RE = re.compile(
+    r"<<<EMBEDDED_IMAGE(?P<meta>[^>]*)>>>\s*(?P<data>[\s\S]*?)\s*<<<END_EMBEDDED_IMAGE>>>",
+    re.IGNORECASE,
+)
 UPLOAD_FILE_HEADER_RE = re.compile(r"^\[(?:Uploaded|Attached) file: .+\]$", re.IGNORECASE)
 PAGE_MARKER_RE = re.compile(r"^--\s*\d+\s+of\s+\d+\s*--$", re.IGNORECASE)
 SPREADSHEET_URL_RE = re.compile(
@@ -234,6 +248,12 @@ def clean_extracted_file_text(context: str) -> str:
     cleaned = "\n".join(cleaned_lines).strip()
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.replace(" /think", "").replace("/think", "").strip()
+
+
+def strip_embedded_image_blocks(text: str) -> str:
+    """Remove serialized embedded-image payloads from text before question parsing."""
+    stripped = EMBEDDED_IMAGE_BLOCK_RE.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", stripped).strip()
 
 
 def marker_file_context(context: str) -> str:
@@ -477,6 +497,92 @@ def infer_default_question_count(text: str) -> int:
     if any(keyword in lowered for keyword in ("feedback", "survey", "satisfaction", "rating", "แบบประเมิน", "ความพึงพอใจ")):
         return 5
     return 0
+
+
+def infer_form_is_quiz(text: str, questions: list[dict[str, Any]] | None = None) -> bool:
+    """Infer whether the requested form should behave as a quiz from user context."""
+    lowered = str(text or "").casefold()
+
+    explicit_non_quiz_patterns = (
+        r"\bnot a quiz\b",
+        r"\bdon't make (?:it )?a quiz\b",
+        r"\bdo not make (?:it )?a quiz\b",
+        r"\bno grading\b",
+        r"\bwithout grading\b",
+        r"ไม่ต้องเป็นแบบทดสอบ",
+        r"ไม่ต้องเป็นควิซ",
+        r"ไม่ต้องให้คะแนน",
+        r"ไม่ต้องตรวจคำตอบ",
+    )
+    if any(re.search(pattern, lowered, re.IGNORECASE) for pattern in explicit_non_quiz_patterns):
+        return False
+
+    quiz_keywords = (
+        "pre-test",
+        "pretest",
+        "post-test",
+        "posttest",
+        "quiz",
+        "test",
+        "exam",
+        "assessment",
+        "answer key",
+        "graded",
+        "grading",
+        "คะแนน",
+        "เฉลย",
+        "คำตอบที่ถูก",
+        "ตรวจคำตอบ",
+        "แบบทดสอบ",
+        "ข้อสอบ",
+        "ควิซ",
+        "ก่อนเรียน",
+        "ก่อนอบรม",
+        "หลังเรียน",
+        "หลังอบรม",
+    )
+    if any(keyword in lowered for keyword in quiz_keywords):
+        return True
+
+    non_quiz_keywords = (
+        "feedback",
+        "survey",
+        "satisfaction",
+        "registration",
+        "register",
+        "signup",
+        "sign-up",
+        "application",
+        "rsvp",
+        "attendance",
+        "แบบประเมิน",
+        "ความพึงพอใจ",
+        "ลงทะเบียน",
+        "สมัคร",
+        "แบบฟอร์มสมัคร",
+    )
+    if any(keyword in lowered for keyword in non_quiz_keywords):
+        return False
+
+    if questions:
+        correct_answer_count = sum(
+            1
+            for question in questions
+            if isinstance(question, dict)
+            and isinstance(question.get("correct_answers", []), list)
+            and any(str(answer or "").strip() for answer in question.get("correct_answers", []))
+        )
+        if correct_answer_count > 0:
+            title_hints = " ".join(
+                str(question.get("title", "") or "")
+                for question in questions[:3]
+                if isinstance(question, dict)
+            ).casefold()
+            if any(keyword in title_hints for keyword in ("แบบทดสอบ", "ข้อสอบ", "pre-test", "post-test", "quiz", "test", "exam")):
+                return True
+            return True
+
+    return False
 
 
 def extract_form_title(text: str) -> str:
@@ -1056,6 +1162,11 @@ def _load_google_workspace_credentials() -> service_account.Credentials | UserCr
     return _load_google_credentials(GOOGLE_WORKSPACE_SCOPES)
 
 
+def _load_google_apps_script_credentials() -> service_account.Credentials | UserCredentials:
+    """Load credentials with the additional Apps Script scopes required for script execution."""
+    return _load_google_credentials(GOOGLE_APPS_SCRIPT_SCOPES)
+
+
 def _quote_sheet_title(sheet_title: str) -> str:
     escaped = sheet_title.replace("'", "''")
     return f"'{escaped}'"
@@ -1207,7 +1318,7 @@ def _build_drive_service() -> Any:
 
 def _build_apps_script_service() -> Any:
     """Create a Google Apps Script API client."""
-    credentials = _load_google_workspace_credentials()
+    credentials = _load_google_apps_script_credentials()
     return build_google_api(
         "script",
         "v1",
@@ -1237,6 +1348,74 @@ function linkFormToSheet(formId, spreadsheetId) {
     destinationId: form.getDestinationId(),
     destinationType: String(form.getDestinationType()),
     editUrl: form.getEditUrl(),
+  };
+}
+
+function insertFormImages(formId, placements) {
+  if (!formId) {
+    throw new Error('formId is required.');
+  }
+  if (!Array.isArray(placements)) {
+    throw new Error('placements must be an array.');
+  }
+
+  let form = null;
+  let lastError = null;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      form = FormApp.openById(formId);
+      break;
+    } catch (err) {
+      lastError = err;
+      Utilities.sleep(1500);
+    }
+  }
+  if (!form) {
+    throw lastError || new Error('Unable to open form by id.');
+  }
+  const orderedPlacements = placements
+    .filter(p => p && p.base64 && p.mimeType)
+    .sort((a, b) => (Number(a.index || 0) - Number(b.index || 0)));
+
+  const created = [];
+  let offset = 0;
+  orderedPlacements.forEach((placement, placementIndex) => {
+    const bytes = Utilities.base64Decode(String(placement.base64 || ''));
+    const blob = Utilities.newBlob(
+      bytes,
+      String(placement.mimeType || 'application/octet-stream'),
+      String(placement.name || ('form-image-' + (placementIndex + 1)))
+    );
+
+    const item = form.addImageItem().setImage(blob);
+    if (placement.title) {
+      item.setTitle(String(placement.title));
+    }
+    if (placement.helpText) {
+      item.setHelpText(String(placement.helpText));
+    }
+    if (placement.width) {
+      item.setWidth(Number(placement.width));
+    }
+
+    const items = form.getItems();
+    const maxIndex = Math.max(0, items.length - 1);
+    const requestedIndex = Number(placement.index || 0) + offset;
+    const targetIndex = Math.max(0, Math.min(maxIndex, requestedIndex));
+    form.moveItem(item.getIndex(), targetIndex);
+    offset += 1;
+
+    created.push({
+      itemId: item.getId(),
+      index: item.getIndex(),
+      title: item.getTitle(),
+    });
+  });
+
+  return {
+    ok: true,
+    createdCount: created.length,
+    created: created,
   };
 }
 """.strip()
@@ -1330,10 +1509,7 @@ def _ensure_native_linker_deployment(script_service: Any) -> dict[str, str]:
     """Ensure an Apps Script project and API deployment exist for native linking."""
     script_id, created = _ensure_native_linker_project(script_service)
     _update_native_linker_project_content(script_service, script_id)
-
-    deployment_id = _get_configured_apps_script_deployment_id()
-    if not deployment_id or created:
-        deployment_id = _create_native_linker_deployment(script_service, script_id)
+    deployment_id = _create_native_linker_deployment(script_service, script_id)
 
     return {
         "scriptId": script_id,
@@ -1411,51 +1587,259 @@ def _upload_support_image_to_drive(image: dict[str, Any], fallback_name: str) ->
     extension = Path(str(image.get("name", "") or fallback_name)).suffix or ""
     drive_name = str(image.get("name", "") or fallback_name).strip() or fallback_name
 
-    drive_service = _build_drive_service()
-    media = MediaInMemoryUpload(image_bytes, mimetype=mime_type, resumable=False)
-    uploaded = drive_service.files().create(
-        body={
-            "name": drive_name,
-            "mimeType": mime_type,
-        },
-        media_body=media,
-        fields="id,webContentLink,webViewLink",
-    ).execute()
-    file_id = str(uploaded.get("id", "") or "").strip()
-    if not file_id:
-        return image
-
-    _make_drive_file_public(file_id)
     updated = dict(image)
-    source_uri = str(uploaded.get("webContentLink", "") or "").strip()
-    if not source_uri:
-        source_uri = f"https://drive.google.com/uc?export=download&id={file_id}"
-    updated["source_uri"] = source_uri
-    updated["drive_file_id"] = file_id
+    updated["inline_source_uri"] = f"data:{mime_type};base64,{data_base64}"
+
+    try:
+        drive_service = _build_drive_service()
+        media = MediaInMemoryUpload(image_bytes, mimetype=mime_type, resumable=False)
+        uploaded = drive_service.files().create(
+            body={
+                "name": drive_name,
+                "mimeType": mime_type,
+            },
+            media_body=media,
+            fields="id,webContentLink,webViewLink",
+        ).execute()
+        file_id = str(uploaded.get("id", "") or "").strip()
+        if file_id:
+            _make_drive_file_public(file_id)
+            public_source_uri = f"https://drive.google.com/uc?export=download&id={file_id}"
+            fallback_source_uri = str(uploaded.get("webContentLink", "") or "").strip()
+            if fallback_source_uri:
+                updated["fallback_source_uri"] = fallback_source_uri
+            updated["public_source_uri"] = public_source_uri
+            updated["source_uri"] = public_source_uri
+            updated["drive_file_id"] = file_id
+    except Exception:
+        pass
+
+    if not str(updated.get("source_uri", "") or "").strip():
+        updated["source_uri"] = str(updated.get("inline_source_uri", "") or "").strip()
+
     if extension and "name" not in updated:
         updated["name"] = f"{fallback_name}{extension}"
     return updated
 
 
+def _combine_embedded_images(
+    images: list[dict[str, Any]],
+    fallback_name: str,
+) -> list[dict[str, Any]]:
+    """Combine multiple embedded images into a single side-by-side PNG for one form choice."""
+    valid_images = [
+        image
+        for image in images
+        if isinstance(image, dict) and str(image.get("data_base64", "") or "").strip()
+    ]
+    if len(valid_images) <= 1:
+        return valid_images
+
+    decoded_images: list[Image.Image] = []
+    image_refs: list[dict[str, Any]] = []
+    try:
+        for image in valid_images:
+            raw = base64.b64decode(str(image.get("data_base64", "") or "").strip(), validate=False)
+            pil_image = Image.open(io.BytesIO(raw)).convert("RGBA")
+            decoded_images.append(pil_image)
+            image_refs.append(image)
+
+        padding = 16
+        max_height = max(image.height for image in decoded_images)
+        total_width = sum(image.width for image in decoded_images) + padding * (len(decoded_images) - 1)
+        canvas = Image.new("RGBA", (total_width, max_height), (255, 255, 255, 0))
+
+        cursor_x = 0
+        for image in decoded_images:
+            offset_y = max(0, (max_height - image.height) // 2)
+            canvas.alpha_composite(image, (cursor_x, offset_y))
+            cursor_x += image.width + padding
+
+        output = io.BytesIO()
+        canvas.save(output, format="PNG")
+        combined_base64 = base64.b64encode(output.getvalue()).decode("ascii")
+        alt_parts = [
+            str(image.get("alt_text", "") or "").strip()
+            for image in image_refs
+            if str(image.get("alt_text", "") or "").strip()
+        ]
+        return [
+            {
+                "name": f"{Path(fallback_name).stem}.png",
+                "mime_type": "image/png",
+                "data_base64": combined_base64,
+                "alt_text": " | ".join(alt_parts).strip(),
+                "width": total_width,
+            }
+        ]
+    except Exception:
+        return valid_images
+    finally:
+        for image in decoded_images:
+            try:
+                image.close()
+            except Exception:
+                pass
+
+
+def _materialize_image_list(
+    images: Any,
+    fallback_prefix: str,
+) -> list[dict[str, Any]]:
+    """Upload a list of embedded images and attach source URIs."""
+    if not isinstance(images, list):
+        return []
+
+    uploaded_images: list[dict[str, Any]] = []
+    for image_index, image in enumerate(images, 1):
+        if not isinstance(image, dict):
+            continue
+        fallback_name = f"{fallback_prefix}-{image_index}"
+        uploaded_images.append(_upload_support_image_to_drive(image, fallback_name))
+    return uploaded_images
+
+
 def _materialize_question_images(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Upload any embedded question images and replace them with source URIs."""
+    """Upload embedded images for questions and options and replace them with source URIs."""
     materialized: list[dict[str, Any]] = []
     for question_index, question in enumerate(questions, 1):
         updated_question = dict(question)
-        images = question.get("images", [])
-        if not isinstance(images, list) or not images:
-            materialized.append(updated_question)
-            continue
+        updated_question["images"] = _materialize_image_list(
+            question.get("images", []),
+            f"form-question-image-{question_index}",
+        )
 
-        uploaded_images: list[dict[str, Any]] = []
-        for image_index, image in enumerate(images, 1):
-            if not isinstance(image, dict):
-                continue
-            fallback_name = f"form-support-image-{question_index}-{image_index}"
-            uploaded_images.append(_upload_support_image_to_drive(image, fallback_name))
-        updated_question["images"] = uploaded_images
+        options = question.get("options", [])
+        if isinstance(options, list):
+            updated_options: list[Any] = []
+            for option_index, option in enumerate(options, 1):
+                if not isinstance(option, dict):
+                    updated_options.append(option)
+                    continue
+
+                updated_option = dict(option)
+                option_images = []
+                if isinstance(option.get("images", []), list):
+                    option_images.extend(option.get("images", []))
+                if isinstance(option.get("extra_images", []), list):
+                    option_images.extend(option.get("extra_images", []))
+                combined_option_images = _combine_embedded_images(
+                    option_images,
+                    f"form-option-image-{question_index}-{option_index}",
+                )
+                updated_option["images"] = _materialize_image_list(
+                    combined_option_images,
+                    f"form-option-image-{question_index}-{option_index}",
+                )
+                updated_option["extra_images"] = []
+                updated_options.append(updated_option)
+            updated_question["options"] = updated_options
+
         materialized.append(updated_question)
     return materialized
+
+
+def _strip_images_from_questions_for_rest(
+    questions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return a copy of the questions with only REST-compatible images preserved."""
+    stripped_questions: list[dict[str, Any]] = []
+    for question in questions:
+        updated_question = dict(question)
+        question_images = question.get("images", [])
+        if isinstance(question_images, list) and question_images:
+            first_question_image = question_images[0]
+            updated_question["images"] = [first_question_image] if isinstance(first_question_image, dict) else []
+        else:
+            updated_question["images"] = []
+        options = question.get("options", [])
+        if isinstance(options, list):
+            updated_options: list[Any] = []
+            for option in options:
+                if not isinstance(option, dict):
+                    updated_options.append(option)
+                    continue
+                updated_option = dict(option)
+                option_images = option.get("images", [])
+                if isinstance(option_images, list) and option_images:
+                    first_image = option_images[0]
+                    updated_option["images"] = [first_image] if isinstance(first_image, dict) else []
+                else:
+                    updated_option["images"] = []
+                updated_option["extra_images"] = []
+                updated_options.append(updated_option)
+            updated_question["options"] = updated_options
+        stripped_questions.append(updated_question)
+    return stripped_questions
+
+
+def _build_apps_script_image_placements(
+    questions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build a placement plan for inserting non-REST-compatible images via Apps Script blobs."""
+    placements: list[dict[str, Any]] = []
+    base_item_index = 0
+    for question in questions:
+        question_title = str(question.get("title", "") or "").strip()
+        question_images = question.get("images", [])
+        if isinstance(question_images, list):
+            extra_question_images = question_images[1:] if len(question_images) > 1 else []
+            for image_index, image in enumerate(extra_question_images, 2):
+                if not isinstance(image, dict):
+                    continue
+                base64_data = str(image.get("data_base64", "") or "").strip()
+                mime_type = str(image.get("mime_type", "") or "").strip()
+                if not base64_data or not mime_type:
+                    continue
+                placements.append(
+                    {
+                        "index": base_item_index,
+                        "title": str(image.get("alt_text", "") or "").strip()
+                        or f"Image for {question_title}",
+                        "helpText": question_title,
+                        "base64": base64_data,
+                        "mimeType": mime_type,
+                        "name": str(image.get("name", "") or f"question-image-{base_item_index + 1}-{image_index}").strip(),
+                        "width": image.get("width"),
+                    }
+                )
+
+        options = question.get("options", [])
+        if isinstance(options, list):
+            for option_index, option in enumerate(options):
+                if not isinstance(option, dict):
+                    continue
+                option_label = str(option.get("label", "") or _option_label_for_index(option_index)).strip()
+                option_value = str(option.get("value", "") or "").strip()
+                option_images = option.get("extra_images", [])
+                if not isinstance(option_images, list):
+                    continue
+                for image_index, image in enumerate(option_images, 1):
+                    if not isinstance(image, dict):
+                        continue
+                    base64_data = str(image.get("data_base64", "") or "").strip()
+                    mime_type = str(image.get("mime_type", "") or "").strip()
+                    if not base64_data or not mime_type:
+                        continue
+                    placements.append(
+                        {
+                            "index": base_item_index + 1,
+                            "title": str(image.get("alt_text", "") or "").strip()
+                            or f"Choice {option_label}",
+                            "helpText": f"{question_title}\nChoice {option_label}: {option_value}".strip(),
+                            "base64": base64_data,
+                            "mimeType": mime_type,
+                            "name": str(
+                                image.get("name", "")
+                                or f"option-image-{base_item_index + 1}-{option_label}-extra-{image_index}"
+                            ).strip(),
+                            "width": image.get("width"),
+                        }
+                    )
+
+        base_item_index += 1
+
+    return placements
 
 
 def _share_native_link_targets_with_actor(form_id: str, spreadsheet_id: str, actor_email: str) -> None:
@@ -1673,6 +2057,135 @@ def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str,
     }
 
 
+def _insert_form_images_via_apps_script(
+    form_id: str,
+    placements: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Insert images into a Google Form using Apps Script blobs."""
+    if not placements:
+        return {"ok": True, "createdCount": 0, "created": []}
+
+    granted_scopes = load_shared_google_oauth_scopes()
+    required_scopes = {
+        "https://www.googleapis.com/auth/forms",
+        "https://www.googleapis.com/auth/script.projects",
+        "https://www.googleapis.com/auth/script.deployments",
+        "https://www.googleapis.com/auth/script.scriptapp",
+    }
+    if granted_scopes and not required_scopes.issubset(granted_scopes):
+        missing_scopes = sorted(required_scopes - granted_scopes)
+        return {
+            "ok": False,
+            "status": "reauthorize-required",
+            "error": "Shared Google OAuth token is missing Apps Script scopes.",
+            "guidance": (
+                "Disconnect and reconnect Google in the web UI so the backend receives "
+                "the Apps Script scopes required to insert form images from blobs."
+            ),
+            "missingScopes": missing_scopes,
+        }
+
+    try:
+        script_service = _build_apps_script_service()
+        runtime = _ensure_native_linker_deployment(script_service)
+    except HttpError as exc:  # pragma: no cover - depends on Google API runtime
+        message = _describe_apps_script_http_error(exc)
+        return {
+            "ok": False,
+            "status": "apps-script-setup-failed",
+            "error": message,
+            "guidance": (
+                "Enable the Apps Script API for the Google Cloud project used by your OAuth "
+                "client, then reconnect Google so the script scopes are granted."
+            ),
+        }
+    except Exception as exc:  # pragma: no cover - depends on Google API runtime
+        return {
+            "ok": False,
+            "status": "apps-script-setup-failed",
+            "error": str(exc),
+            "guidance": (
+                "The backend could not prepare the Apps Script runtime needed to insert form images."
+            ),
+        }
+
+    response: dict[str, Any] | None = None
+    last_error_result: dict[str, Any] | None = None
+    for attempt in range(3):
+        try:
+            response = script_service.scripts().run(
+                scriptId=runtime["deploymentId"],
+                body={
+                    "function": "insertFormImages",
+                    "parameters": [form_id, placements],
+                },
+            ).execute()
+            break
+        except HttpError as exc:  # pragma: no cover - depends on Google API runtime
+            message = _describe_apps_script_http_error(exc)
+            last_error_result = {
+                "ok": False,
+                "status": "apps-script-image-insert-failed",
+                "error": message,
+                "guidance": (
+                    "The Apps Script runtime could not insert images into the Google Form."
+                ),
+                "scriptId": runtime.get("scriptId", ""),
+                "deploymentId": runtime.get("deploymentId", ""),
+            }
+            if "Requested entity was not found" not in message or attempt == 2:
+                return last_error_result
+            time.sleep(2)
+        except Exception as exc:  # pragma: no cover - depends on Google API runtime
+            last_error_result = {
+                "ok": False,
+                "status": "apps-script-image-insert-failed",
+                "error": str(exc),
+                "guidance": (
+                    "The Apps Script runtime could not insert images into the Google Form."
+                ),
+                "scriptId": runtime.get("scriptId", ""),
+                "deploymentId": runtime.get("deploymentId", ""),
+            }
+            if "Requested entity was not found" not in str(exc) or attempt == 2:
+                return last_error_result
+            time.sleep(2)
+
+    if response is None:
+        return last_error_result or {
+            "ok": False,
+            "status": "apps-script-image-insert-failed",
+            "error": "Unknown Apps Script image insertion failure.",
+            "guidance": "The Apps Script runtime could not insert images into the Google Form.",
+            "scriptId": runtime.get("scriptId", ""),
+            "deploymentId": runtime.get("deploymentId", ""),
+        }
+
+    if isinstance(response, dict) and response.get("error"):
+        return {
+            "ok": False,
+            "status": "apps-script-image-insert-failed",
+            "error": json.dumps(response.get("error"), ensure_ascii=False),
+            "guidance": (
+                "The Apps Script runtime ran but did not complete image insertion."
+            ),
+            "scriptId": runtime.get("scriptId", ""),
+            "deploymentId": runtime.get("deploymentId", ""),
+        }
+
+    result = response.get("response", {}).get("result", {}) if isinstance(response, dict) else {}
+    created_count = int(result.get("createdCount", 0) or 0)
+    return {
+        "ok": True,
+        "status": "images-inserted",
+        "createdCount": created_count,
+        "created": result.get("created", []),
+        "scriptId": runtime.get("scriptId", ""),
+        "deploymentId": runtime.get("deploymentId", ""),
+        "scriptUrl": runtime.get("scriptUrl", ""),
+    }
+
+
 def _extract_form_question_map(form_payload: dict[str, Any]) -> list[dict[str, str]]:
     """Collect question IDs and titles from a Form resource."""
     question_map: list[dict[str, str]] = []
@@ -1815,6 +2328,22 @@ def _normalize_question_dict(raw_question: dict[str, Any], index: int) -> dict[s
         raw_question.get("description", "") or raw_question.get("help_text", "") or ""
     ).strip()
     images = raw_question.get("images", [])
+    correct_answers = raw_question.get("correct_answers", [])
+    point_value = raw_question.get("point_value", 1)
+
+    normalized_correct_answers = (
+        [
+            str(answer).strip()
+            for answer in correct_answers
+            if str(answer).strip()
+        ]
+        if isinstance(correct_answers, list)
+        else []
+    )
+    try:
+        normalized_point_value = max(1, int(point_value or 1))
+    except Exception:
+        normalized_point_value = 1
 
     return {
         "title": title,
@@ -1823,6 +2352,8 @@ def _normalize_question_dict(raw_question: dict[str, Any], index: int) -> dict[s
         "options": options if isinstance(options, list) else [],
         "description": help_text,
         "images": images if isinstance(images, list) else [],
+        "correct_answers": normalized_correct_answers,
+        "point_value": normalized_point_value,
     }
 
 
@@ -2066,6 +2597,11 @@ def extract_questions_from_reference_text(reference_text: str) -> list[dict[str,
         for question in questions:
             normalized_question = dict(question)
             question_type = str(normalized_question.get("type", "multiple_choice") or "multiple_choice").strip().lower()
+            correct_answers = [
+                str(answer).strip()
+                for answer in normalized_question.get("correct_answers", [])
+                if str(answer).strip()
+            ] if isinstance(normalized_question.get("correct_answers", []), list) else []
             options = [
                 str(option).strip()
                 for option in normalized_question.get("options", [])
@@ -2085,6 +2621,17 @@ def extract_questions_from_reference_text(reference_text: str) -> list[dict[str,
                 "radio",
             }:
                 options = options[:inferred_choice_count]
+            if correct_answers:
+                normalized_option_map = {
+                    _normalize_match_text(option): option
+                    for option in options
+                    if str(option).strip()
+                }
+                normalized_question["correct_answers"] = [
+                    normalized_option_map.get(_normalize_match_text(answer), answer)
+                    for answer in correct_answers
+                    if _normalize_match_text(answer) in normalized_option_map
+                ]
             if question_type in {
                 "multiple_choice",
                 "multiple-choice",
@@ -2305,7 +2852,7 @@ def extract_questions_from_reference_text(reference_text: str) -> list[dict[str,
         flush_current()
         return questions
 
-    text = clean_extracted_file_text(reference_text)
+    text = strip_embedded_image_blocks(clean_extracted_file_text(reference_text))
     if not text:
         return []
 
@@ -2509,12 +3056,23 @@ def _parse_single_question_object(chunk: str) -> dict[str, Any] | None:
     return None
 
 
-def _build_form_item(question: dict[str, Any]) -> dict[str, Any]:
+def _build_form_item(question: dict[str, Any], include_grading: bool = True) -> dict[str, Any]:
     """Build a Google Forms item payload from a normalized question."""
     question_type = str(question.get("type", "multiple_choice") or "multiple_choice").strip().lower()
     required = bool(question.get("required", True))
     item: dict[str, Any] = {"title": str(question["title"])}
     description = str(question.get("description", "") or "").strip()
+    question_images = [
+        image
+        for image in question.get("images", [])
+        if isinstance(image, dict) and str(image.get("source_uri", "") or "").strip()
+    ]
+    correct_answers = [
+        str(answer).strip()
+        for answer in question.get("correct_answers", [])
+        if str(answer).strip()
+    ] if isinstance(question.get("correct_answers", []), list) else []
+    point_value = max(1, int(question.get("point_value", 1) or 1))
     if description:
         item["description"] = description
     if question_type in {"section", "section_break", "page_break"}:
@@ -2546,15 +3104,31 @@ def _build_form_item(question: dict[str, Any]) -> dict[str, Any]:
                     options_payload.append({"value": value})
         if len(options_payload) < 2:
             raise RuntimeError(f"Multiple-choice question '{question['title']}' needs at least 2 options.")
-        item["questionItem"] = {
-            "question": {
-                "required": required,
-                "choiceQuestion": {
-                    "type": "RADIO",
-                    "options": options_payload,
+        question_payload: dict[str, Any] = {
+            "required": required,
+            "choiceQuestion": {
+                "type": "RADIO",
+                "options": options_payload,
+            },
+        }
+        if include_grading and correct_answers:
+            question_payload["grading"] = {
+                "pointValue": point_value,
+                "correctAnswers": {
+                    "answers": [{"value": answer} for answer in correct_answers]
                 },
             }
+        item["questionItem"] = {
+            "question": question_payload
         }
+        if question_images:
+            first_image = question_images[0]
+            item["questionItem"]["image"] = {
+                "sourceUri": str(first_image.get("source_uri", "") or "").strip()
+            }
+            alt_text = str(first_image.get("alt_text", "") or "").strip()
+            if alt_text:
+                item["questionItem"]["image"]["altText"] = alt_text
         return item
 
     if question_type in {"checkbox", "checkboxes"}:
@@ -2570,15 +3144,31 @@ def _build_form_item(question: dict[str, Any]) -> dict[str, Any]:
                     options_payload.append({"value": value})
         if len(options_payload) < 2:
             raise RuntimeError(f"Checkbox question '{question['title']}' needs at least 2 options.")
-        item["questionItem"] = {
-            "question": {
-                "required": required,
-                "choiceQuestion": {
-                    "type": "CHECKBOX",
-                    "options": options_payload,
+        question_payload = {
+            "required": required,
+            "choiceQuestion": {
+                "type": "CHECKBOX",
+                "options": options_payload,
+            },
+        }
+        if include_grading and correct_answers:
+            question_payload["grading"] = {
+                "pointValue": point_value,
+                "correctAnswers": {
+                    "answers": [{"value": answer} for answer in correct_answers]
                 },
             }
+        item["questionItem"] = {
+            "question": question_payload
         }
+        if question_images:
+            first_image = question_images[0]
+            item["questionItem"]["image"] = {
+                "sourceUri": str(first_image.get("source_uri", "") or "").strip()
+            }
+            alt_text = str(first_image.get("alt_text", "") or "").strip()
+            if alt_text:
+                item["questionItem"]["image"]["altText"] = alt_text
         return item
 
     if question_type in {"dropdown", "drop_down"}:
@@ -2594,15 +3184,31 @@ def _build_form_item(question: dict[str, Any]) -> dict[str, Any]:
                     options_payload.append({"value": value})
         if len(options_payload) < 2:
             raise RuntimeError(f"Dropdown question '{question['title']}' needs at least 2 options.")
-        item["questionItem"] = {
-            "question": {
-                "required": required,
-                "choiceQuestion": {
-                    "type": "DROP_DOWN",
-                    "options": options_payload,
+        question_payload = {
+            "required": required,
+            "choiceQuestion": {
+                "type": "DROP_DOWN",
+                "options": options_payload,
+            },
+        }
+        if include_grading and correct_answers:
+            question_payload["grading"] = {
+                "pointValue": point_value,
+                "correctAnswers": {
+                    "answers": [{"value": answer} for answer in correct_answers]
                 },
             }
+        item["questionItem"] = {
+            "question": question_payload
         }
+        if question_images:
+            first_image = question_images[0]
+            item["questionItem"]["image"] = {
+                "sourceUri": str(first_image.get("source_uri", "") or "").strip()
+            }
+            alt_text = str(first_image.get("alt_text", "") or "").strip()
+            if alt_text:
+                item["questionItem"]["image"]["altText"] = alt_text
         return item
 
     item["questionItem"] = {
@@ -2611,10 +3217,18 @@ def _build_form_item(question: dict[str, Any]) -> dict[str, Any]:
             "textQuestion": {},
         }
     }
+    if question_images:
+        first_image = question_images[0]
+        item["questionItem"]["image"] = {
+            "sourceUri": str(first_image.get("source_uri", "") or "").strip()
+        }
+        alt_text = str(first_image.get("alt_text", "") or "").strip()
+        if alt_text:
+            item["questionItem"]["image"]["altText"] = alt_text
     return item
 
 
-def _build_form_items(question: dict[str, Any]) -> list[dict[str, Any]]:
+def _build_form_items(question: dict[str, Any], include_grading: bool = True) -> list[dict[str, Any]]:
     """Build one or more Google Forms item payloads from a normalized question."""
     images = [
         image
@@ -2622,7 +3236,8 @@ def _build_form_items(question: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(image, dict) and str(image.get("source_uri", "") or "").strip()
     ]
     items: list[dict[str, Any]] = []
-    for image in images:
+    extra_question_images = images[1:] if images else []
+    for image in extra_question_images:
         image_item: dict[str, Any] = {
             "title": str(image.get("alt_text", "") or "").strip()
             or f"Image for {str(question.get('title', '') or '').strip()}",
@@ -2669,7 +3284,7 @@ def _build_form_items(question: dict[str, Any]) -> list[dict[str, Any]]:
                 image_item["imageItem"]["image"]["altText"] = alt_text
             items.append(image_item)
 
-    primary_item = _build_form_item(question)
+    primary_item = _build_form_item(question, include_grading=include_grading)
     items.append(primary_item)
     return items
 
@@ -2741,9 +3356,23 @@ def _apply_form_batch_updates(
     form_id: str,
     description: str,
     questions: list[dict[str, Any]],
+    is_quiz: bool = False,
 ) -> None:
     """Apply form description and items in a single batchUpdate call."""
     requests: list[dict[str, Any]] = []
+    if is_quiz:
+        requests.append(
+            {
+                "updateSettings": {
+                    "settings": {
+                        "quizSettings": {
+                            "isQuiz": True,
+                        }
+                    },
+                    "updateMask": "quizSettings.isQuiz",
+                }
+            }
+        )
 
     if description.strip():
         requests.append(
@@ -2757,7 +3386,7 @@ def _apply_form_batch_updates(
 
     item_index = 0
     for question in questions:
-        for item in _build_form_items(question):
+        for item in _build_form_items(question, include_grading=is_quiz):
             requests.append(
                 {
                     "createItem": {
@@ -3367,6 +3996,7 @@ def create_form_with_response_sheet(
     expected_question_count: int = 0,
     source_prompt: str = "",
     strict_source_questions: bool = False,
+    is_quiz: bool = False,
 ) -> str:
     """Create a Google Form and optionally add description/questions."""
     if not title.strip():
@@ -3451,13 +4081,38 @@ def create_form_with_response_sheet(
         raise RuntimeError("Google Forms API did not return a formId.")
 
     questions = _materialize_question_images(questions)
+    image_placements = _build_apps_script_image_placements(questions)
+    rest_questions = questions
+    if image_placements:
+        rest_questions = _strip_images_from_questions_for_rest(questions)
 
     _apply_form_batch_updates(
         forms_service=forms_service,
         form_id=form_id,
         description=description,
-        questions=questions,
+        questions=rest_questions,
+        is_quiz=is_quiz,
     )
+
+    image_insert_result: dict[str, Any] = {}
+    if image_placements:
+        image_insert_result = _insert_form_images_via_apps_script(
+            form_id=form_id,
+            placements=image_placements,
+        )
+        if not image_insert_result.get("ok"):
+            guidance = str(image_insert_result.get("guidance", "") or "").strip()
+            error = str(image_insert_result.get("error", "") or "Unknown image insertion failure").strip()
+            raise RuntimeError(
+                f"Form questions were created, but image insertion failed. {error}"
+                + (f" {guidance}" if guidance else "")
+            )
+        inserted_count = int(image_insert_result.get("createdCount", 0) or 0)
+        if inserted_count < len(image_placements):
+            raise RuntimeError(
+                "Form questions were created, but not all images were inserted. "
+                f"Expected {len(image_placements)} image placements but Apps Script reported {inserted_count} inserted."
+            )
 
     responder_uri = form_response.get("responderUri", "")
     edit_uri = f"https://docs.google.com/forms/d/{form_id}/edit"
@@ -3472,6 +4127,8 @@ def create_form_with_response_sheet(
             "responderUri": responder_uri,
             "responseUrl": responder_uri,
             "questionCount": len(questions),
+            "insertedImageCount": int(image_insert_result.get("createdCount", 0) or 0),
+            "isQuiz": bool(is_quiz),
             "nextStep": (
                 "Manually link this form to a Google Spreadsheet in Google Forms. "
                 "Then send the spreadsheet link back so the agent can format the raw response data "
@@ -3985,7 +4642,8 @@ def file_block_to_text(block: dict[str, Any], name: str, mime_type: str) -> str:
         return f"{header}\n[No readable text was found in this PDF file.]"
 
     if mime_type == DOCX_MIME_TYPE:
-        text = extract_docx_text(file_bytes)
+        segments = extract_docx_segments(file_bytes)
+        text = serialize_docx_segments_to_text(segments) if segments else extract_docx_text(file_bytes)
         if text:
             return marker_file_context(f"{header}\n{text}")
         return f"{header}\n[No readable text was found in this DOCX file.]"
@@ -4182,25 +4840,34 @@ def extract_docx_text(file_bytes: bytes) -> str:
     def extract_image_markers(element: ElementTree.Element) -> list[str]:
         markers: list[str] = []
 
-        doc_props = element.findall(".//wp:docPr", namespace)
-        pic_props = element.findall(".//pic:cNvPr", namespace)
-        v_shapes = element.findall(".//v:shape", namespace)
-
-        for node in [*doc_props, *pic_props]:
-            label = (
-                node.get("descr", "").strip()
-                or node.get("title", "").strip()
-                or node.get("name", "").strip()
-            )
+        for drawing in element.findall(".//w:drawing", namespace):
+            doc_prop = drawing.find(".//wp:docPr", namespace)
+            pic_prop = drawing.find(".//pic:cNvPr", namespace)
+            label = ""
+            for node in (doc_prop, pic_prop):
+                if node is None:
+                    continue
+                label = (
+                    node.get("descr", "").strip()
+                    or node.get("title", "").strip()
+                    or node.get("name", "").strip()
+                )
+                if label:
+                    break
             markers.append(f"[Embedded image: {label}]" if label else "[Embedded image]")
 
-        for shape in v_shapes:
+        for shape in element.findall(".//v:shape", namespace):
             label = (
                 shape.get("alt", "").strip()
                 or shape.get("title", "").strip()
                 or shape.get("id", "").strip()
             )
-            markers.append(f"[Embedded image: {label}]" if label else "[Embedded image]")
+            imagedata_nodes = shape.findall(".//v:imagedata", namespace)
+            if imagedata_nodes:
+                for _ in imagedata_nodes:
+                    markers.append(f"[Embedded image: {label}]" if label else "[Embedded image]")
+            else:
+                markers.append(f"[Embedded image: {label}]" if label else "[Embedded image]")
 
         if not markers:
             blips = element.findall(".//a:blip", namespace)
@@ -4208,14 +4875,7 @@ def extract_docx_text(file_bytes: bytes) -> str:
             image_refs = len(blips) + len(imagedata)
             if image_refs:
                 markers.extend("[Embedded image]" for _ in range(image_refs))
-
-        deduped: list[str] = []
-        seen: set[str] = set()
-        for marker in markers:
-            if marker not in seen:
-                deduped.append(marker)
-                seen.add(marker)
-        return deduped
+        return markers
 
     def render_paragraph(paragraph: ElementTree.Element) -> list[str]:
         runs = [
@@ -4265,6 +4925,42 @@ def extract_docx_text(file_bytes: bytes) -> str:
 
     cleaned_parts = [part.strip() for part in parts if part and part.strip()]
     return "\n".join(cleaned_parts).strip()
+
+
+def _serialize_embedded_image_block(image: dict[str, Any]) -> str:
+    """Serialize one embedded DOCX image into a stable hidden-text block."""
+    name = str(image.get("name", "") or "").replace('"', "'").strip()
+    alt_text = str(image.get("alt_text", "") or "").replace('"', "'").strip()
+    mime_type = str(image.get("mime_type", "") or "application/octet-stream").strip()
+    data_base64 = str(image.get("data_base64", "") or "").strip()
+    meta_parts = []
+    if name:
+        meta_parts.append(f'name="{name}"')
+    if mime_type:
+        meta_parts.append(f'mime="{mime_type}"')
+    if alt_text:
+        meta_parts.append(f'alt="{alt_text}"')
+    meta = " " + " ".join(meta_parts) if meta_parts else ""
+    return (
+        f"<<<EMBEDDED_IMAGE{meta}>>>\n"
+        f"{data_base64}\n"
+        "<<<END_EMBEDDED_IMAGE>>>"
+    )
+
+
+def serialize_docx_segments_to_text(segments: list[dict[str, Any]]) -> str:
+    """Render extracted DOCX segments to hidden text while preserving image position."""
+    rendered_parts: list[str] = []
+    for segment in segments:
+        text = str(segment.get("text", "") or "").strip()
+        images = segment.get("images", [])
+        if text:
+            rendered_parts.append(text)
+        if isinstance(images, list):
+            for image in images:
+                if isinstance(image, dict) and str(image.get("data_base64", "") or "").strip():
+                    rendered_parts.append(_serialize_embedded_image_block(image))
+    return "\n".join(part for part in rendered_parts if part).strip()
 
 
 def extract_docx_segments(file_bytes: bytes) -> list[dict[str, Any]]:
@@ -4359,32 +5055,37 @@ def extract_docx_segments(file_bytes: bytes) -> list[dict[str, Any]]:
         nonlocal image_counter
         images: list[dict[str, Any]] = []
 
-        for node in element.findall(".//wp:docPr", namespace):
-            rel_parent = None
-            for parent in element.findall(".//a:blip", namespace):
-                rel_parent = parent
-                break
-            rel_id = rel_parent.get(f"{{{namespace['r']}}}embed", "") if rel_parent is not None else ""
-            asset = build_image_asset(
-                rel_id,
-                node.get("descr", "").strip()
-                or node.get("title", "").strip()
-                or node.get("name", "").strip(),
-                image_counter + 1,
-            )
+        for drawing in element.findall(".//w:drawing", namespace):
+            doc_prop = drawing.find(".//wp:docPr", namespace)
+            blip = drawing.find(".//a:blip", namespace)
+            rel_id = blip.get(f"{{{namespace['r']}}}embed", "").strip() if blip is not None else ""
+            label = ""
+            if doc_prop is not None:
+                label = (
+                    doc_prop.get("descr", "").strip()
+                    or doc_prop.get("title", "").strip()
+                    or doc_prop.get("name", "").strip()
+                )
+            asset = build_image_asset(rel_id, label, image_counter + 1)
             if asset:
                 image_counter += 1
                 images.append(asset)
 
-        for node in element.findall(".//v:imagedata", namespace):
-            rel_id = (
-                node.get(f"{{{namespace['r']}}}id", "").strip()
-                or node.get(f"{{{namespace['o']}}}relid", "").strip()
+        for shape in element.findall(".//v:shape", namespace):
+            label = (
+                shape.get("alt", "").strip()
+                or shape.get("title", "").strip()
+                or shape.get("id", "").strip()
             )
-            asset = build_image_asset(rel_id, "", image_counter + 1)
-            if asset:
-                image_counter += 1
-                images.append(asset)
+            for node in shape.findall(".//v:imagedata", namespace):
+                rel_id = (
+                    node.get(f"{{{namespace['r']}}}id", "").strip()
+                    or node.get(f"{{{namespace['o']}}}relid", "").strip()
+                )
+                asset = build_image_asset(rel_id, label, image_counter + 1)
+                if asset:
+                    image_counter += 1
+                    images.append(asset)
 
         deduped: list[dict[str, Any]] = []
         seen_keys: set[tuple[str, str]] = set()
@@ -4484,6 +5185,236 @@ def _option_label_for_index(index: int) -> str:
     return chr(ord("A") + index)
 
 
+def _match_next_question_index(
+    normalized_segment_text: str,
+    current_question_index: int,
+    normalized_titles: list[str],
+) -> int | None:
+    """Return the next question index when a segment text matches the upcoming question title."""
+    next_index = current_question_index + 1
+    if next_index >= len(normalized_titles):
+        return None
+    target = normalized_titles[next_index]
+    if target and (
+        normalized_segment_text == target
+        or normalized_segment_text.startswith(target)
+        or target.startswith(normalized_segment_text)
+    ):
+        return next_index
+    return None
+
+
+def _question_title_refers_to_image(title: str) -> bool:
+    """Detect question titles that explicitly refer to an accompanying image."""
+    normalized = _normalize_match_text(title)
+    image_cues = (
+        "จากภาพ",
+        "ภาพด้านบน",
+        "ภาพต่อไปนี้",
+        "จากรูป",
+        "รูปด้านบน",
+        "รูปต่อไปนี้",
+        "ดูภาพ",
+        "ดูรูป",
+    )
+    return any(cue in normalized for cue in image_cues)
+
+
+def _is_docx_run_answer_signaled(run: ElementTree.Element, namespace: dict[str, str]) -> bool:
+    """Return whether a DOCX run uses a salient answer-key style."""
+    run_properties = run.find("./w:rPr", namespace)
+    if run_properties is None:
+        return False
+
+    highlight = run_properties.find("./w:highlight", namespace)
+    if highlight is not None:
+        highlight_value = str(highlight.get(f"{{{namespace['w']}}}val", "") or "").strip().casefold()
+        if highlight_value and highlight_value not in {"none", "default"}:
+            return True
+
+    shading = run_properties.find("./w:shd", namespace)
+    if shading is not None:
+        fill_value = str(shading.get(f"{{{namespace['w']}}}fill", "") or "").strip().casefold()
+        if fill_value and fill_value not in {"auto", "ffffff", "000000"}:
+            return True
+
+    color = run_properties.find("./w:color", namespace)
+    if color is not None:
+        color_value = str(color.get(f"{{{namespace['w']}}}val", "") or "").strip().casefold()
+        if color_value and color_value not in {"auto", "000000", "ffffff"}:
+            return True
+
+    return False
+
+
+def _extract_docx_answer_signal_paragraphs(file_bytes: bytes) -> list[dict[str, str]]:
+    """Extract paragraph text with salient styled fragments used to mark correct answers."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as docx:
+            xml_bytes = docx.read("word/document.xml")
+    except Exception:
+        return []
+
+    try:
+        root = ElementTree.fromstring(xml_bytes)
+    except ElementTree.ParseError:
+        return []
+
+    namespace = {
+        "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+    }
+
+    paragraphs: list[dict[str, str]] = []
+    for paragraph in root.findall(".//w:p", namespace):
+        all_text_parts: list[str] = []
+        signaled_parts: list[str] = []
+        for run in paragraph.findall("./w:r", namespace):
+            run_text = "".join(
+                text_node.text or ""
+                for text_node in run.findall(".//w:t", namespace)
+            )
+            if not run_text:
+                continue
+            all_text_parts.append(run_text)
+            if _is_docx_run_answer_signaled(run, namespace):
+                signaled_parts.append(run_text)
+
+        paragraph_text = "".join(all_text_parts).strip()
+        signaled_text = "".join(signaled_parts).strip()
+        if paragraph_text or signaled_text:
+            paragraphs.append(
+                {
+                    "text": paragraph_text,
+                    "signaled_text": signaled_text,
+                }
+            )
+
+    return paragraphs
+
+
+def _split_labeled_option_pairs(text: str) -> list[tuple[str, str]]:
+    """Split a line that may contain inline Thai/English labeled options."""
+    pattern = re.compile(r"([A-Da-d]|[\u0E01-\u0E2E])[.)]\s*")
+    matches = list(pattern.finditer(str(text or "").strip()))
+    if not matches:
+        return []
+
+    pairs: list[tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        label = match.group(1).strip()
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        body = str(text[start:end]).strip()
+        if body:
+            pairs.append((label, body))
+    return pairs
+
+
+def _highlight_matches_option(highlighted_text: str, option_label: str, option_value: str) -> bool:
+    """Return whether highlighted text corresponds to the given option."""
+    normalized_highlight = _normalize_match_text(highlighted_text)
+    if not normalized_highlight:
+        return False
+
+    normalized_label = _normalize_match_text(option_label)
+    normalized_value = _normalize_match_text(option_value)
+
+    if normalized_label and normalized_label in normalized_highlight:
+        return True
+    if normalized_value and (
+        normalized_highlight in normalized_value
+        or normalized_value in normalized_highlight
+    ):
+        return True
+    return False
+
+
+def _apply_docx_correct_answers(
+    questions: list[dict[str, Any]],
+    file_bytes: bytes,
+) -> list[dict[str, Any]]:
+    """Attach correct answers from highlighted DOCX option text to parsed questions."""
+    paragraphs = _extract_docx_answer_signal_paragraphs(file_bytes)
+    if not paragraphs or not questions:
+        return questions
+
+    normalized_titles = [_normalize_match_text(question.get("title", "")) for question in questions]
+    question_index = -1
+
+    for paragraph in paragraphs:
+        paragraph_text = str(paragraph.get("text", "") or "").strip()
+        highlighted_text = str(paragraph.get("signaled_text", "") or "").strip()
+        normalized_paragraph_text = _normalize_match_text(paragraph_text)
+
+        if normalized_paragraph_text:
+            next_index = _match_next_question_index(
+                normalized_paragraph_text,
+                question_index,
+                normalized_titles,
+            )
+            if next_index is not None:
+                question_index = next_index
+                continue
+
+        if question_index < 0 or question_index >= len(questions) or not highlighted_text:
+            continue
+
+        question = questions[question_index]
+        options = question.get("options", [])
+        if not isinstance(options, list) or not options:
+            continue
+
+        matched_labels: list[str] = []
+        inline_pairs = _split_labeled_option_pairs(paragraph_text)
+        if inline_pairs:
+            for label, body in inline_pairs:
+                if _highlight_matches_option(highlighted_text, label, body):
+                    matched_labels.append(label.casefold())
+        else:
+            option_match = _extract_option_marker(paragraph_text)
+            if option_match:
+                option_label, option_body = option_match
+                if _highlight_matches_option(highlighted_text, option_label, option_body or paragraph_text):
+                    matched_labels.append(option_label.casefold())
+
+        if not matched_labels:
+            for option in options:
+                if not isinstance(option, dict):
+                    continue
+                option_label = str(option.get("label", "") or "").strip()
+                option_value = str(option.get("value", "") or "").strip()
+                if _highlight_matches_option(highlighted_text, option_label, option_value):
+                    matched_labels.append(option_label.casefold())
+
+        if not matched_labels:
+            continue
+
+        correct_answers = list(question.get("correct_answers", [])) if isinstance(question.get("correct_answers", []), list) else []
+        seen_answers = {
+            _normalize_match_text(answer)
+            for answer in correct_answers
+            if str(answer or "").strip()
+        }
+        for option in options:
+            if not isinstance(option, dict):
+                continue
+            option_label = str(option.get("label", "") or "").strip().casefold()
+            option_value = str(option.get("value", "") or "").strip()
+            if option_label not in matched_labels or not option_value:
+                continue
+            normalized_value = _normalize_match_text(option_value)
+            if normalized_value in seen_answers:
+                continue
+            correct_answers.append(option_value)
+            seen_answers.add(normalized_value)
+
+        if correct_answers:
+            question["correct_answers"] = correct_answers
+            question.setdefault("point_value", 1)
+
+    return questions
+
+
 def extract_docx_questions_with_images(file_bytes: bytes) -> list[dict[str, Any]]:
     """Extract questions from a DOCX and attach embedded image assets to the nearest question."""
     segments = extract_docx_segments(file_bytes)
@@ -4527,21 +5458,19 @@ def extract_docx_questions_with_images(file_bytes: bytes) -> list[dict[str, Any]
     question_index = -1
     current_option_index: int | None = None
 
-    for segment in segments:
+    for segment_index, segment in enumerate(segments):
         segment_text = str(segment.get("text", "") or "").strip()
         normalized_segment_text = _normalize_match_text(segment_text)
         if normalized_segment_text:
-            next_index = question_index + 1
-            if next_index < len(normalized_titles):
-                target = normalized_titles[next_index]
-                if target and (
-                    normalized_segment_text == target
-                    or normalized_segment_text.startswith(target)
-                    or target.startswith(normalized_segment_text)
-                ):
-                    question_index = next_index
-                    current_option_index = None
-                    continue
+            next_index = _match_next_question_index(
+                normalized_segment_text,
+                question_index,
+                normalized_titles,
+            )
+            if next_index is not None:
+                question_index = next_index
+                current_option_index = None
+                continue
 
             if question_index >= 0:
                 option_match = _extract_option_marker(segment_text)
@@ -4569,6 +5498,27 @@ def extract_docx_questions_with_images(file_bytes: bytes) -> list[dict[str, Any]
         images = segment.get("images", [])
         if not images or question_index < 0 or question_index >= len(questions):
             continue
+
+        if not normalized_segment_text and current_option_index is not None:
+            lookahead_index = segment_index + 1
+            while lookahead_index < len(segments):
+                lookahead_text = str(segments[lookahead_index].get("text", "") or "").strip()
+                normalized_lookahead_text = _normalize_match_text(lookahead_text)
+                if not normalized_lookahead_text:
+                    lookahead_index += 1
+                    continue
+                next_question_index = _match_next_question_index(
+                    normalized_lookahead_text,
+                    question_index,
+                    normalized_titles,
+                )
+                if (
+                    next_question_index is not None
+                    and _question_title_refers_to_image(questions[next_question_index].get("title", ""))
+                ):
+                    question_index = next_question_index
+                    current_option_index = None
+                break
 
         if current_option_index is not None:
             options = questions[question_index].get("options", [])
@@ -4614,7 +5564,7 @@ def extract_docx_questions_with_images(file_bytes: bytes) -> list[dict[str, Any]
                 continue
             destination.append(image)
 
-    return questions
+    return _apply_docx_correct_answers(questions, file_bytes)
 
 
 def xml_text_nodes(xml_bytes: bytes, tag_suffix: str = "t") -> list[str]:
@@ -5059,13 +6009,25 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
     if not file_questions and effective_reference_text:
         file_questions = extract_questions_from_reference_text(effective_reference_text)
 
+    is_quiz = infer_form_is_quiz(
+        "\n\n".join(
+            part
+            for part in (
+                latest_user_instruction,
+                effective_reference_text,
+                effective_creation_brief,
+            )
+            if str(part or "").strip()
+        ),
+        file_questions,
+    )
+
     title = extract_form_title(parsing_source).strip() or "Generated Google Form"
     description = extract_form_description(parsing_source).strip()
-    respondent_questions = extract_requested_respondent_questions(parsing_source)
+    respondent_prompt_source = latest_user_instruction or latest_human_content
+    respondent_questions = extract_requested_respondent_questions(respondent_prompt_source)
     if not respondent_questions:
-        respondent_questions = extract_inline_respondent_questions(parsing_source)
-    if not respondent_questions and effective_reference_text:
-        respondent_questions = extract_requested_respondent_questions(effective_reference_text)
+        respondent_questions = extract_inline_respondent_questions(respondent_prompt_source)
     expected_question_count = 0 if exact_source_mode else infer_default_question_count(parsing_source)
     section_structure = extract_requested_section_structure(parsing_source)
     if not section_structure:
@@ -5123,6 +6085,7 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
                 "expected_question_count": expected_question_count,
                 "source_prompt": effective_creation_brief or latest_human_content,
                 "strict_source_questions": bool(file_questions) or exact_source_mode,
+                "is_quiz": is_quiz,
             }
         )
         if not isinstance(result, str):
@@ -5150,11 +6113,23 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
         )
         form_id = str(payload.get("formId", "") or "")
         question_count = int(payload.get("questionCount", 0) or 0)
+        inserted_image_count = int(payload.get("insertedImageCount", 0) or 0)
+        payload_is_quiz = bool(payload.get("isQuiz", False))
         if form_id:
             response_lines.append(f"- {'รหัสฟอร์ม' if user_language == 'th' else 'Form ID'}: {form_id}")
         if question_count:
             response_lines.append(
                 f"- {'จำนวนคำถามที่เพิ่ม' if user_language == 'th' else 'Questions added'}: {question_count}"
+            )
+        response_lines.append(
+            f"- {'โหมดแบบทดสอบ' if user_language == 'th' else 'Quiz mode'}: "
+            + ("เปิด" if user_language == "th" and payload_is_quiz else
+               "ปิด" if user_language == "th" and not payload_is_quiz else
+               "On" if payload_is_quiz else "Off")
+        )
+        if inserted_image_count:
+            response_lines.append(
+                f"- {'จำนวนรูปที่แทรก' if user_language == 'th' else 'Images inserted'}: {inserted_image_count}"
             )
         if form_url:
             response_lines.extend(["", f"{'ลิงก์ฟอร์ม' if user_language == 'th' else 'Form link'}: {form_url}"])
@@ -5191,12 +6166,13 @@ class LocalLLMMessageFormatMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Any],
     ) -> ModelResponse | AIMessage:
+        original_messages = list(request.messages)
         system_message = (
             sanitize_message_content(request.system_message)
             if request.system_message is not None
             else None
         )
-        messages = [sanitize_message_content(message) for message in request.messages]
+        messages = [sanitize_message_content(message) for message in original_messages]
         messages = inject_attached_file_context(
             messages,
             get_attached_file_context(request),
@@ -5207,9 +6183,13 @@ class LocalLLMMessageFormatMiddleware(AgentMiddleware):
         )
         if direct_sheet_response is not None:
             return direct_sheet_response
+        direct_form_messages = inject_attached_file_context(
+            original_messages,
+            get_attached_file_context(request),
+        )
         direct_form_response = await asyncio.to_thread(
             maybe_complete_form_creation_request,
-            messages,
+            direct_form_messages,
         )
         if direct_form_response is not None:
             return direct_form_response
