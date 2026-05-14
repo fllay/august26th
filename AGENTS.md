@@ -29,10 +29,10 @@ These instructions apply to this repository unless a more specific `AGENTS.md` e
 - Current product workflow is:
   1. user asks the agent to create a form
   2. agent creates the Google Form
-  3. user manually links the form to a Google Spreadsheet in Google Forms
-  4. user sends the spreadsheet link back
+  3. agent automatically creates and links the response Google Spreadsheet through Apps Script
+  4. user can send the returned spreadsheet link back
   5. agent formats the linked response sheet into analysis-oriented tabs
-- Native automatic Google Forms -> Sheets linking is intentionally not part of the current flow.
+- Native automatic Google Forms -> Sheets linking is part of the current flow when Apps Script runtime/scopes are configured.
 - The backend now prefers deterministic shortcuts for obvious handoffs:
   - clear form-creation prompts can go straight into the local `create_form_with_response_sheet` tool path
   - pasted linked spreadsheet URLs can go straight into `format_response_sheet_for_analysis`

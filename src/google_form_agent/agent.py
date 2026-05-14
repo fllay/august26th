@@ -172,13 +172,13 @@ Work deliberately:
   - Use text questions for open responses and multiple choice questions when the
     user gives options.
   - If the user asks to list or browse forms, use list_google_forms.
-  - After create_form_with_response_sheet succeeds, reuse the exact returned
+- After create_form_with_response_sheet succeeds, reuse the exact returned
     formId value. Never substitute placeholder IDs.
   - After creating or editing a form, report the form title, the questions added,
     and any URL or form ID returned by the tools.
-  - After creating a form, tell the user to manually link the form to a Google
-    Spreadsheet in Google Forms and then send that spreadsheet link back so you
-    can format the raw response data for analysis.
+  - After creating a form, automatically create and link its Google Spreadsheet
+    response destination when native Apps Script linking is available, and report
+    the spreadsheet link back to the user.
   - Never claim a form was created unless a Google Forms MCP tool succeeded.
   - Never say that form-creation tools are unavailable when the request is about
     creating, listing, or syncing Google Forms. Those local form tools are
@@ -1330,6 +1330,38 @@ def _build_apps_script_service() -> Any:
 def _apps_script_project_url(script_id: str) -> str:
     """Return the Apps Script editor URL for a script project."""
     return f"https://script.google.com/home/projects/{script_id}/edit"
+
+
+def _derive_response_spreadsheet_title(form_title: str) -> str:
+    """Return a simple linked-response spreadsheet title for a form."""
+    cleaned_title = str(form_title or "").strip() or "Google Form"
+    if any("\u0E00" <= char <= "\u0E7F" for char in cleaned_title):
+        return f"{cleaned_title} - คำตอบแบบฟอร์ม"
+    return f"{cleaned_title} - Form Responses"
+
+
+def _create_response_spreadsheet(form_title: str) -> dict[str, str]:
+    """Create a Google Spreadsheet that will hold linked form responses."""
+    sheets_service = _build_sheets_service()
+    spreadsheet_title = _derive_response_spreadsheet_title(form_title)
+    response = sheets_service.spreadsheets().create(
+        body={"properties": {"title": spreadsheet_title}},
+        fields="spreadsheetId,spreadsheetUrl,properties.title",
+    ).execute()
+    spreadsheet_id = str(response.get("spreadsheetId", "") or "").strip()
+    if not spreadsheet_id:
+        raise RuntimeError("Google Sheets API did not return a spreadsheetId.")
+
+    spreadsheet_url = str(response.get("spreadsheetUrl", "") or "").strip()
+    if not spreadsheet_url:
+        spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+
+    resolved_title = str(response.get("properties", {}).get("title", "") or "").strip()
+    return {
+        "spreadsheetId": spreadsheet_id,
+        "spreadsheetTitle": resolved_title or spreadsheet_title,
+        "spreadsheetUrl": spreadsheet_url,
+    }
 
 
 def _build_native_linker_script_files() -> list[dict[str, Any]]:
@@ -3553,6 +3585,50 @@ def _derive_analysis_sheet_names(
     return detailed_name, summary_name
 
 
+def _derive_postprocess_sheet_names(
+    source_title: str,
+    headers: list[str],
+    requested_output_sheet_name: str,
+) -> tuple[str, str, str]:
+    """Derive sheet names for cleaned raw responses, long-form details, and summary."""
+    language_seed = " ".join([source_title, *headers[:5]])
+    is_thai = _contains_thai(language_seed)
+    base_title = source_title.strip() or ("คำตอบแบบฟอร์ม" if is_thai else "Form Responses")
+
+    if requested_output_sheet_name.strip():
+        processed_name = _sanitize_sheet_title(
+            requested_output_sheet_name.strip(),
+            "Processed Responses" if not is_thai else "คำตอบที่จัดรูปแบบ",
+        )
+    else:
+        processed_name = _sanitize_sheet_title(
+            (
+                f"{base_title} - คำตอบที่จัดรูปแบบ"
+                if is_thai
+                else f"{base_title} - Processed Responses"
+            ),
+            "Processed Responses" if not is_thai else "คำตอบที่จัดรูปแบบ",
+        )
+
+    detail_name = _sanitize_sheet_title(
+        (
+            f"{base_title} - รายละเอียดคำตอบ"
+            if is_thai
+            else f"{base_title} - Response Details"
+        ),
+        "Response Details" if not is_thai else "รายละเอียดคำตอบ",
+    )
+    summary_name = _sanitize_sheet_title(
+        (
+            f"{base_title} - สรุปคำตอบรายข้อ"
+            if is_thai
+            else f"{base_title} - Question Summary"
+        ),
+        "Question Summary" if not is_thai else "สรุปคำตอบรายข้อ",
+    )
+    return processed_name, detail_name, summary_name
+
+
 def _is_timestamp_header(header: str) -> bool:
     lowered = header.strip().casefold()
     return any(
@@ -3998,7 +4074,7 @@ def create_form_with_response_sheet(
     strict_source_questions: bool = False,
     is_quiz: bool = False,
 ) -> str:
-    """Create a Google Form and optionally add description/questions."""
+    """Create a Google Form, link a response spreadsheet, and optionally add description/questions."""
     if not title.strip():
         raise RuntimeError("title is required")
 
@@ -4114,6 +4190,62 @@ def create_form_with_response_sheet(
                 f"Expected {len(image_placements)} image placements but Apps Script reported {inserted_count} inserted."
             )
 
+    spreadsheet_details = _create_response_spreadsheet(title.strip())
+    spreadsheet_id = spreadsheet_details["spreadsheetId"]
+    link_result = _link_form_to_sheet_natively(form_id=form_id, spreadsheet_id=spreadsheet_id)
+    if not link_result.get("ok"):
+        guidance = str(link_result.get("guidance", "") or "").strip()
+        error = str(link_result.get("error", "") or "Unknown native linking failure").strip()
+        raise RuntimeError(
+            f"Form questions were created, but response-sheet linking failed. {error}"
+            + (f" {guidance}" if guidance else "")
+        )
+
+    destination_id = str(link_result.get("destinationId", "") or "").strip()
+    if destination_id and destination_id != spreadsheet_id:
+        raise RuntimeError(
+            "Form questions were created, but the linked response sheet did not match the created spreadsheet. "
+            f"Expected {spreadsheet_id} but Google reported {destination_id}."
+        )
+
+    linked_at = datetime.now(timezone.utc).isoformat()
+    _upsert_form_sheet_link(
+        form_id,
+        {
+            "spreadsheetId": spreadsheet_id,
+            "spreadsheetTitle": spreadsheet_details["spreadsheetTitle"],
+            "spreadsheetUrl": spreadsheet_details["spreadsheetUrl"],
+            "formUrl": f"https://docs.google.com/forms/d/{form_id}/edit",
+            "linkStatus": str(link_result.get("status", "") or "linked"),
+            "linkMode": str(link_result.get("mode", "") or "api-executable"),
+            "linkedAt": linked_at,
+            "scriptId": str(link_result.get("scriptId", "") or ""),
+            "deploymentId": str(link_result.get("deploymentId", "") or ""),
+            "scriptUrl": str(link_result.get("scriptUrl", "") or ""),
+        },
+    )
+
+    postprocess_result = _postprocess_newly_linked_response_sheet(spreadsheet_id)
+    if postprocess_result.get("ok"):
+        _upsert_form_sheet_link(
+            form_id,
+            {
+                "postprocessStatus": "formatted",
+                "processedSheetName": str(postprocess_result.get("processedSheetName", "") or ""),
+                "analysisSheetName": str(postprocess_result.get("analysisSheetName", "") or ""),
+                "summarySheetName": str(postprocess_result.get("summarySheetName", "") or ""),
+                "postprocessedAt": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    else:
+        _upsert_form_sheet_link(
+            form_id,
+            {
+                "postprocessStatus": str(postprocess_result.get("status", "") or "format-failed"),
+                "postprocessError": str(postprocess_result.get("error", "") or ""),
+            },
+        )
+
     responder_uri = form_response.get("responderUri", "")
     edit_uri = f"https://docs.google.com/forms/d/{form_id}/edit"
 
@@ -4129,10 +4261,20 @@ def create_form_with_response_sheet(
             "questionCount": len(questions),
             "insertedImageCount": int(image_insert_result.get("createdCount", 0) or 0),
             "isQuiz": bool(is_quiz),
+            "spreadsheetId": spreadsheet_id,
+            "spreadsheetTitle": spreadsheet_details["spreadsheetTitle"],
+            "spreadsheetUrl": spreadsheet_details["spreadsheetUrl"],
+            "linkStatus": str(link_result.get("status", "") or "linked"),
+            "linkedAt": linked_at,
+            "postprocessStatus": str(postprocess_result.get("status", "") or ""),
+            "processedSheetName": str(postprocess_result.get("processedSheetName", "") or ""),
+            "analysisSheetName": str(postprocess_result.get("analysisSheetName", "") or ""),
+            "summarySheetName": str(postprocess_result.get("summarySheetName", "") or ""),
+            "postprocessError": str(postprocess_result.get("error", "") or ""),
             "nextStep": (
-                "Manually link this form to a Google Spreadsheet in Google Forms. "
-                "Then send the spreadsheet link back so the agent can format the raw response data "
-                "into an analysis-ready table."
+                "The form is already linked to a Google Spreadsheet. "
+                "If responses already exist, the analysis sheets were created automatically. "
+                "Send that spreadsheet link back any time you want the agent to inspect or reformat the data."
             ),
         },
         ensure_ascii=False,
@@ -4231,18 +4373,25 @@ def format_response_sheet_for_analysis(
         cleaned_rows,
     )
 
-    output_sheet_name, summary_sheet_name = _derive_analysis_sheet_names(
+    processed_sheet_name, detail_sheet_name, summary_sheet_name = _derive_postprocess_sheet_names(
         source_title,
         headers,
         output_sheet_name,
     )
-    _ensure_sheet_exists(service, spreadsheet_id_value, output_sheet_name, sheets)
+    _ensure_sheet_exists(service, spreadsheet_id_value, processed_sheet_name, sheets)
+    _ensure_sheet_exists(service, spreadsheet_id_value, detail_sheet_name, sheets)
     _ensure_sheet_exists(service, spreadsheet_id_value, summary_sheet_name, sheets)
-    destination_range = f"{_quote_sheet_title(output_sheet_name)}!A1"
+    processed_range = f"{_quote_sheet_title(processed_sheet_name)}!A1"
+    detail_range = f"{_quote_sheet_title(detail_sheet_name)}!A1"
     summary_range = f"{_quote_sheet_title(summary_sheet_name)}!A1"
     service.spreadsheets().values().clear(
         spreadsheetId=spreadsheet_id_value,
-        range=_quote_sheet_title(output_sheet_name),
+        range=_quote_sheet_title(processed_sheet_name),
+        body={},
+    ).execute()
+    service.spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id_value,
+        range=_quote_sheet_title(detail_sheet_name),
         body={},
     ).execute()
     service.spreadsheets().values().clear(
@@ -4252,7 +4401,13 @@ def format_response_sheet_for_analysis(
     ).execute()
     service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id_value,
-        range=destination_range,
+        range=processed_range,
+        valueInputOption="RAW",
+        body={"values": [headers, *cleaned_rows]},
+    ).execute()
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id_value,
+        range=detail_range,
         valueInputOption="RAW",
         body={"values": [analysis_headers, *analysis_rows]},
     ).execute()
@@ -4273,22 +4428,81 @@ def format_response_sheet_for_analysis(
             "spreadsheetId": spreadsheet_id_value,
             "spreadsheetTitle": spreadsheet_title,
             "sourceSheet": source_title,
-            "outputSheet": output_sheet_name,
+            "outputSheet": processed_sheet_name,
+            "detailSheet": detail_sheet_name,
             "summarySheet": summary_sheet_name,
             "headerRowIndex": header_row_index + 1,
-            "columnCount": len(analysis_headers),
-            "rowCountWritten": len(analysis_rows),
+            "columnCount": len(headers),
+            "rowCountWritten": len(cleaned_rows),
+            "detailColumnCount": len(analysis_headers),
+            "detailRowCountWritten": len(analysis_rows),
             "questionSummaryRowCount": len(summary_rows),
             "rawHeaders": headers,
             "analysisHeaders": analysis_headers,
             "note": (
-                "The raw response data was reorganized into a detailed response table, "
-                "and a separate question summary sheet was created with counts and percentages."
+                "The raw response data was cleaned into a wide processed-response sheet, "
+                "with an additional long-form detail sheet and a separate question summary sheet."
             ),
         },
         ensure_ascii=False,
         indent=2,
     )
+
+
+def _postprocess_newly_linked_response_sheet(
+    spreadsheet_id: str,
+    retries: int = 3,
+    delay_seconds: float = 2.0,
+) -> dict[str, Any]:
+    """Best-effort formatting of a newly linked response sheet into analysis tabs."""
+    last_error = ""
+    for attempt in range(max(1, retries)):
+        try:
+            result = format_response_sheet_for_analysis.invoke(
+                {"spreadsheet_target": spreadsheet_id}
+            )
+            payload = json.loads(result) if isinstance(result, str) else result
+            if isinstance(payload, dict):
+                payload["processedSheetName"] = str(payload.get("outputSheet", "") or "")
+                payload["analysisSheetName"] = str(payload.get("detailSheet", "") or "")
+                payload["ok"] = True
+                payload["status"] = "formatted"
+                payload["attempts"] = attempt + 1
+                return payload
+            return {
+                "ok": True,
+                "status": "formatted",
+                "attempts": attempt + 1,
+            }
+        except Exception as exc:
+            last_error = str(exc).strip()
+            lowered = last_error.casefold()
+            if (
+                "no populated sheet was found" in lowered
+                or "could not detect a usable header row" in lowered
+            ):
+                if attempt < max(1, retries) - 1:
+                    time.sleep(delay_seconds)
+                    continue
+                return {
+                    "ok": False,
+                    "status": "waiting-for-responses",
+                    "error": last_error,
+                    "attempts": attempt + 1,
+                }
+            return {
+                "ok": False,
+                "status": "format-failed",
+                "error": last_error,
+                "attempts": attempt + 1,
+            }
+
+    return {
+        "ok": False,
+        "status": "format-failed",
+        "error": last_error or "Unknown response-sheet post-processing failure.",
+        "attempts": max(1, retries),
+    }
 
 
 @tool
@@ -5908,9 +6122,11 @@ def maybe_complete_manual_sheet_format_handoff(messages: list[AnyMessage]) -> AI
         spreadsheet_title = str(payload.get("spreadsheetTitle", "") or "")
         source_sheet = str(payload.get("sourceSheet", "") or "")
         output_sheet = str(payload.get("outputSheet", "") or "")
+        detail_sheet = str(payload.get("detailSheet", "") or "")
         summary_sheet = str(payload.get("summarySheet", "") or "")
         row_count = int(payload.get("rowCountWritten", 0) or 0)
         column_count = int(payload.get("columnCount", 0) or 0)
+        detail_row_count = int(payload.get("detailRowCountWritten", 0) or 0)
         summary_row_count = int(payload.get("questionSummaryRowCount", 0) or 0)
         spreadsheet_url = (
             f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
@@ -5935,10 +6151,12 @@ def maybe_complete_manual_sheet_format_handoff(messages: list[AnyMessage]) -> AI
                 "",
                 f"- Spreadsheet: {spreadsheet_title or spreadsheet_id}",
                 f"- Source sheet: {source_sheet}",
-                f"- Detailed responses sheet: {output_sheet}",
+                f"- Processed responses sheet: {output_sheet}",
+                f"- Detailed responses sheet: {detail_sheet}",
                 f"- Question summary sheet: {summary_sheet}",
                 f"- Response rows written: {row_count}",
-                f"- Columns in detailed sheet: {column_count}",
+                f"- Columns in processed sheet: {column_count}",
+                f"- Rows in detailed sheet: {detail_row_count}",
                 f"- Summary rows written: {summary_row_count}",
             ]
         if spreadsheet_url:
@@ -6047,8 +6265,7 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
             expected_question_count = file_main_question_count
         if (
             not exact_source_mode
-            and
-            infer_default_question_count(latest_user_instruction or latest_human_content) > 0
+            and infer_default_question_count(latest_user_instruction or latest_human_content) > 0
             and file_main_question_count > 0
             and expected_question_count != file_main_question_count
         ):
@@ -6056,8 +6273,13 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
 
     if exact_source_mode and effective_reference_text and not file_questions:
         raise RuntimeError(
-            "à¸‰à¸±à¸™à¸•à¹‰à¸­à¸‡à¸¢à¸¶à¸”à¸•à¸²à¸¡à¹„à¸Ÿà¸¥à¹Œà¹à¸™à¸šà¹€à¸›à¹‡à¸™à¸«à¸¥à¸±à¸ à¹à¸•à¹ˆà¸¢à¸±à¸‡à¸­à¹ˆà¸²à¸™à¸„à¸³à¸–à¸²à¸¡à¹à¸¥à¸°à¸•à¸±à¸§à¹€à¸¥à¸·à¸­à¸à¸ˆà¸²à¸à¹„à¸Ÿà¸¥à¹Œà¹„à¸”à¹‰à¹„à¸¡à¹ˆà¸Šà¸±à¸”à¹€à¸ˆà¸™ "
-            "à¸à¸£à¸¸à¸“à¸²à¹à¸™à¸šà¹„à¸Ÿà¸¥à¹Œà¸—à¸µà¹ˆà¸„à¸¡à¸Šà¸±à¸”à¸à¸§à¹ˆà¸²à¸™à¸µà¹‰ à¸«à¸£à¸·à¸­à¹à¸™à¸šà¹„à¸Ÿà¸¥à¹Œ DOCX/PDF à¸—à¸µà¹ˆà¸¡à¸µà¸‚à¹‰à¸­à¸„à¸§à¸²à¸¡à¹€à¸¥à¸·à¸­à¸à¹„à¸”à¹‰à¹‚à¸”à¸¢à¸•à¸£à¸‡"
+            "\u0e09\u0e31\u0e19\u0e16\u0e39\u0e01\u0e02\u0e2d\u0e43\u0e2b\u0e49\u0e22\u0e36\u0e14\u0e15\u0e32\u0e21\u0e44\u0e1f\u0e25\u0e4c\u0e41\u0e19\u0e1a\u0e41\u0e1a\u0e1a\u0e15\u0e23\u0e07\u0e15\u0e49\u0e19\u0e09\u0e1a\u0e31\u0e1a "
+            "\u0e41\u0e15\u0e48\u0e22\u0e31\u0e07\u0e14\u0e36\u0e07\u0e04\u0e33\u0e16\u0e32\u0e21\u0e41\u0e25\u0e30\u0e15\u0e31\u0e27\u0e40\u0e25\u0e37\u0e2d\u0e01\u0e08\u0e32\u0e01\u0e44\u0e1f\u0e25\u0e4c\u0e41\u0e19\u0e1a\u0e44\u0e14\u0e49\u0e44\u0e21\u0e48\u0e04\u0e23\u0e1a\u0e16\u0e49\u0e27\u0e19 "
+            "\u0e01\u0e23\u0e38\u0e13\u0e32\u0e41\u0e19\u0e1a\u0e44\u0e1f\u0e25\u0e4c\u0e17\u0e35\u0e48\u0e0a\u0e31\u0e14\u0e40\u0e08\u0e19\u0e02\u0e36\u0e49\u0e19 \u0e2b\u0e23\u0e37\u0e2d\u0e43\u0e0a\u0e49 DOCX/PDF \u0e17\u0e35\u0e48\u0e21\u0e35\u0e02\u0e49\u0e2d\u0e04\u0e27\u0e32\u0e21\u0e40\u0e25\u0e37\u0e2d\u0e01\u0e04\u0e31\u0e14\u0e25\u0e2d\u0e01\u0e44\u0e14\u0e49"
+            if user_language == "th"
+            else "I was asked to follow the uploaded source exactly, but I could not reliably extract "
+            "questions and answer choices from the attached file. Please attach a clearer file or a "
+            "DOCX/PDF with selectable text."
         )
 
     try:
@@ -6066,22 +6288,18 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
                 "title": title,
                 "description": description,
                 "questions_json": (
-                    json.dumps(file_questions, ensure_ascii=False)
-                    if file_questions
+                    json.dumps(file_questions, ensure_ascii=False) if file_questions else ""
+                ),
+                "respondent_questions_json": (
+                    json.dumps(respondent_questions, ensure_ascii=False)
+                    if respondent_questions
                     else ""
                 ),
-                "respondent_questions_json": json.dumps(
-                    respondent_questions,
-                    ensure_ascii=False,
-                )
-                if respondent_questions
-                else "",
-                "section_structure_json": json.dumps(
-                    section_structure,
-                    ensure_ascii=False,
-                )
-                if section_structure
-                else "",
+                "section_structure_json": (
+                    json.dumps(section_structure, ensure_ascii=False)
+                    if section_structure
+                    else ""
+                ),
                 "expected_question_count": expected_question_count,
                 "source_prompt": effective_creation_brief or latest_human_content,
                 "strict_source_questions": bool(file_questions) or exact_source_mode,
@@ -6091,11 +6309,12 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
         if not isinstance(result, str):
             result = json.dumps(result, ensure_ascii=False, indent=2)
         payload = json.loads(result)
+
         if user_language == "th":
             response_lines = [
-                "สร้าง Google Form เรียบร้อยแล้ว",
+                "\u0e2a\u0e23\u0e49\u0e32\u0e07 Google Form \u0e40\u0e23\u0e35\u0e22\u0e1a\u0e23\u0e49\u0e2d\u0e22\u0e41\u0e25\u0e49\u0e27",
                 "",
-                f"- ชื่อฟอร์ม: {str(payload.get('title', '') or title)}",
+                f"- \u0e0a\u0e37\u0e48\u0e2d\u0e1f\u0e2d\u0e23\u0e4c\u0e21: {str(payload.get('title', '') or title)}",
             ]
         else:
             response_lines = [
@@ -6103,54 +6322,122 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
                 "",
                 f"- Title: {str(payload.get('title', '') or title)}",
             ]
+
         if effective_reference_text and file_questions:
             response_lines.append(
-                f"- {'ใช้คำถามจากไฟล์แนบเป็นหลัก' if user_language == 'th' else 'Primary question source'}: {'ไฟล์แนบที่อัปโหลด' if user_language == 'th' else 'uploaded file'}"
+                f"- {'\u0e43\u0e0a\u0e49\u0e04\u0e33\u0e16\u0e32\u0e21\u0e08\u0e32\u0e01\u0e44\u0e1f\u0e25\u0e4c\u0e41\u0e19\u0e1a\u0e40\u0e1b\u0e47\u0e19\u0e2b\u0e25\u0e31\u0e01' if user_language == 'th' else 'Primary question source'}: "
+                f"{'\u0e44\u0e1f\u0e25\u0e4c\u0e41\u0e19\u0e1a\u0e17\u0e35\u0e48\u0e2d\u0e31\u0e1b\u0e42\u0e2b\u0e25\u0e14' if user_language == 'th' else 'uploaded file'}"
             )
+
         form_url = str(payload.get("formUrl", "") or payload.get("editUrl", "") or "")
-        responder_url = str(
-            payload.get("responderUri", "") or payload.get("responseUrl", "") or ""
-        )
+        responder_url = str(payload.get("responderUri", "") or payload.get("responseUrl", "") or "")
         form_id = str(payload.get("formId", "") or "")
         question_count = int(payload.get("questionCount", 0) or 0)
         inserted_image_count = int(payload.get("insertedImageCount", 0) or 0)
         payload_is_quiz = bool(payload.get("isQuiz", False))
+        spreadsheet_id = str(payload.get("spreadsheetId", "") or "")
+        spreadsheet_title = str(payload.get("spreadsheetTitle", "") or "")
+        spreadsheet_url = str(payload.get("spreadsheetUrl", "") or "")
+        postprocess_status = str(payload.get("postprocessStatus", "") or "")
+        processed_sheet_name = str(payload.get("processedSheetName", "") or "")
+        analysis_sheet_name = str(payload.get("analysisSheetName", "") or "")
+        summary_sheet_name = str(payload.get("summarySheetName", "") or "")
+        postprocess_error = str(payload.get("postprocessError", "") or "")
+
         if form_id:
-            response_lines.append(f"- {'รหัสฟอร์ม' if user_language == 'th' else 'Form ID'}: {form_id}")
+            response_lines.append(f"- {'\u0e23\u0e2b\u0e31\u0e2a\u0e1f\u0e2d\u0e23\u0e4c\u0e21' if user_language == 'th' else 'Form ID'}: {form_id}")
         if question_count:
             response_lines.append(
-                f"- {'จำนวนคำถามที่เพิ่ม' if user_language == 'th' else 'Questions added'}: {question_count}"
+                f"- {'\u0e08\u0e33\u0e19\u0e27\u0e19\u0e04\u0e33\u0e16\u0e32\u0e21\u0e17\u0e35\u0e48\u0e40\u0e1e\u0e34\u0e48\u0e21' if user_language == 'th' else 'Questions added'}: {question_count}"
             )
         response_lines.append(
-            f"- {'โหมดแบบทดสอบ' if user_language == 'th' else 'Quiz mode'}: "
-            + ("เปิด" if user_language == "th" and payload_is_quiz else
-               "ปิด" if user_language == "th" and not payload_is_quiz else
-               "On" if payload_is_quiz else "Off")
+            f"- {'\u0e42\u0e2b\u0e21\u0e14\u0e41\u0e1a\u0e1a\u0e17\u0e14\u0e2a\u0e2d\u0e1a' if user_language == 'th' else 'Quiz mode'}: "
+            + (
+                "\u0e40\u0e1b\u0e34\u0e14"
+                if user_language == "th" and payload_is_quiz
+                else "\u0e1b\u0e34\u0e14"
+                if user_language == "th" and not payload_is_quiz
+                else "On"
+                if payload_is_quiz
+                else "Off"
+            )
         )
         if inserted_image_count:
             response_lines.append(
-                f"- {'จำนวนรูปที่แทรก' if user_language == 'th' else 'Images inserted'}: {inserted_image_count}"
+                f"- {'\u0e08\u0e33\u0e19\u0e27\u0e19\u0e23\u0e39\u0e1b\u0e17\u0e35\u0e48\u0e41\u0e17\u0e23\u0e01' if user_language == 'th' else 'Images inserted'}: {inserted_image_count}"
+            )
+        if spreadsheet_id:
+            response_lines.append(
+                f"- {'\u0e23\u0e2b\u0e31\u0e2a\u0e2a\u0e40\u0e1b\u0e23\u0e14\u0e0a\u0e35\u0e15' if user_language == 'th' else 'Spreadsheet ID'}: {spreadsheet_id}"
+            )
+        if spreadsheet_title:
+            response_lines.append(
+                f"- {'\u0e0a\u0e37\u0e48\u0e2d\u0e2a\u0e40\u0e1b\u0e23\u0e14\u0e0a\u0e35\u0e15' if user_language == 'th' else 'Spreadsheet title'}: {spreadsheet_title}"
             )
         if form_url:
-            response_lines.extend(["", f"{'ลิงก์ฟอร์ม' if user_language == 'th' else 'Form link'}: {form_url}"])
+            response_lines.extend(["", f"{'\u0e25\u0e34\u0e07\u0e01\u0e4c\u0e1f\u0e2d\u0e23\u0e4c\u0e21' if user_language == 'th' else 'Form link'}: {form_url}"])
         if responder_url:
             response_lines.append(
-                f"{'ลิงก์สำหรับผู้ตอบ' if user_language == 'th' else 'Responder link'}: {responder_url}"
+                f"{'\u0e25\u0e34\u0e07\u0e01\u0e4c\u0e2a\u0e33\u0e2b\u0e23\u0e31\u0e1a\u0e1c\u0e39\u0e49\u0e15\u0e2d\u0e1a' if user_language == 'th' else 'Responder link'}: {responder_url}"
             )
+        if spreadsheet_url:
+            response_lines.append(
+                f"{'\u0e25\u0e34\u0e07\u0e01\u0e4c\u0e2a\u0e40\u0e1b\u0e23\u0e14\u0e0a\u0e35\u0e15' if user_language == 'th' else 'Spreadsheet link'}: {spreadsheet_url}"
+            )
+        if postprocess_status == "formatted":
+            response_lines.append(
+                f"- {'สถานะการจัดรูปแบบชีต' if user_language == 'th' else 'Sheet post-process'}: "
+                f"{'เสร็จแล้ว' if user_language == 'th' else 'Completed'}"
+            )
+            if processed_sheet_name:
+                response_lines.append(
+                    f"- {'ชีตคำตอบที่จัดรูปแบบ' if user_language == 'th' else 'Processed responses sheet'}: {processed_sheet_name}"
+                )
+            if analysis_sheet_name:
+                response_lines.append(
+                    f"- {'ชีตรายละเอียดคำตอบ' if user_language == 'th' else 'Response details sheet'}: {analysis_sheet_name}"
+                )
+            if summary_sheet_name:
+                response_lines.append(
+                    f"- {'ชีตสรุปคำตอบรายข้อ' if user_language == 'th' else 'Question summary sheet'}: {summary_sheet_name}"
+                )
+        elif postprocess_status == "waiting-for-responses":
+            response_lines.append(
+                f"- {'สถานะการจัดรูปแบบชีต' if user_language == 'th' else 'Sheet post-process'}: "
+                f"{'รอข้อมูลคำตอบชุดแรก' if user_language == 'th' else 'Waiting for first responses'}"
+            )
+        elif postprocess_status and postprocess_error:
+            response_lines.append(
+                f"- {'สถานะการจัดรูปแบบชีต' if user_language == 'th' else 'Sheet post-process'}: "
+                f"{'ยังไม่สำเร็จ' if user_language == 'th' else 'Not completed yet'}"
+            )
+
         next_step = str(payload.get("nextStep", "") or "").strip()
         if next_step:
             localized_next_step = next_step
             if user_language == "th":
+                if postprocess_status == "formatted":
+                    localized_next_step = (
+                        "ฟอร์มนี้ถูกเชื่อมกับ Google Spreadsheet และจัดรูปแบบชีตวิเคราะห์เบื้องต้นแล้ว "
+                        "ส่งลิงก์สเปรดชีตกลับมาได้ทุกเมื่อหากต้องการให้ฉันวิเคราะห์หรือจัดรูปแบบใหม่"
+                    )
+                else:
+                    localized_next_step = (
+                        "ฟอร์มนี้ถูกเชื่อมกับ Google Spreadsheet เรียบร้อยแล้ว "
+                        "เมื่อมีคำตอบเข้ามาแล้ว ส่งลิงก์สเปรดชีตกลับมาได้ทุกเมื่อเพื่อให้ฉันวิเคราะห์หรือจัดรูปแบบใหม่"
+                    )
+            elif postprocess_status == "formatted":
                 localized_next_step = (
-                    "ให้เชื่อมฟอร์มนี้กับ Google Spreadsheet ในหน้า Google Forms แบบ manual "
-                    "แล้วส่งลิงก์สเปรดชีตกลับมา เพื่อให้ฉันจัดรูปแบบข้อมูลคำตอบสำหรับการวิเคราะห์ต่อ"
+                    "The form is linked and the first-pass analysis sheets are already in place. "
+                    "Send the spreadsheet link back any time you want the agent to inspect or reformat the data."
                 )
             response_lines.extend(["", localized_next_step])
+
         return AIMessage(content="\n".join(response_lines).strip())
     except Exception as exc:
         raise RuntimeError(
             (
-                "ฉันตรวจพบว่านี่เป็นคำขอสร้าง Google Form แต่การสร้างฟอร์มแบบตรงล้มเหลว "
+                "\u0e09\u0e31\u0e19\u0e15\u0e23\u0e27\u0e08\u0e1e\u0e1a\u0e27\u0e48\u0e32\u0e19\u0e35\u0e48\u0e40\u0e1b\u0e47\u0e19\u0e04\u0e33\u0e02\u0e2d\u0e2a\u0e23\u0e49\u0e32\u0e07 Google Form \u0e41\u0e15\u0e48\u0e01\u0e32\u0e23\u0e2a\u0e23\u0e49\u0e32\u0e07\u0e1f\u0e2d\u0e23\u0e4c\u0e21\u0e41\u0e1a\u0e1a\u0e15\u0e23\u0e07\u0e25\u0e49\u0e21\u0e40\u0e2b\u0e25\u0e27 "
                 if user_language == "th"
                 else "I recognized this as a Google Form creation request, but the direct form creation flow failed. "
             )
