@@ -2701,6 +2701,8 @@ def extract_questions_from_reference_text(reference_text: str) -> list[dict[str,
                 return True
             if text in {"[Table]"} or text.startswith("[Embedded image"):
                 return True
+            if _is_visual_separator_line(text):
+                return True
             return _is_instructional_prompt_line(text)
 
         def next_meaningful_lines(start_index: int, limit: int = 8) -> list[str]:
@@ -2816,6 +2818,9 @@ def extract_questions_from_reference_text(reference_text: str) -> list[dict[str,
                 continue
 
             if current_question is None:
+                lookahead_after_current = next_meaningful_lines(line_index + 1, limit=4)
+                if lookahead_after_current and question_start_re.match(lookahead_after_current[0]):
+                    continue
                 if looks_like_question_title(line_index):
                     current_question = {
                         "title": stripped,
@@ -2876,6 +2881,13 @@ def extract_questions_from_reference_text(reference_text: str) -> list[dict[str,
                         line_index + 1
                     ),
                 }
+                continue
+
+            if not current_question.get("options"):
+                description = str(current_question.get("description", "") or "").strip()
+                current_question["description"] = (
+                    f"{description}\n{stripped}".strip() if description else stripped
+                )
                 continue
 
             title = str(current_question.get("title", "") or "").strip()
@@ -3092,17 +3104,17 @@ def _build_form_item(question: dict[str, Any], include_grading: bool = True) -> 
     """Build a Google Forms item payload from a normalized question."""
     question_type = str(question.get("type", "multiple_choice") or "multiple_choice").strip().lower()
     required = bool(question.get("required", True))
-    item: dict[str, Any] = {"title": str(question["title"])}
-    description = str(question.get("description", "") or "").strip()
+    item: dict[str, Any] = {"title": _sanitize_display_text(question["title"])}
+    description = _sanitize_multiline_display_text(question.get("description", ""))
     question_images = [
         image
         for image in question.get("images", [])
         if isinstance(image, dict) and str(image.get("source_uri", "") or "").strip()
     ]
     correct_answers = [
-        str(answer).strip()
+        _sanitize_display_text(answer)
         for answer in question.get("correct_answers", [])
-        if str(answer).strip()
+        if _sanitize_display_text(answer)
     ] if isinstance(question.get("correct_answers", []), list) else []
     point_value = max(1, int(question.get("point_value", 1) or 1))
     if description:
@@ -3112,28 +3124,9 @@ def _build_form_item(question: dict[str, Any], include_grading: bool = True) -> 
         return item
 
     if question_type in {"multiple_choice", "multiple-choice", "radio"}:
-        options_payload: list[dict[str, Any]] = []
-        for option_index, option in enumerate(question.get("options", [])):
-            if isinstance(option, dict):
-                value = str(option.get("value", "") or "").strip()
-                if not value:
-                    continue
-                option_payload: dict[str, Any] = {"value": value}
-                option_images = option.get("images", [])
-                if isinstance(option_images, list) and option_images:
-                    first_image = option_images[0]
-                    if isinstance(first_image, dict):
-                        source_uri = str(first_image.get("source_uri", "") or "").strip()
-                        if source_uri:
-                            option_payload["image"] = {"sourceUri": source_uri}
-                            alt_text = str(first_image.get("alt_text", "") or "").strip()
-                            if alt_text:
-                                option_payload["image"]["altText"] = alt_text
-                options_payload.append(option_payload)
-            else:
-                value = str(option).strip()
-                if value:
-                    options_payload.append({"value": value})
+        options_payload, answer_value_map = _build_unique_choice_options(
+            question.get("options", [])
+        )
         if len(options_payload) < 2:
             raise RuntimeError(f"Multiple-choice question '{question['title']}' needs at least 2 options.")
         question_payload: dict[str, Any] = {
@@ -3144,12 +3137,17 @@ def _build_form_item(question: dict[str, Any], include_grading: bool = True) -> 
             },
         }
         if include_grading and correct_answers:
-            question_payload["grading"] = {
-                "pointValue": point_value,
-                "correctAnswers": {
-                    "answers": [{"value": answer} for answer in correct_answers]
-                },
-            }
+            remapped_correct_answers = _remap_correct_answers_for_choice_values(
+                correct_answers,
+                answer_value_map,
+            )
+            if remapped_correct_answers:
+                question_payload["grading"] = {
+                    "pointValue": point_value,
+                    "correctAnswers": {
+                        "answers": [{"value": answer} for answer in remapped_correct_answers]
+                    },
+                }
         item["questionItem"] = {
             "question": question_payload
         }
@@ -3164,16 +3162,9 @@ def _build_form_item(question: dict[str, Any], include_grading: bool = True) -> 
         return item
 
     if question_type in {"checkbox", "checkboxes"}:
-        options_payload: list[dict[str, Any]] = []
-        for option in question.get("options", []):
-            if isinstance(option, dict):
-                value = str(option.get("value", "") or "").strip()
-                if value:
-                    options_payload.append({"value": value})
-            else:
-                value = str(option).strip()
-                if value:
-                    options_payload.append({"value": value})
+        options_payload, answer_value_map = _build_unique_choice_options(
+            question.get("options", [])
+        )
         if len(options_payload) < 2:
             raise RuntimeError(f"Checkbox question '{question['title']}' needs at least 2 options.")
         question_payload = {
@@ -3184,12 +3175,17 @@ def _build_form_item(question: dict[str, Any], include_grading: bool = True) -> 
             },
         }
         if include_grading and correct_answers:
-            question_payload["grading"] = {
-                "pointValue": point_value,
-                "correctAnswers": {
-                    "answers": [{"value": answer} for answer in correct_answers]
-                },
-            }
+            remapped_correct_answers = _remap_correct_answers_for_choice_values(
+                correct_answers,
+                answer_value_map,
+            )
+            if remapped_correct_answers:
+                question_payload["grading"] = {
+                    "pointValue": point_value,
+                    "correctAnswers": {
+                        "answers": [{"value": answer} for answer in remapped_correct_answers]
+                    },
+                }
         item["questionItem"] = {
             "question": question_payload
         }
@@ -3204,16 +3200,9 @@ def _build_form_item(question: dict[str, Any], include_grading: bool = True) -> 
         return item
 
     if question_type in {"dropdown", "drop_down"}:
-        options_payload: list[dict[str, Any]] = []
-        for option in question.get("options", []):
-            if isinstance(option, dict):
-                value = str(option.get("value", "") or "").strip()
-                if value:
-                    options_payload.append({"value": value})
-            else:
-                value = str(option).strip()
-                if value:
-                    options_payload.append({"value": value})
+        options_payload, answer_value_map = _build_unique_choice_options(
+            question.get("options", [])
+        )
         if len(options_payload) < 2:
             raise RuntimeError(f"Dropdown question '{question['title']}' needs at least 2 options.")
         question_payload = {
@@ -3224,12 +3213,17 @@ def _build_form_item(question: dict[str, Any], include_grading: bool = True) -> 
             },
         }
         if include_grading and correct_answers:
-            question_payload["grading"] = {
-                "pointValue": point_value,
-                "correctAnswers": {
-                    "answers": [{"value": answer} for answer in correct_answers]
-                },
-            }
+            remapped_correct_answers = _remap_correct_answers_for_choice_values(
+                correct_answers,
+                answer_value_map,
+            )
+            if remapped_correct_answers:
+                question_payload["grading"] = {
+                    "pointValue": point_value,
+                    "correctAnswers": {
+                        "answers": [{"value": answer} for answer in remapped_correct_answers]
+                    },
+                }
         item["questionItem"] = {
             "question": question_payload
         }
@@ -3271,8 +3265,8 @@ def _build_form_items(question: dict[str, Any], include_grading: bool = True) ->
     extra_question_images = images[1:] if images else []
     for image in extra_question_images:
         image_item: dict[str, Any] = {
-            "title": str(image.get("alt_text", "") or "").strip()
-            or f"Image for {str(question.get('title', '') or '').strip()}",
+            "title": _sanitize_display_text(image.get("alt_text", ""))
+            or _sanitize_display_text(f"Image for {str(question.get('title', '') or '').strip()}"),
             "imageItem": {
                 "image": {
                     "sourceUri": str(image.get("source_uri", "") or "").strip(),
@@ -3294,14 +3288,14 @@ def _build_form_items(question: dict[str, Any], include_grading: bool = True) ->
         if not isinstance(extra_images, list):
             continue
         option_label = str(option.get("label", "") or _option_label_for_index(option_index)).strip()
-        option_value = str(option.get("value", "") or "").strip()
+        option_value = _sanitize_display_text(option.get("value", ""))
         for image in extra_images:
             if not isinstance(image, dict) or not str(image.get("source_uri", "") or "").strip():
                 continue
             image_item: dict[str, Any] = {
-                "title": str(image.get("alt_text", "") or "").strip()
-                or f"Additional image for choice {option_label}",
-                "description": f"Choice {option_label}: {option_value}".strip(),
+                "title": _sanitize_display_text(image.get("alt_text", ""))
+                or _sanitize_display_text(f"Additional image for choice {option_label}"),
+                "description": _sanitize_display_text(f"Choice {option_label}: {option_value}"),
                 "imageItem": {
                     "image": {
                         "sourceUri": str(image.get("source_uri", "") or "").strip(),
@@ -3431,6 +3425,8 @@ def _apply_form_batch_updates(
 
     if not requests:
         return
+
+    requests = _sanitize_forms_payload(requests)
 
     forms_service.forms().batchUpdate(
         formId=form_id,
@@ -5399,6 +5395,133 @@ def _option_label_for_index(index: int) -> str:
     return chr(ord("A") + index)
 
 
+def _build_unique_choice_options(
+    raw_options: list[Any],
+) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+    """Build Forms choice options while guaranteeing unique visible values."""
+    options_payload: list[dict[str, Any]] = []
+    answer_value_map: dict[str, list[str]] = {}
+    used_values: set[str] = set()
+
+    for option_index, option in enumerate(raw_options):
+        original_value = ""
+        option_label = _option_label_for_index(option_index)
+        option_payload: dict[str, Any] = {}
+
+        if isinstance(option, dict):
+            original_value = _sanitize_display_text(option.get("value", ""))
+            option_label = str(option.get("label", "") or option_label).strip() or option_label
+            if not original_value:
+                continue
+            option_images = option.get("images", [])
+            if isinstance(option_images, list) and option_images:
+                first_image = option_images[0]
+                if isinstance(first_image, dict):
+                    source_uri = str(first_image.get("source_uri", "") or "").strip()
+                    if source_uri:
+                        option_payload["image"] = {"sourceUri": source_uri}
+                        alt_text = str(first_image.get("alt_text", "") or "").strip()
+                        if alt_text:
+                            option_payload["image"]["altText"] = alt_text
+        else:
+            original_value = _sanitize_display_text(option)
+            if not original_value:
+                continue
+
+        unique_value = original_value
+        if unique_value in used_values:
+            if not unique_value.startswith(f"{option_label}. "):
+                unique_value = f"{option_label}. {original_value}"
+            suffix = 2
+            while unique_value in used_values:
+                unique_value = f"{original_value} ({suffix})"
+                suffix += 1
+
+        option_payload["value"] = unique_value
+        options_payload.append(option_payload)
+        used_values.add(unique_value)
+
+        normalized_original_value = _normalize_match_text(original_value)
+        if normalized_original_value:
+            answer_value_map.setdefault(normalized_original_value, []).append(unique_value)
+
+    return options_payload, answer_value_map
+
+
+def _remap_correct_answers_for_choice_values(
+    correct_answers: list[str],
+    answer_value_map: dict[str, list[str]],
+) -> list[str]:
+    """Map correct answers onto the final visible option values used in Forms."""
+    remapped_answers: list[str] = []
+    seen_answers: set[str] = set()
+    for answer in correct_answers:
+        normalized_answer = _normalize_match_text(answer)
+        if not normalized_answer:
+            continue
+        candidates = answer_value_map.get(normalized_answer, [])
+        if not candidates:
+            continue
+        candidate = candidates[0]
+        if candidate in seen_answers:
+            continue
+        remapped_answers.append(candidate)
+        seen_answers.add(candidate)
+    return remapped_answers
+
+
+def _is_visual_separator_line(text: str) -> bool:
+    """Return whether a line is only a decorative separator from the source document."""
+    stripped = str(text or "").strip()
+    if not stripped:
+        return False
+    normalized = _normalize_match_text(stripped)
+    if not normalized:
+        return False
+    if normalized.startswith("%="):
+        return True
+    return bool(re.fullmatch(r"[%=~_\-]{8,}", stripped))
+
+
+def _sanitize_display_text(text: Any) -> str:
+    """Flatten text for Google Forms displayed fields that cannot contain newlines."""
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def _sanitize_multiline_display_text(text: Any) -> str:
+    """Normalize multiline text while preserving line breaks."""
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    lines = [
+        re.sub(r"\s+", " ", line).strip()
+        for line in value.replace("\r\n", "\n").split("\n")
+    ]
+    return "\n".join(line for line in lines if line)
+
+
+def _sanitize_forms_payload(value: Any, key: str | None = None) -> Any:
+    """Recursively sanitize displayed text fields before sending requests to Forms."""
+    if isinstance(value, dict):
+        return {
+            sub_key: _sanitize_forms_payload(sub_value, sub_key)
+            for sub_key, sub_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_forms_payload(item, key) for item in value]
+    if isinstance(value, str):
+        if key == "description":
+            return _sanitize_multiline_display_text(value)
+        if key in {"title", "value", "altText"}:
+            return _sanitize_display_text(value)
+        return value
+    return value
+
+
 def _match_next_question_index(
     normalized_segment_text: str,
     current_question_index: int,
@@ -5409,10 +5532,17 @@ def _match_next_question_index(
     if next_index >= len(normalized_titles):
         return None
     target = normalized_titles[next_index]
-    if target and (
-        normalized_segment_text == target
-        or normalized_segment_text.startswith(target)
-        or target.startswith(normalized_segment_text)
+    candidate_texts = [normalized_segment_text]
+    stripped_numbering = re.sub(r"^\d+[.)]\s*", "", normalized_segment_text).strip()
+    if stripped_numbering and stripped_numbering not in candidate_texts:
+        candidate_texts.append(stripped_numbering)
+
+    if target and any(
+        candidate == target
+        or candidate.startswith(target)
+        or target.startswith(candidate)
+        for candidate in candidate_texts
+        if candidate
     ):
         return next_index
     return None
@@ -5428,6 +5558,12 @@ def _question_title_refers_to_image(title: str) -> bool:
         "จากรูป",
         "รูปด้านบน",
         "รูปต่อไปนี้",
+        "ภาพข้างล่าง",
+        "ภาพข้างล่างนี้",
+        "รูปข้างล่าง",
+        "รูปข้างล่างนี้",
+        "ตามที่ปรากฏในภาพ",
+        "ตามที่ปรากฏในรูป",
         "ดูภาพ",
         "ดูรูป",
     )
@@ -5674,6 +5810,9 @@ def extract_docx_questions_with_images(file_bytes: bytes) -> list[dict[str, Any]
 
     for segment_index, segment in enumerate(segments):
         segment_text = str(segment.get("text", "") or "").strip()
+        if _is_visual_separator_line(segment_text):
+            continue
+
         normalized_segment_text = _normalize_match_text(segment_text)
         if normalized_segment_text:
             next_index = _match_next_question_index(
@@ -5718,7 +5857,7 @@ def extract_docx_questions_with_images(file_bytes: bytes) -> list[dict[str, Any]
             while lookahead_index < len(segments):
                 lookahead_text = str(segments[lookahead_index].get("text", "") or "").strip()
                 normalized_lookahead_text = _normalize_match_text(lookahead_text)
-                if not normalized_lookahead_text:
+                if not normalized_lookahead_text or _is_visual_separator_line(lookahead_text):
                     lookahead_index += 1
                     continue
                 next_question_index = _match_next_question_index(
@@ -6374,16 +6513,37 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
             response_lines.append(
                 f"- {'\u0e0a\u0e37\u0e48\u0e2d\u0e2a\u0e40\u0e1b\u0e23\u0e14\u0e0a\u0e35\u0e15' if user_language == 'th' else 'Spreadsheet title'}: {spreadsheet_title}"
             )
+        link_lines: list[str] = []
         if form_url:
-            response_lines.extend(["", f"{'\u0e25\u0e34\u0e07\u0e01\u0e4c\u0e1f\u0e2d\u0e23\u0e4c\u0e21' if user_language == 'th' else 'Form link'}: {form_url}"])
+            link_lines.extend(
+                [
+                    f"{'\u0e25\u0e34\u0e07\u0e01\u0e4c\u0e1f\u0e2d\u0e23\u0e4c\u0e21' if user_language == 'th' else 'Form link'}:",
+                    "",
+                    form_url,
+                ]
+            )
         if responder_url:
-            response_lines.append(
-                f"{'\u0e25\u0e34\u0e07\u0e01\u0e4c\u0e2a\u0e33\u0e2b\u0e23\u0e31\u0e1a\u0e1c\u0e39\u0e49\u0e15\u0e2d\u0e1a' if user_language == 'th' else 'Responder link'}: {responder_url}"
+            if link_lines:
+                link_lines.append("")
+            link_lines.extend(
+                [
+                    f"{'\u0e25\u0e34\u0e07\u0e01\u0e4c\u0e2a\u0e33\u0e2b\u0e23\u0e31\u0e1a\u0e1c\u0e39\u0e49\u0e15\u0e2d\u0e1a' if user_language == 'th' else 'Responder link'}:",
+                    "",
+                    responder_url,
+                ]
             )
         if spreadsheet_url:
-            response_lines.append(
-                f"{'\u0e25\u0e34\u0e07\u0e01\u0e4c\u0e2a\u0e40\u0e1b\u0e23\u0e14\u0e0a\u0e35\u0e15' if user_language == 'th' else 'Spreadsheet link'}: {spreadsheet_url}"
+            if link_lines:
+                link_lines.append("")
+            link_lines.extend(
+                [
+                    f"{'\u0e25\u0e34\u0e07\u0e01\u0e4c\u0e2a\u0e40\u0e1b\u0e23\u0e14\u0e0a\u0e35\u0e15' if user_language == 'th' else 'Spreadsheet link'}:",
+                    "",
+                    spreadsheet_url,
+                ]
             )
+        if link_lines:
+            response_lines.extend(["", *link_lines])
         if postprocess_status == "formatted":
             response_lines.append(
                 f"- {'สถานะการจัดรูปแบบชีต' if user_language == 'th' else 'Sheet post-process'}: "
