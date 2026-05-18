@@ -25,6 +25,7 @@ These instructions apply to this repository unless a more specific `AGENTS.md` e
   - image-only paragraphs can be mapped to the following image-based question when the question title explicitly refers to an image
   - multiple images inside one answer choice may be merged into a single composite image because Google Forms only supports one native image per option
 - Configure the Web UI backend URLs through `.env` with `WEBUI_PUBLIC_API_URL` and `WEBUI_LANGGRAPH_API_URL`.
+- For public/domain deployments, do not route the LangGraph backend directly on the same `/api` path that the Next.js app uses for its own API routes and Google OAuth callback. Keep the Next.js app at the main hostname and expose LangGraph either on a separate hostname or a distinct non-conflicting path, then point `WEBUI_PUBLIC_API_URL` at that public browser-reachable endpoint.
 - Run backend and web UI together with `docker compose up --build`; Docker Desktop must be running with the Linux engine.
 - Current product workflow is:
   1. user asks the agent to create a form
