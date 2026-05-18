@@ -7,6 +7,7 @@ const DEFAULT_TOKEN_PATH = path.resolve(
   process.cwd(),
   "../.data/google-oauth.json",
 );
+const GOOGLE_OAUTH_SESSION_COOKIE_NAME = "google_oauth_session";
 const STATE_COOKIE_NAME = "google_oauth_state";
 const SCOPES = [
   "https://www.googleapis.com/auth/forms",
@@ -33,6 +34,14 @@ export type StoredGoogleToken = {
   expiry?: string;
   created_at: string;
 };
+
+function sanitizeSessionKey(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const normalized = trimmed.replace(/[^a-zA-Z0-9_-]/g, "");
+  if (!normalized) return null;
+  return normalized.slice(0, 128);
+}
 
 function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();
@@ -79,8 +88,33 @@ function getRequestOrigin(request: Request): string {
   return `${protocol}://${normalizedHost}`;
 }
 
-export function getGoogleOauthTokenPath(): string {
-  return process.env.GOOGLE_OAUTH_TOKEN_PATH?.trim() || DEFAULT_TOKEN_PATH;
+async function getOrCreateGoogleOauthSessionKey(): Promise<string> {
+  const cookieStore = await cookies();
+  const existing = sanitizeSessionKey(
+    cookieStore.get(GOOGLE_OAUTH_SESSION_COOKIE_NAME)?.value ?? "",
+  );
+  if (existing) return existing;
+
+  const sessionKey = randomUUID();
+  cookieStore.set(GOOGLE_OAUTH_SESSION_COOKIE_NAME, sessionKey, {
+    httpOnly: false,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    path: "/",
+    maxAge: 60 * 60 * 24 * 30,
+  });
+  return sessionKey;
+}
+
+export async function getGoogleOauthSessionKey(): Promise<string> {
+  return getOrCreateGoogleOauthSessionKey();
+}
+
+export async function getGoogleOauthTokenPath(): Promise<string> {
+  const basePath = process.env.GOOGLE_OAUTH_TOKEN_PATH?.trim() || DEFAULT_TOKEN_PATH;
+  const sessionKey = await getOrCreateGoogleOauthSessionKey();
+  const baseDir = path.dirname(basePath);
+  return path.join(baseDir, "google-oauth-sessions", `${sessionKey}.json`);
 }
 
 export function getGoogleOauthRedirectUri(request: Request): string {
@@ -197,14 +231,14 @@ export async function exchangeCodeForToken(
 }
 
 export async function saveGoogleOauthToken(token: StoredGoogleToken) {
-  const tokenPath = getGoogleOauthTokenPath();
+  const tokenPath = await getGoogleOauthTokenPath();
   await mkdir(path.dirname(tokenPath), { recursive: true });
   await writeFile(tokenPath, JSON.stringify(token, null, 2), "utf-8");
 }
 
 export async function loadGoogleOauthToken(): Promise<StoredGoogleToken | null> {
   try {
-    const raw = await readFile(getGoogleOauthTokenPath(), "utf-8");
+    const raw = await readFile(await getGoogleOauthTokenPath(), "utf-8");
     return JSON.parse(raw) as StoredGoogleToken;
   } catch {
     return null;
@@ -212,5 +246,5 @@ export async function loadGoogleOauthToken(): Promise<StoredGoogleToken | null> 
 }
 
 export async function deleteGoogleOauthToken() {
-  await rm(getGoogleOauthTokenPath(), { force: true });
+  await rm(await getGoogleOauthTokenPath(), { force: true });
 }

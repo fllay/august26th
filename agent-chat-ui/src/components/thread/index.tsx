@@ -51,12 +51,30 @@ import { GenericInterruptView } from "./messages/generic-interrupt";
 import { MarkdownText } from "./markdown-text";
 import { GoogleOauthButton } from "./google-oauth-button";
 
+const GOOGLE_OAUTH_SESSION_COOKIE_NAME = "google_oauth_session";
+
 const isThreadNotFoundError = (message: string) => {
   const normalized = message.toLowerCase();
   return (
     normalized.includes("thread not found") ||
     (normalized.includes("not found") && normalized.includes("thread"))
   );
+};
+
+const getCookieValue = (name: string): string | null => {
+  if (typeof document === "undefined") return null;
+  const prefix = `${name}=`;
+  const match = document.cookie
+    .split(";")
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(prefix));
+  if (!match) return null;
+  const rawValue = match.slice(prefix.length);
+  try {
+    return decodeURIComponent(rawValue);
+  } catch {
+    return rawValue;
+  }
 };
 
 function StickyToBottomContent(props: {
@@ -506,6 +524,8 @@ export function Thread() {
           }
         : {}),
       web_search_enabled: false,
+      google_oauth_session_key:
+        getCookieValue(GOOGLE_OAUTH_SESSION_COOKIE_NAME) ?? undefined,
     };
 
     const guestId = ensureGuestId();

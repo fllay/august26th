@@ -3,6 +3,7 @@
 import asyncio
 import ast
 import base64
+import contextvars
 import csv
 from datetime import datetime, timezone
 import html
@@ -61,6 +62,10 @@ GOOGLE_APPS_SCRIPT_SCOPES = [
     "https://www.googleapis.com/auth/script.deployments",
     "https://www.googleapis.com/auth/script.scriptapp",
 ]
+GOOGLE_OAUTH_SESSION_KEY = contextvars.ContextVar[str | None](
+    "google_oauth_session_key",
+    default=None,
+)
 DEFAULT_RESPONDENT_INFO_QUESTIONS = [
     {"title": "ชื่อ-นามสกุล", "type": "text", "required": True},
     {"title": "หน่วยงาน/สถานศึกษา", "type": "text", "required": True},
@@ -4712,12 +4717,32 @@ def get_required_env(name: str) -> str:
     return value
 
 
+def _sanitize_google_oauth_session_key(value: Any) -> str | None:
+    """Normalize a user-scoped OAuth session key into a safe filename fragment."""
+    if not isinstance(value, str):
+        return None
+    trimmed = value.strip()
+    if not trimmed:
+        return None
+    normalized = re.sub(r"[^a-zA-Z0-9_-]", "", trimmed)
+    if not normalized:
+        return None
+    return normalized[:128]
+
+
+def _derive_google_oauth_token_path_for_session(session_key: str | None) -> Path:
+    """Map a logical OAuth session key to its token file location."""
+    configured = os.getenv("GOOGLE_OAUTH_TOKEN_PATH")
+    base_path = Path(configured).expanduser() if configured else DEFAULT_GOOGLE_OAUTH_TOKEN_PATH
+    if not session_key:
+        return base_path
+    return base_path.parent / "google-oauth-sessions" / f"{session_key}.json"
+
+
 def get_google_oauth_token_path() -> Path:
     """Return the shared OAuth token file path used by the web UI and backend."""
-    configured = os.getenv("GOOGLE_OAUTH_TOKEN_PATH")
-    if configured:
-        return Path(configured).expanduser()
-    return DEFAULT_GOOGLE_OAUTH_TOKEN_PATH
+    session_key = GOOGLE_OAUTH_SESSION_KEY.get()
+    return _derive_google_oauth_token_path_for_session(session_key)
 
 
 def load_google_refresh_token() -> str | None:
@@ -6100,6 +6125,30 @@ def get_attached_file_context(request: ModelRequest) -> str:
     return ""
 
 
+def get_google_oauth_session_key_from_request(request: ModelRequest) -> str | None:
+    """Read the user-scoped Google OAuth session key from runtime or state context."""
+    runtime = getattr(request, "runtime", None)
+    runtime_context = getattr(runtime, "context", None)
+    if isinstance(runtime_context, dict):
+        return _sanitize_google_oauth_session_key(
+            runtime_context.get("google_oauth_session_key")
+        )
+    if hasattr(runtime_context, "get"):
+        try:
+            return _sanitize_google_oauth_session_key(
+                runtime_context.get("google_oauth_session_key")
+            )
+        except Exception:
+            pass
+
+    state_context = request.state.get("context") if isinstance(request.state, dict) else None
+    if isinstance(state_context, dict):
+        return _sanitize_google_oauth_session_key(
+            state_context.get("google_oauth_session_key")
+        )
+    return None
+
+
 def inject_attached_file_context(
     messages: list[AnyMessage],
     attached_file_context: str,
@@ -6613,39 +6662,45 @@ class LocalLLMMessageFormatMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Any],
     ) -> ModelResponse | AIMessage:
-        original_messages = list(request.messages)
-        system_message = (
-            sanitize_message_content(request.system_message)
-            if request.system_message is not None
-            else None
+        token_session = GOOGLE_OAUTH_SESSION_KEY.set(
+            get_google_oauth_session_key_from_request(request)
         )
-        messages = [sanitize_message_content(message) for message in original_messages]
-        messages = inject_attached_file_context(
-            messages,
-            get_attached_file_context(request),
-        )
-        direct_sheet_response = await asyncio.to_thread(
-            maybe_complete_manual_sheet_format_handoff,
-            messages,
-        )
-        if direct_sheet_response is not None:
-            return direct_sheet_response
-        direct_form_messages = inject_attached_file_context(
-            original_messages,
-            get_attached_file_context(request),
-        )
-        direct_form_response = await asyncio.to_thread(
-            maybe_complete_form_creation_request,
-            direct_form_messages,
-        )
-        if direct_form_response is not None:
-            return direct_form_response
-        messages = inject_form_creation_context(messages)
-        messages = inject_spreadsheet_target_context(messages)
-        response = await handler(
-            request.override(system_message=system_message, messages=messages)
-        )
-        return clean_model_response(response)
+        try:
+            original_messages = list(request.messages)
+            system_message = (
+                sanitize_message_content(request.system_message)
+                if request.system_message is not None
+                else None
+            )
+            messages = [sanitize_message_content(message) for message in original_messages]
+            messages = inject_attached_file_context(
+                messages,
+                get_attached_file_context(request),
+            )
+            direct_sheet_response = await asyncio.to_thread(
+                maybe_complete_manual_sheet_format_handoff,
+                messages,
+            )
+            if direct_sheet_response is not None:
+                return direct_sheet_response
+            direct_form_messages = inject_attached_file_context(
+                original_messages,
+                get_attached_file_context(request),
+            )
+            direct_form_response = await asyncio.to_thread(
+                maybe_complete_form_creation_request,
+                direct_form_messages,
+            )
+            if direct_form_response is not None:
+                return direct_form_response
+            messages = inject_form_creation_context(messages)
+            messages = inject_spreadsheet_target_context(messages)
+            response = await handler(
+                request.override(system_message=system_message, messages=messages)
+            )
+            return clean_model_response(response)
+        finally:
+            GOOGLE_OAUTH_SESSION_KEY.reset(token_session)
 
 
 def build_openrouter_model() -> ChatOpenAI:
