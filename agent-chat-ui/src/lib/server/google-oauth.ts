@@ -9,6 +9,7 @@ const DEFAULT_TOKEN_PATH = path.resolve(
 );
 const STATE_COOKIE_NAME = "google_oauth_state";
 const SCOPES = [
+  "https://www.googleapis.com/auth/forms",
   "https://www.googleapis.com/auth/forms.body",
   "https://www.googleapis.com/auth/forms.responses.readonly",
   "https://www.googleapis.com/auth/spreadsheets",
