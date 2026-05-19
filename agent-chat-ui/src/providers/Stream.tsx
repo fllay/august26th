@@ -151,18 +151,17 @@ const StreamSession = ({
   );
 };
 
-const DEFAULT_API_URL = "http://localhost:2024";
+const DEFAULT_API_URL = "/api";
 const DEFAULT_ASSISTANT_ID = "agent";
 
 export const StreamProvider: React.FC<{ children: ReactNode }> = ({
   children,
 }) => {
-  const envApiUrl: string | undefined = process.env.NEXT_PUBLIC_API_URL;
   const envAssistantId: string | undefined =
     process.env.NEXT_PUBLIC_ASSISTANT_ID;
 
   const [apiUrl, setApiUrl] = useQueryState("apiUrl", {
-    defaultValue: envApiUrl || "",
+    defaultValue: DEFAULT_API_URL,
   });
   const [assistantId, setAssistantId] = useQueryState("assistantId", {
     defaultValue: envAssistantId || "",
@@ -175,7 +174,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     _setApiKey(key);
   };
 
-  const finalApiUrl = apiUrl || envApiUrl || "";
+  const finalApiUrl = apiUrl || DEFAULT_API_URL;
   const finalAssistantId = assistantId || envAssistantId || "";
 
   if (!finalApiUrl || !finalAssistantId) {

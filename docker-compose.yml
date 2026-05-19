@@ -33,12 +33,11 @@ services:
       context: ./agent-chat-ui
       dockerfile: Dockerfile
       args:
-        NEXT_PUBLIC_API_URL: ${WEBUI_PUBLIC_API_URL}
         NEXT_PUBLIC_ASSISTANT_ID: ${WEBUI_ASSISTANT_ID:-agent}
     environment:
-      NEXT_PUBLIC_API_URL: ${WEBUI_PUBLIC_API_URL}
       NEXT_PUBLIC_ASSISTANT_ID: ${WEBUI_ASSISTANT_ID:-agent}
       LANGGRAPH_API_URL: ${WEBUI_LANGGRAPH_API_URL}
+      WEBUI_APP_URL: ${WEBUI_APP_URL:-}
       GOOGLE_OAUTH_TOKEN_PATH: /data/google-oauth.json
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}

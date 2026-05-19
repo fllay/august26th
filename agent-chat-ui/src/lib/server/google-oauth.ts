@@ -51,6 +51,11 @@ function requiredEnv(name: string): string {
   return value;
 }
 
+function optionalEnv(name: string): string | null {
+  const value = process.env[name]?.trim();
+  return value ? value : null;
+}
+
 function normalizePublicHostname(hostname: string): string {
   if (hostname === "0.0.0.0" || hostname === "::" || hostname === "[::]") {
     return "localhost";
@@ -59,6 +64,11 @@ function normalizePublicHostname(hostname: string): string {
 }
 
 function getRequestOrigin(request: Request): string {
+  const configuredAppUrl = optionalEnv("WEBUI_APP_URL");
+  if (configuredAppUrl) {
+    return configuredAppUrl.replace(/\/+$/, "");
+  }
+
   const url = new URL(request.url);
   const forwardedProto = request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
   const forwardedHost = request.headers.get("x-forwarded-host")?.split(",")[0]?.trim();

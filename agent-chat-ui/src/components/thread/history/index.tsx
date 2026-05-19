@@ -111,8 +111,7 @@ export default function ThreadHistory() {
     "chatHistoryOpen",
     parseAsBoolean.withDefault(false),
   );
-  const envApiUrl: string | undefined = process.env.NEXT_PUBLIC_API_URL;
-  const finalApiUrl = apiUrl || envApiUrl;
+  const finalApiUrl = apiUrl || "/api";
 
   const { getThreads, threads, setThreads, threadsLoading, setThreadsLoading } =
     useThreads();
