@@ -1129,7 +1129,8 @@ def _load_google_credentials(
             )
 
     token_path = Path(
-        os.getenv("TOKEN_PATH") or str(get_google_oauth_token_path())
+        os.getenv("TOKEN_PATH")
+        or str(get_google_oauth_token_path(discover_single_session=True))
     ).expanduser()
     if token_path.exists():
         payload = json.loads(token_path.read_text(encoding="utf-8"))
@@ -1141,7 +1142,7 @@ def _load_google_credentials(
             credentials.refresh(GoogleAuthRequest())
         return credentials
 
-    refresh_token = load_google_refresh_token()
+    refresh_token = load_google_refresh_token(discover_single_session=False)
     if refresh_token:
         credentials = UserCredentials(
             token=None,
@@ -5030,8 +5031,8 @@ def _discover_single_google_oauth_session_token(base_path: Path) -> Path | None:
     return None
 
 
-def get_google_oauth_token_path() -> Path:
-    """Return the shared OAuth token file path used by the web UI and backend."""
+def get_google_oauth_token_path(*, discover_single_session: bool = False) -> Path:
+    """Return the OAuth token file path used by the web UI and backend."""
     session_key = GOOGLE_OAUTH_SESSION_KEY.get()
     token_path = _derive_google_oauth_token_path_for_session(session_key)
     if session_key:
@@ -5039,19 +5040,22 @@ def get_google_oauth_token_path() -> Path:
     if token_path.exists():
         return token_path
 
-    discovered = _discover_single_google_oauth_session_token(token_path)
-    if discovered is not None:
-        return discovered
+    if discover_single_session:
+        discovered = _discover_single_google_oauth_session_token(token_path)
+        if discovered is not None:
+            return discovered
     return token_path
 
 
-def load_google_refresh_token() -> str | None:
+def load_google_refresh_token(*, discover_single_session: bool = True) -> str | None:
     """Load the Google refresh token from env first, then shared OAuth storage."""
     env_token = os.getenv("GOOGLE_REFRESH_TOKEN")
     if env_token:
         return env_token
 
-    token_path = get_google_oauth_token_path()
+    token_path = get_google_oauth_token_path(
+        discover_single_session=discover_single_session
+    )
     if not token_path.exists():
         return None
 
@@ -5068,7 +5072,7 @@ def load_google_refresh_token() -> str | None:
 
 def load_shared_google_oauth_scopes() -> set[str]:
     """Load granted scopes from the shared Google OAuth token file when available."""
-    token_path = get_google_oauth_token_path()
+    token_path = get_google_oauth_token_path(discover_single_session=True)
     if not token_path.exists():
         return set()
 
@@ -5086,9 +5090,11 @@ def load_shared_google_oauth_scopes() -> set[str]:
     return set()
 
 
-def has_shared_google_oauth_token() -> bool:
+def has_shared_google_oauth_token(*, discover_single_session: bool = False) -> bool:
     """Return whether the shared Google OAuth token file exists."""
-    return get_google_oauth_token_path().exists()
+    return get_google_oauth_token_path(
+        discover_single_session=discover_single_session
+    ).exists()
 
 
 def has_google_sheets_auth_config() -> bool:
@@ -7170,7 +7176,9 @@ def build_mcp_client() -> MultiServerMCPClient:
             if (value := os.getenv(key))
         }
         if "TOKEN_PATH" not in sheets_server_env and has_shared_google_oauth_token():
-            sheets_server_env["TOKEN_PATH"] = str(get_google_oauth_token_path())
+            sheets_server_env["TOKEN_PATH"] = str(
+                get_google_oauth_token_path(discover_single_session=False)
+            )
         sheets_enabled_tools = os.getenv(
             "GOOGLE_SHEETS_ENABLED_TOOLS",
             "search_spreadsheets,list_spreadsheets,list_sheets,get_sheet_data,"
