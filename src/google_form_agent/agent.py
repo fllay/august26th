@@ -1,4 +1,4 @@
-"""LangChain Deep Agent wired to the Google Forms MCP server."""
+﻿"""LangChain Deep Agent wired to the Google Forms MCP server."""
 
 import asyncio
 import ast
@@ -752,13 +752,13 @@ def prefers_exact_source_following(text: str) -> bool:
         "follow exactly",
         "use the file as source of truth",
         "use the attached file as source of truth",
-        "à¸¢à¸¶à¸”à¸•à¸²à¸¡à¹„à¸Ÿà¸¥à¹Œ",
-        "à¸¢à¸¶à¸”à¸•à¸²à¸¡à¹„à¸Ÿà¸¥à¹Œà¹à¸™à¸š",
-        "à¸•à¸²à¸¡à¹„à¸Ÿà¸¥à¹Œà¹à¸™à¸š",
-        "à¸•à¸²à¸¡à¸•à¹‰à¸™à¸‰à¸šà¸±à¸š",
-        "à¹ƒà¸«à¹‰à¸•à¸£à¸‡à¸•à¸²à¸¡à¹„à¸Ÿà¸¥à¹Œ",
-        "à¹ƒà¸«à¹‰à¸•à¸£à¸‡à¸•à¸²à¸¡à¸•à¹‰à¸™à¸‰à¸šà¸±à¸š",
-        "à¸•à¹‰à¸™à¸‰à¸šà¸±à¸šà¸«à¸¥à¸±à¸",
+        "ยึดตามไฟล์",
+        "ยึดตามไฟล์แนบ",
+        "ตามไฟล์แนบ",
+        "ตามต้นฉบับ",
+        "ให้ตรงตามไฟล์",
+        "ให้ตรงตามต้นฉบับ",
+        "ต้นฉบับหลัก",
     )
     return any(keyword in lowered for keyword in keywords)
 
@@ -899,7 +899,7 @@ def extract_requested_respondent_questions(text: str) -> list[dict[str, Any]]:
             if current_question:
                 questions.append(current_question)
             item_text = item_match.group(1).strip()
-            parts = re.split(r"\s+[—-]\s+", item_text)
+            parts = re.split(r"\s+[â€”-]\s+", item_text)
             title = parts[0].strip()
             question_type = "text"
             required = True
@@ -1243,6 +1243,18 @@ def _get_configured_apps_script_deployment_id() -> str:
     return str(stored).strip() if stored else ""
 
 
+def _get_locally_managed_apps_script_id() -> str:
+    """Return the locally managed Apps Script project id for per-user fallback runtime."""
+    stored = _load_apps_script_config().get("managedScriptId", "")
+    return str(stored).strip() if stored else ""
+
+
+def _get_locally_managed_apps_script_deployment_id() -> str:
+    """Return the locally managed Apps Script deployment id for per-user fallback runtime."""
+    stored = _load_apps_script_config().get("managedDeploymentId", "")
+    return str(stored).strip() if stored else ""
+
+
 def _save_form_sheet_links(links: dict[str, dict[str, Any]]) -> None:
     """Persist the local registry of form-to-sheet links."""
     FORM_SHEET_LINKS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1460,7 +1472,7 @@ function insertFormImages(formId, placements) {
         "timeZone": "Asia/Bangkok",
         "exceptionLogging": "STACKDRIVER",
         "runtimeVersion": "V8",
-        "executionApi": {"access": "MYSELF"},
+        "executionApi": {"access": "ANYONE"},
         "oauthScopes": [
             "https://www.googleapis.com/auth/forms",
             "https://www.googleapis.com/auth/spreadsheets",
@@ -1548,6 +1560,41 @@ def _ensure_native_linker_deployment(script_service: Any) -> dict[str, str]:
     _update_native_linker_project_content(script_service, script_id)
     deployment_id = _create_native_linker_deployment(script_service, script_id)
 
+    return {
+        "scriptId": script_id,
+        "deploymentId": deployment_id,
+        "scriptUrl": _apps_script_project_url(script_id),
+    }
+
+
+def _ensure_locally_managed_native_linker_deployment(script_service: Any) -> dict[str, str]:
+    """Ensure a per-user managed Apps Script project and API deployment exist."""
+    script_id = _get_locally_managed_apps_script_id()
+    if not script_id:
+        response = script_service.projects().create(
+            body={"title": "Google Form Agent Native Linker (Managed Fallback)"}
+        ).execute()
+        script_id = str(response.get("scriptId", "") or "").strip()
+        if not script_id:
+            raise RuntimeError("Apps Script API did not return a managed fallback scriptId.")
+        _upsert_apps_script_config(
+            {
+                "managedScriptId": script_id,
+                "managedScriptUrl": _apps_script_project_url(script_id),
+                "managedCreatedAt": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
+    _update_native_linker_project_content(script_service, script_id)
+    deployment_id = _create_native_linker_deployment(script_service, script_id)
+    _upsert_apps_script_config(
+        {
+            "managedScriptId": script_id,
+            "managedDeploymentId": deployment_id,
+            "managedScriptUrl": _apps_script_project_url(script_id),
+            "managedUpdatedAt": datetime.now(timezone.utc).isoformat(),
+        }
+    )
     return {
         "scriptId": script_id,
         "deploymentId": deployment_id,
@@ -1976,27 +2023,6 @@ def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str,
             webapp_result["mode"] = "web-app"
             return webapp_result
 
-    granted_scopes = load_shared_google_oauth_scopes()
-    required_scopes = {
-        "https://www.googleapis.com/auth/forms",
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/script.projects",
-        "https://www.googleapis.com/auth/script.deployments",
-        "https://www.googleapis.com/auth/script.scriptapp",
-    }
-    if granted_scopes and not required_scopes.issubset(granted_scopes):
-        missing_scopes = sorted(required_scopes - granted_scopes)
-        return {
-            "ok": False,
-            "status": "reauthorize-required",
-            "error": "Shared Google OAuth token is missing Apps Script scopes.",
-            "guidance": (
-                "Disconnect and reconnect Google in the web UI so the backend receives the new "
-                "Apps Script scopes required for native Google Forms response linking."
-            ),
-            "missingScopes": missing_scopes,
-        }
-
     if web_app_config:
         return {
             **webapp_result,
@@ -2008,25 +2034,124 @@ def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str,
         }
 
     runtime = _get_shared_native_linker_runtime()
-    if not runtime:
-        return {
-            "ok": False,
-            "status": "shared-runtime-required",
-            "error": (
-                "Shared Apps Script runtime is not configured for native Google Forms linking."
-            ),
-            "guidance": (
-                "Create one shared Apps Script project, switch it to the same standard Google "
-                "Cloud project as this app's OAuth client, deploy it as an API executable, and "
-                "set GOOGLE_APPS_SCRIPT_PROJECT_ID plus GOOGLE_APPS_SCRIPT_DEPLOYMENT_ID."
-            ),
-        }
-
+    using_shared_runtime = bool(runtime)
     script_service = _build_apps_script_service()
+    if not runtime:
+        try:
+            runtime = _ensure_native_linker_deployment(script_service)
+        except HttpError as exc:  # pragma: no cover - depends on Google API runtime
+            message = _describe_apps_script_http_error(exc)
+            return {
+                "ok": False,
+                "status": "apps-script-setup-failed",
+                "error": message,
+                "guidance": (
+                    "Enable the Apps Script API for the Google Cloud project used by your OAuth "
+                    "client, and ensure the shared Apps Script project is attached to that same "
+                    "standard Google Cloud project before retrying."
+                ),
+            }
+        except Exception as exc:  # pragma: no cover - depends on Google API runtime
+            return {
+                "ok": False,
+                "status": "apps-script-setup-failed",
+                "error": str(exc),
+                "guidance": (
+                    "The backend could not prepare the Apps Script runtime needed for native Google "
+                    "Forms response linking."
+                ),
+            }
+
+    def _should_try_managed_fallback(error_text: str) -> bool:
+        normalized = str(error_text or "").lower()
+        fallback_markers = (
+            "requested entity was not found",
+            "insufficient authentication scopes",
+            "authrequirederror",
+            "you do not have permission to call formapp.openbyid",
+        )
+        return using_shared_runtime and any(marker in normalized for marker in fallback_markers)
+
+    def _try_managed_runtime_fallback(primary_error: str, primary_guidance: str) -> dict[str, Any] | None:
+        try:
+            fallback_runtime = _ensure_locally_managed_native_linker_deployment(script_service)
+            fallback_response = script_service.scripts().run(
+                scriptId=fallback_runtime["scriptId"],
+                body={
+                    "function": "linkFormToSheet",
+                    "parameters": [form_id, spreadsheet_id],
+                },
+            ).execute()
+        except HttpError as fallback_exc:  # pragma: no cover - depends on Google API runtime
+            fallback_message = _describe_apps_script_http_error(fallback_exc)
+            return {
+                "ok": False,
+                "status": "native-link-failed",
+                "error": primary_error,
+                "guidance": primary_guidance,
+                "fallbackError": fallback_message,
+                "scriptId": runtime["scriptId"],
+                "deploymentId": runtime["deploymentId"],
+                "scriptUrl": runtime["scriptUrl"],
+            }
+        except Exception as fallback_exc:  # pragma: no cover - depends on Google API runtime
+            return {
+                "ok": False,
+                "status": "native-link-failed",
+                "error": primary_error,
+                "guidance": primary_guidance,
+                "fallbackError": str(fallback_exc),
+                "scriptId": runtime["scriptId"],
+                "deploymentId": runtime["deploymentId"],
+                "scriptUrl": runtime["scriptUrl"],
+            }
+
+        if isinstance(fallback_response, dict) and fallback_response.get("error"):
+            return {
+                "ok": False,
+                "status": "native-link-failed",
+                "error": primary_error,
+                "guidance": primary_guidance,
+                "fallbackError": json.dumps(fallback_response.get("error"), ensure_ascii=False),
+                "scriptId": runtime["scriptId"],
+                "deploymentId": runtime["deploymentId"],
+                "scriptUrl": runtime["scriptUrl"],
+            }
+
+        fallback_result = (
+            fallback_response.get("response", {}).get("result", {})
+            if isinstance(fallback_response, dict)
+            else {}
+        )
+        destination_id = str(fallback_result.get("destinationId", "") or "").strip()
+        if destination_id != spreadsheet_id:
+            return {
+                "ok": False,
+                "status": "native-link-fallback-mismatch",
+                "error": primary_error,
+                "guidance": primary_guidance,
+                "fallbackError": json.dumps(fallback_result, ensure_ascii=False),
+                "scriptId": runtime["scriptId"],
+                "deploymentId": runtime["deploymentId"],
+                "scriptUrl": runtime["scriptUrl"],
+            }
+
+        return {
+            "ok": True,
+            "status": "linked",
+            "mode": "managed-fallback",
+            "scriptId": fallback_runtime["scriptId"],
+            "deploymentId": fallback_runtime["deploymentId"],
+            "scriptUrl": fallback_runtime["scriptUrl"],
+            "destinationId": destination_id,
+            "destinationType": str(fallback_result.get("destinationType", "") or "").strip(),
+            "editUrl": str(fallback_result.get("editUrl", "") or "").strip(),
+            "raw": fallback_result,
+        }
 
     try:
         response = script_service.scripts().run(
-            scriptId=runtime["deploymentId"],
+            scriptId=runtime["scriptId"],
             body={
                 "function": "linkFormToSheet",
                 "parameters": [form_id, spreadsheet_id],
@@ -2039,6 +2164,12 @@ def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str,
             "the same standard Google Cloud project as this app's OAuth client, with the Apps "
             "Script API enabled. Reconnect Google after adding the new script scopes if needed."
         )
+        if _should_try_managed_fallback(message):
+            fallback_result = _try_managed_runtime_fallback(message, guidance)
+            if fallback_result and fallback_result.get("ok"):
+                return fallback_result
+            if fallback_result:
+                return fallback_result
         return {
             "ok": False,
             "status": "native-link-failed",
@@ -2055,6 +2186,12 @@ def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str,
             "standard Google Cloud project as this app's OAuth client, with the Apps Script "
             "API enabled. Reconnect Google after adding the new script scopes if needed."
         )
+        if _should_try_managed_fallback(message):
+            fallback_result = _try_managed_runtime_fallback(message, guidance)
+            if fallback_result and fallback_result.get("ok"):
+                return fallback_result
+            if fallback_result:
+                return fallback_result
         return {
             "ok": False,
             "status": "native-link-failed",
@@ -2066,14 +2203,22 @@ def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str,
         }
 
     if isinstance(response, dict) and response.get("error"):
+        error_payload = json.dumps(response.get("error"), ensure_ascii=False)
+        guidance = (
+            "The Apps Script runtime executed but did not complete the native link. "
+            "Verify the script project's Cloud project setup and OAuth scopes."
+        )
+        if _should_try_managed_fallback(error_payload):
+            fallback_result = _try_managed_runtime_fallback(error_payload, guidance)
+            if fallback_result and fallback_result.get("ok"):
+                return fallback_result
+            if fallback_result:
+                return fallback_result
         return {
             "ok": False,
             "status": "native-link-failed",
-            "error": json.dumps(response.get("error"), ensure_ascii=False),
-            "guidance": (
-                "The Apps Script runtime executed but did not complete the native link. "
-                "Verify the script project's Cloud project setup and OAuth scopes."
-            ),
+            "error": error_payload,
+            "guidance": guidance,
             "scriptId": runtime["scriptId"],
             "deploymentId": runtime["deploymentId"],
             "scriptUrl": runtime["scriptUrl"],
@@ -2102,48 +2247,105 @@ def _insert_form_images_via_apps_script(
     if not placements:
         return {"ok": True, "createdCount": 0, "created": []}
 
-    granted_scopes = load_shared_google_oauth_scopes()
-    required_scopes = {
-        "https://www.googleapis.com/auth/forms",
-        "https://www.googleapis.com/auth/script.projects",
-        "https://www.googleapis.com/auth/script.deployments",
-        "https://www.googleapis.com/auth/script.scriptapp",
-    }
-    if granted_scopes and not required_scopes.issubset(granted_scopes):
-        missing_scopes = sorted(required_scopes - granted_scopes)
-        return {
-            "ok": False,
-            "status": "reauthorize-required",
-            "error": "Shared Google OAuth token is missing Apps Script scopes.",
-            "guidance": (
-                "Disconnect and reconnect Google in the web UI so the backend receives "
-                "the Apps Script scopes required to insert form images from blobs."
-            ),
-            "missingScopes": missing_scopes,
-        }
+    script_service = _build_apps_script_service()
+    runtime = _get_shared_native_linker_runtime()
+    using_shared_runtime = bool(runtime)
+    if not runtime:
+        try:
+            runtime = _ensure_native_linker_deployment(script_service)
+        except HttpError as exc:  # pragma: no cover - depends on Google API runtime
+            message = _describe_apps_script_http_error(exc)
+            return {
+                "ok": False,
+                "status": "apps-script-setup-failed",
+                "error": message,
+                "guidance": (
+                    "Enable the Apps Script API for the Google Cloud project used by your OAuth "
+                    "client, then reconnect Google so the script scopes are granted."
+                ),
+            }
+        except Exception as exc:  # pragma: no cover - depends on Google API runtime
+            return {
+                "ok": False,
+                "status": "apps-script-setup-failed",
+                "error": str(exc),
+                "guidance": (
+                    "The backend could not prepare the Apps Script runtime needed to insert form images."
+                ),
+            }
 
-    try:
-        script_service = _build_apps_script_service()
-        runtime = _ensure_native_linker_deployment(script_service)
-    except HttpError as exc:  # pragma: no cover - depends on Google API runtime
-        message = _describe_apps_script_http_error(exc)
+    def _should_try_managed_fallback(error_text: str) -> bool:
+        normalized = str(error_text or "").lower()
+        fallback_markers = (
+            "requested entity was not found",
+            "insufficient authentication scopes",
+            "authrequirederror",
+            "you do not have permission to call formapp.openbyid",
+        )
+        return using_shared_runtime and any(marker in normalized for marker in fallback_markers)
+
+    def _try_managed_runtime_fallback(primary_error: str, primary_guidance: str) -> dict[str, Any] | None:
+        try:
+            fallback_runtime = _ensure_locally_managed_native_linker_deployment(script_service)
+            fallback_response = script_service.scripts().run(
+                scriptId=fallback_runtime["scriptId"],
+                body={
+                    "function": "insertFormImages",
+                    "parameters": [form_id, placements],
+                },
+            ).execute()
+        except HttpError as fallback_exc:  # pragma: no cover - depends on Google API runtime
+            fallback_message = _describe_apps_script_http_error(fallback_exc)
+            return {
+                "ok": False,
+                "status": "apps-script-image-insert-failed",
+                "error": primary_error,
+                "guidance": primary_guidance,
+                "fallbackError": fallback_message,
+                "scriptId": runtime.get("scriptId", ""),
+                "deploymentId": runtime.get("deploymentId", ""),
+                "scriptUrl": runtime.get("scriptUrl", ""),
+            }
+        except Exception as fallback_exc:  # pragma: no cover - depends on Google API runtime
+            return {
+                "ok": False,
+                "status": "apps-script-image-insert-failed",
+                "error": primary_error,
+                "guidance": primary_guidance,
+                "fallbackError": str(fallback_exc),
+                "scriptId": runtime.get("scriptId", ""),
+                "deploymentId": runtime.get("deploymentId", ""),
+                "scriptUrl": runtime.get("scriptUrl", ""),
+            }
+
+        if isinstance(fallback_response, dict) and fallback_response.get("error"):
+            return {
+                "ok": False,
+                "status": "apps-script-image-insert-failed",
+                "error": primary_error,
+                "guidance": primary_guidance,
+                "fallbackError": json.dumps(fallback_response.get("error"), ensure_ascii=False),
+                "scriptId": runtime.get("scriptId", ""),
+                "deploymentId": runtime.get("deploymentId", ""),
+                "scriptUrl": runtime.get("scriptUrl", ""),
+            }
+
+        fallback_result = (
+            fallback_response.get("response", {}).get("result", {})
+            if isinstance(fallback_response, dict)
+            else {}
+        )
+        created_count = int(fallback_result.get("createdCount", 0) or 0)
         return {
-            "ok": False,
-            "status": "apps-script-setup-failed",
-            "error": message,
-            "guidance": (
-                "Enable the Apps Script API for the Google Cloud project used by your OAuth "
-                "client, then reconnect Google so the script scopes are granted."
-            ),
-        }
-    except Exception as exc:  # pragma: no cover - depends on Google API runtime
-        return {
-            "ok": False,
-            "status": "apps-script-setup-failed",
-            "error": str(exc),
-            "guidance": (
-                "The backend could not prepare the Apps Script runtime needed to insert form images."
-            ),
+            "ok": created_count >= len(placements),
+            "status": "images-inserted" if created_count >= len(placements) else "images-partial",
+            "mode": "managed-fallback",
+            "createdCount": created_count,
+            "created": fallback_result.get("created", []),
+            "scriptId": fallback_runtime["scriptId"],
+            "deploymentId": fallback_runtime["deploymentId"],
+            "scriptUrl": fallback_runtime["scriptUrl"],
+            "fallbackError": "" if created_count >= len(placements) else json.dumps(fallback_result, ensure_ascii=False),
         }
 
     response: dict[str, Any] | None = None
@@ -2151,7 +2353,7 @@ def _insert_form_images_via_apps_script(
     for attempt in range(3):
         try:
             response = script_service.scripts().run(
-                scriptId=runtime["deploymentId"],
+                scriptId=runtime["scriptId"],
                 body={
                     "function": "insertFormImages",
                     "parameters": [form_id, placements],
@@ -2160,13 +2362,19 @@ def _insert_form_images_via_apps_script(
             break
         except HttpError as exc:  # pragma: no cover - depends on Google API runtime
             message = _describe_apps_script_http_error(exc)
+            guidance = "The Apps Script runtime could not insert images into the Google Form."
+            if _should_try_managed_fallback(message):
+                fallback_result = _try_managed_runtime_fallback(message, guidance)
+                if fallback_result and fallback_result.get("ok"):
+                    return fallback_result
+                if fallback_result:
+                    last_error_result = fallback_result
+                    break
             last_error_result = {
                 "ok": False,
                 "status": "apps-script-image-insert-failed",
                 "error": message,
-                "guidance": (
-                    "The Apps Script runtime could not insert images into the Google Form."
-                ),
+                "guidance": guidance,
                 "scriptId": runtime.get("scriptId", ""),
                 "deploymentId": runtime.get("deploymentId", ""),
             }
@@ -2174,17 +2382,24 @@ def _insert_form_images_via_apps_script(
                 return last_error_result
             time.sleep(2)
         except Exception as exc:  # pragma: no cover - depends on Google API runtime
+            message = str(exc)
+            guidance = "The Apps Script runtime could not insert images into the Google Form."
+            if _should_try_managed_fallback(message):
+                fallback_result = _try_managed_runtime_fallback(message, guidance)
+                if fallback_result and fallback_result.get("ok"):
+                    return fallback_result
+                if fallback_result:
+                    last_error_result = fallback_result
+                    break
             last_error_result = {
                 "ok": False,
                 "status": "apps-script-image-insert-failed",
-                "error": str(exc),
-                "guidance": (
-                    "The Apps Script runtime could not insert images into the Google Form."
-                ),
+                "error": message,
+                "guidance": guidance,
                 "scriptId": runtime.get("scriptId", ""),
                 "deploymentId": runtime.get("deploymentId", ""),
             }
-            if "Requested entity was not found" not in str(exc) or attempt == 2:
+            if "Requested entity was not found" not in message or attempt == 2:
                 return last_error_result
             time.sleep(2)
 
@@ -2199,13 +2414,19 @@ def _insert_form_images_via_apps_script(
         }
 
     if isinstance(response, dict) and response.get("error"):
+        error_payload = json.dumps(response.get("error"), ensure_ascii=False)
+        guidance = "The Apps Script runtime ran but did not complete image insertion."
+        if _should_try_managed_fallback(error_payload):
+            fallback_result = _try_managed_runtime_fallback(error_payload, guidance)
+            if fallback_result and fallback_result.get("ok"):
+                return fallback_result
+            if fallback_result:
+                return fallback_result
         return {
             "ok": False,
             "status": "apps-script-image-insert-failed",
-            "error": json.dumps(response.get("error"), ensure_ascii=False),
-            "guidance": (
-                "The Apps Script runtime ran but did not complete image insertion."
-            ),
+            "error": error_payload,
+            "guidance": guidance,
             "scriptId": runtime.get("scriptId", ""),
             "deploymentId": runtime.get("deploymentId", ""),
         }
@@ -2698,7 +2919,7 @@ def extract_questions_from_reference_text(reference_text: str) -> list[dict[str,
         question_start_re = re.compile(r"^\s*(\d+)[.)]\s+(.+)$")
         option_start_re = re.compile(r"^\s*([A-Da-d]|[\u0E01-\u0E2E])[.)]\s*(.*)$")
         answer_blank_re = re.compile(
-            r"^\s*(?:[._\-]{5,}|[.…·•\s]{8,})\s*$"
+            r"^\s*(?:[._\-]{5,}|[.â€¦Â·â€¢\s]{8,})\s*$"
         )
 
         def is_skippable_line(text: str) -> bool:
@@ -4059,6 +4280,21 @@ def _describe_apps_script_http_error(exc: HttpError) -> str:
             guidance += f" Open this URL: {activation_url}"
         return f"{message} {guidance}"
 
+    if "Requested entity was not found" in message:
+        return (
+            "Requested entity was not found. This usually means the configured shared Apps "
+            "Script API executable deployment is not accessible to the current user. Recreate "
+            "the deployment as an API executable with Execution API access set to ANYONE, and "
+            "attach the script project to the same standard Google Cloud project as the OAuth client."
+        )
+
+    if "insufficient authentication scopes" in message.lower():
+        return (
+            "Request had insufficient authentication scopes. Confirm the connected Google user "
+            "granted the Apps Script scopes, enable the Apps Script API in the shared standard "
+            "Google Cloud project, and recreate the shared API executable deployment if needed."
+        )
+
     return message
 
 
@@ -4182,39 +4418,47 @@ def create_form_with_response_sheet(
                 form_id=form_id,
                 placements=image_placements,
             )
-            if not image_insert_result.get("ok"):
-                guidance = str(image_insert_result.get("guidance", "") or "").strip()
-                error = str(image_insert_result.get("error", "") or "Unknown image insertion failure").strip()
-                raise RuntimeError(
-                    f"Form questions were created, but image insertion failed. {error}"
-                    + (f" {guidance}" if guidance else "")
-                )
             inserted_count = int(image_insert_result.get("createdCount", 0) or 0)
-            if inserted_count < len(image_placements):
-                raise RuntimeError(
-                    "Form questions were created, but not all images were inserted. "
-                    f"Expected {len(image_placements)} image placements but Apps Script reported {inserted_count} inserted."
-                )
+            image_insert_ok = bool(image_insert_result.get("ok"))
+            if image_insert_ok and inserted_count < len(image_placements):
+                image_insert_ok = False
+                image_insert_result = {
+                    **image_insert_result,
+                    "ok": False,
+                    "status": "images-partial",
+                    "error": (
+                        "Not all images were inserted. "
+                        f"Expected {len(image_placements)} image placements but Apps Script reported {inserted_count} inserted."
+                    ),
+                    "guidance": "The form was created, but some inline images were skipped.",
+                }
+        image_insert_status = str(
+            image_insert_result.get("status", "") or ("images-inserted" if not image_placements else "images-skipped")
+        )
+        image_insert_error = str(image_insert_result.get("error", "") or "").strip()
+        image_insert_guidance = str(image_insert_result.get("guidance", "") or "").strip()
 
         spreadsheet_details = _create_response_spreadsheet(title.strip())
         spreadsheet_id = spreadsheet_details["spreadsheetId"]
         link_result = _link_form_to_sheet_natively(form_id=form_id, spreadsheet_id=spreadsheet_id)
-        if not link_result.get("ok"):
-            guidance = str(link_result.get("guidance", "") or "").strip()
-            error = str(link_result.get("error", "") or "Unknown native linking failure").strip()
-            raise RuntimeError(
-                f"Form questions were created, but response-sheet linking failed. {error}"
-                + (f" {guidance}" if guidance else "")
-            )
-
+        link_ok = bool(link_result.get("ok"))
+        link_status = str(link_result.get("status", "") or ("linked" if link_ok else "link-failed"))
+        link_error = str(link_result.get("error", "") or "").strip()
+        link_guidance = str(link_result.get("guidance", "") or "").strip()
         destination_id = str(link_result.get("destinationId", "") or "").strip()
-        if destination_id and destination_id != spreadsheet_id:
-            raise RuntimeError(
-                "Form questions were created, but the linked response sheet did not match the created spreadsheet. "
+        linked_at = datetime.now(timezone.utc).isoformat() if link_ok else ""
+        if link_ok and destination_id and destination_id != spreadsheet_id:
+            link_ok = False
+            link_status = "mismatch"
+            link_error = (
+                "The linked response sheet did not match the created spreadsheet. "
                 f"Expected {spreadsheet_id} but Google reported {destination_id}."
             )
+            link_guidance = (
+                "Use the spreadsheet link below as the response destination reference, or "
+                "configure the shared Apps Script linker runtime correctly and retry linking."
+            )
 
-        linked_at = datetime.now(timezone.utc).isoformat()
         _upsert_form_sheet_link(
             form_id,
             {
@@ -4222,32 +4466,48 @@ def create_form_with_response_sheet(
                 "spreadsheetTitle": spreadsheet_details["spreadsheetTitle"],
                 "spreadsheetUrl": spreadsheet_details["spreadsheetUrl"],
                 "formUrl": f"https://docs.google.com/forms/d/{form_id}/edit",
-                "linkStatus": str(link_result.get("status", "") or "linked"),
+                "linkStatus": link_status,
                 "linkMode": str(link_result.get("mode", "") or "api-executable"),
                 "linkedAt": linked_at,
+                "linkError": link_error,
+                "linkGuidance": link_guidance,
                 "scriptId": str(link_result.get("scriptId", "") or ""),
                 "deploymentId": str(link_result.get("deploymentId", "") or ""),
                 "scriptUrl": str(link_result.get("scriptUrl", "") or ""),
             },
         )
 
-        postprocess_result = _postprocess_newly_linked_response_sheet(spreadsheet_id)
-        if postprocess_result.get("ok"):
-            _upsert_form_sheet_link(
-                form_id,
-                {
-                    "postprocessStatus": "formatted",
-                    "processedSheetName": str(postprocess_result.get("processedSheetName", "") or ""),
-                    "analysisSheetName": str(postprocess_result.get("analysisSheetName", "") or ""),
-                    "summarySheetName": str(postprocess_result.get("summarySheetName", "") or ""),
-                    "postprocessedAt": datetime.now(timezone.utc).isoformat(),
-                },
-            )
+        if link_ok:
+            postprocess_result = _postprocess_newly_linked_response_sheet(spreadsheet_id)
+            if postprocess_result.get("ok"):
+                _upsert_form_sheet_link(
+                    form_id,
+                    {
+                        "postprocessStatus": "formatted",
+                        "processedSheetName": str(postprocess_result.get("processedSheetName", "") or ""),
+                        "analysisSheetName": str(postprocess_result.get("analysisSheetName", "") or ""),
+                        "summarySheetName": str(postprocess_result.get("summarySheetName", "") or ""),
+                        "postprocessedAt": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+            else:
+                _upsert_form_sheet_link(
+                    form_id,
+                    {
+                        "postprocessStatus": str(postprocess_result.get("status", "") or "format-failed"),
+                        "postprocessError": str(postprocess_result.get("error", "") or ""),
+                    },
+                )
         else:
+            postprocess_result = {
+                "ok": False,
+                "status": "skipped-link-failed",
+                "error": "Skipped because the response sheet could not be linked automatically.",
+            }
             _upsert_form_sheet_link(
                 form_id,
                 {
-                    "postprocessStatus": str(postprocess_result.get("status", "") or "format-failed"),
+                    "postprocessStatus": "skipped-link-failed",
                     "postprocessError": str(postprocess_result.get("error", "") or ""),
                 },
             )
@@ -4266,11 +4526,16 @@ def create_form_with_response_sheet(
                 "responseUrl": responder_uri,
                 "questionCount": len(questions),
                 "insertedImageCount": int(image_insert_result.get("createdCount", 0) or 0),
+                "imageInsertStatus": image_insert_status,
+                "imageInsertError": image_insert_error,
+                "imageInsertGuidance": image_insert_guidance,
                 "isQuiz": bool(is_quiz),
                 "spreadsheetId": spreadsheet_id,
                 "spreadsheetTitle": spreadsheet_details["spreadsheetTitle"],
                 "spreadsheetUrl": spreadsheet_details["spreadsheetUrl"],
-                "linkStatus": str(link_result.get("status", "") or "linked"),
+                "linkStatus": link_status,
+                "linkError": link_error,
+                "linkGuidance": link_guidance,
                 "linkedAt": linked_at,
                 "postprocessStatus": str(postprocess_result.get("status", "") or ""),
                 "processedSheetName": str(postprocess_result.get("processedSheetName", "") or ""),
@@ -4281,6 +4546,9 @@ def create_form_with_response_sheet(
                     "The form is already linked to a Google Spreadsheet. "
                     "If responses already exist, the analysis sheets were created automatically. "
                     "Send that spreadsheet link back any time you want the agent to inspect or reformat the data."
+                    if link_ok
+                    else "The Google Form and a response spreadsheet were created, but automatic native linking did not complete. "
+                    "Use the returned links, then finish linking manually or reconfigure the shared Apps Script runtime before retrying automatic linking."
                 ),
             },
             ensure_ascii=False,
@@ -5405,8 +5673,8 @@ def _normalize_match_text(text: str) -> str:
     """Normalize text for loose matching between extracted source and parsed questions."""
     lowered = str(text or "").casefold()
     lowered = re.sub(r"\s+", " ", lowered)
-    lowered = lowered.replace("“", '"').replace("”", '"')
-    lowered = lowered.replace("‘", "'").replace("’", "'")
+    lowered = lowered.replace("â€œ", '"').replace("â€", '"')
+    lowered = lowered.replace("â€˜", "'").replace("â€™", "'")
     lowered = lowered.replace("\u00a0", " ")
     return lowered.strip(" .:-")
 
@@ -6431,7 +6699,7 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
     if not looks_like_form_creation_request(latest_user_instruction or latest_human_content):
         return None
 
-    parsing_source = effective_creation_brief or latest_human_content
+    parsing_source = latest_user_instruction or latest_human_content
     file_questions: list[dict[str, Any]] = []
     if latest_docx_bytes:
         file_questions = extract_docx_questions_with_images(latest_docx_bytes)
@@ -6585,6 +6853,20 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
         if spreadsheet_title:
             response_lines.append(
                 f"- {'\u0e0a\u0e37\u0e48\u0e2d\u0e2a\u0e40\u0e1b\u0e23\u0e14\u0e0a\u0e35\u0e15' if user_language == 'th' else 'Spreadsheet title'}: {spreadsheet_title}"
+            )
+        link_status = str(payload.get("linkStatus", "") or "").strip()
+        if link_status and link_status != "linked":
+            response_lines.append(
+                "- การเชื่อมสเปรดชีตอัตโนมัติยังไม่สำเร็จ"
+                if user_language == "th"
+                else "- Automatic spreadsheet linking did not complete"
+            )
+        image_insert_status = str(payload.get("imageInsertStatus", "") or "").strip()
+        if image_insert_status and image_insert_status != "images-inserted":
+            response_lines.append(
+                "- การแทรกรูปภาพบางส่วนยังไม่สำเร็จ"
+                if user_language == "th"
+                else "- Some form images were not inserted automatically"
             )
         link_lines: list[str] = []
         if form_url:
@@ -6884,3 +7166,4 @@ async def build_agent() -> Any:
         skills=[SKILLS_DIR.as_posix()],
         system_prompt=SYSTEM_PROMPT,
     )
+
