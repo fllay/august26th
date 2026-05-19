@@ -2033,9 +2033,39 @@ def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str,
                 ),
             }
 
-    runtime = _get_shared_native_linker_runtime()
-    using_shared_runtime = bool(runtime)
     script_service = _build_apps_script_service()
+    prefer_managed_runtime = bool(GOOGLE_OAUTH_SESSION_KEY.get()) and not web_app_config
+    runtime: dict[str, str] = {}
+    using_shared_runtime = False
+
+    if prefer_managed_runtime:
+        try:
+            runtime = _ensure_locally_managed_native_linker_deployment(script_service)
+        except HttpError as exc:  # pragma: no cover - depends on Google API runtime
+            message = _describe_apps_script_http_error(exc)
+            return {
+                "ok": False,
+                "status": "apps-script-setup-failed",
+                "error": message,
+                "guidance": (
+                    "The backend could not prepare the per-user Apps Script runtime needed for "
+                    "native Google Forms response linking."
+                ),
+            }
+        except Exception as exc:  # pragma: no cover - depends on Google API runtime
+            return {
+                "ok": False,
+                "status": "apps-script-setup-failed",
+                "error": str(exc),
+                "guidance": (
+                    "The backend could not prepare the per-user Apps Script runtime needed for "
+                    "native Google Forms response linking."
+                ),
+            }
+    else:
+        runtime = _get_shared_native_linker_runtime()
+        using_shared_runtime = bool(runtime)
+
     if not runtime:
         try:
             runtime = _ensure_native_linker_deployment(script_service)
@@ -6499,6 +6529,11 @@ def get_google_oauth_session_key_from_request(request: ModelRequest) -> str | No
                     return direct
             except Exception:
                 pass
+        object_dict = getattr(value, "__dict__", None)
+        if isinstance(object_dict, dict):
+            found = _find_session_key(object_dict, depth + 1)
+            if found:
+                return found
         return None
 
     runtime = getattr(request, "runtime", None)
@@ -6508,6 +6543,18 @@ def get_google_oauth_session_key_from_request(request: ModelRequest) -> str | No
         return found
 
     found = _find_session_key(getattr(request, "state", None))
+    if found:
+        return found
+
+    found = _find_session_key(getattr(request, "config", None))
+    if found:
+        return found
+
+    found = _find_session_key(getattr(runtime, "config", None))
+    if found:
+        return found
+
+    found = _find_session_key(getattr(request, "configurable", None))
     if found:
         return found
 

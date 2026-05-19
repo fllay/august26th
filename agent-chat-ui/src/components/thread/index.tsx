@@ -508,6 +508,9 @@ export function Thread() {
       };
     });
 
+    const googleOauthSessionKey =
+      getCookieValue(GOOGLE_OAUTH_SESSION_COOKIE_NAME) ?? undefined;
+
     const context = {
       ...(Object.keys(artifactContext).length > 0 ? artifactContext : {}),
       ...(attachedFiles.length > 0
@@ -524,8 +527,7 @@ export function Thread() {
           }
         : {}),
       web_search_enabled: false,
-      google_oauth_session_key:
-        getCookieValue(GOOGLE_OAUTH_SESSION_COOKIE_NAME) ?? undefined,
+      google_oauth_session_key: googleOauthSessionKey,
     };
 
     const guestId = ensureGuestId();
@@ -540,6 +542,7 @@ export function Thread() {
       ...threadMetadata,
       web_search_enabled: false,
       user_id: resolvedUserId,
+      google_oauth_session_key: googleOauthSessionKey,
     };
 
     if (needsThreadId && newThreadId) {
@@ -567,7 +570,10 @@ export function Thread() {
         streamSubgraphs: false,
         streamResumable: false,
         config: {
-          configurable: { web_search_enabled: false },
+          configurable: {
+            web_search_enabled: false,
+            google_oauth_session_key: googleOauthSessionKey,
+          },
         },
         metadata: submitMetadata,
         threadId: newThreadId,
@@ -591,18 +597,24 @@ export function Thread() {
     parentCheckpoint: Checkpoint | null | undefined,
   ) => {
     const resolvedUserId = userIdRef.current || userId || "unknown";
+    const googleOauthSessionKey =
+      getCookieValue(GOOGLE_OAUTH_SESSION_COOKIE_NAME) ?? undefined;
     stream.submit(undefined, {
       checkpoint: parentCheckpoint,
       streamMode: ["values"],
       streamSubgraphs: false,
       streamResumable: false,
       config: {
-        configurable: { web_search_enabled: false },
+        configurable: {
+          web_search_enabled: false,
+          google_oauth_session_key: googleOauthSessionKey,
+        },
       },
       metadata: {
         guest_id: ensureGuestId(),
         web_search_enabled: false,
         user_id: resolvedUserId,
+        google_oauth_session_key: googleOauthSessionKey,
       },
     });
   };
