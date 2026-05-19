@@ -28,6 +28,7 @@ import {
   setGuestThreadId,
 } from "@/lib/guest-session";
 import { useThreads } from "./Thread";
+import { resolveApiUrl } from "./client";
 import { toast } from "sonner";
 
 export type StateType = { messages: Message[]; ui?: UIMessage[] };
@@ -97,7 +98,7 @@ const StreamSession = ({
   }, [threadId]);
 
   const streamValue = useTypedStream({
-    apiUrl,
+    apiUrl: resolveApiUrl(apiUrl),
     apiKey: apiKey ?? undefined,
     assistantId,
     threadId: threadId ?? null,
