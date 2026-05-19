@@ -5014,10 +5014,35 @@ def _derive_google_oauth_token_path_for_session(session_key: str | None) -> Path
     return base_path.parent / "google-oauth-sessions" / f"{session_key}.json"
 
 
+def _discover_single_google_oauth_session_token(base_path: Path) -> Path | None:
+    """Return the lone session-scoped OAuth token file when exactly one exists."""
+    sessions_dir = base_path.parent / "google-oauth-sessions"
+    if not sessions_dir.exists() or not sessions_dir.is_dir():
+        return None
+
+    candidates = sorted(
+        candidate
+        for candidate in sessions_dir.glob("*.json")
+        if candidate.is_file()
+    )
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
 def get_google_oauth_token_path() -> Path:
     """Return the shared OAuth token file path used by the web UI and backend."""
     session_key = GOOGLE_OAUTH_SESSION_KEY.get()
-    return _derive_google_oauth_token_path_for_session(session_key)
+    token_path = _derive_google_oauth_token_path_for_session(session_key)
+    if session_key:
+        return token_path
+    if token_path.exists():
+        return token_path
+
+    discovered = _discover_single_google_oauth_session_token(token_path)
+    if discovered is not None:
+        return discovered
+    return token_path
 
 
 def load_google_refresh_token() -> str | None:
