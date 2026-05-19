@@ -6402,25 +6402,51 @@ def get_attached_file_context(request: ModelRequest) -> str:
 
 def get_google_oauth_session_key_from_request(request: ModelRequest) -> str | None:
     """Read the user-scoped Google OAuth session key from runtime or state context."""
+    def _find_session_key(value: Any, depth: int = 0) -> str | None:
+        if depth > 6:
+            return None
+        if isinstance(value, dict):
+            direct = _sanitize_google_oauth_session_key(
+                value.get("google_oauth_session_key")
+            )
+            if direct:
+                return direct
+            for nested in value.values():
+                found = _find_session_key(nested, depth + 1)
+                if found:
+                    return found
+            return None
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                found = _find_session_key(item, depth + 1)
+                if found:
+                    return found
+            return None
+        if hasattr(value, "get"):
+            try:
+                direct = _sanitize_google_oauth_session_key(
+                    value.get("google_oauth_session_key")
+                )
+                if direct:
+                    return direct
+            except Exception:
+                pass
+        return None
+
     runtime = getattr(request, "runtime", None)
     runtime_context = getattr(runtime, "context", None)
-    if isinstance(runtime_context, dict):
-        return _sanitize_google_oauth_session_key(
-            runtime_context.get("google_oauth_session_key")
-        )
-    if hasattr(runtime_context, "get"):
-        try:
-            return _sanitize_google_oauth_session_key(
-                runtime_context.get("google_oauth_session_key")
-            )
-        except Exception:
-            pass
+    found = _find_session_key(runtime_context)
+    if found:
+        return found
 
-    state_context = request.state.get("context") if isinstance(request.state, dict) else None
-    if isinstance(state_context, dict):
-        return _sanitize_google_oauth_session_key(
-            state_context.get("google_oauth_session_key")
-        )
+    found = _find_session_key(getattr(request, "state", None))
+    if found:
+        return found
+
+    found = _find_session_key(getattr(request, "metadata", None))
+    if found:
+        return found
+
     return None
 
 
