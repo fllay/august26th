@@ -648,25 +648,6 @@ def extract_form_description(text: str) -> str:
     description = "\n".join(collected).strip()
     if description:
         return description
-
-    topic = extract_form_topic(text)
-    lowered = text.casefold()
-    is_thai = "thai" in lowered or "ภาษาไทย" in lowered or bool(re.search(r"[\u0E00-\u0E7F]", text))
-    question_count = infer_default_question_count(text)
-    if any(keyword in lowered for keyword in ("pre-test", "pretest", "post-test", "posttest", "quiz", "test", "แบบทดสอบ")):
-        if is_thai:
-            count_text = f" จำนวน {question_count} ข้อ" if question_count else ""
-            return f"แบบฟอร์มนี้ใช้สำหรับแบบทดสอบเกี่ยวกับ {topic}{count_text}".strip()
-        count_text = f" with {question_count} questions" if question_count else ""
-        return f"This form is for a test about {topic}{count_text}.".strip()
-    if any(keyword in lowered for keyword in ("feedback", "survey", "satisfaction", "แบบประเมิน", "ความพึงพอใจ")):
-        if is_thai:
-            return f"แบบฟอร์มนี้ใช้สำหรับรวบรวมความคิดเห็นและข้อเสนอแนะเกี่ยวกับ {topic}".strip()
-        return f"This form collects feedback about {topic}.".strip()
-    if topic:
-        if is_thai:
-            return f"แบบฟอร์มนี้เกี่ยวกับ {topic}".strip()
-        return f"This form is about {topic}.".strip()
     return ""
 
 
@@ -1227,7 +1208,7 @@ def _upsert_apps_script_config(details: dict[str, Any]) -> None:
 
 
 def _get_configured_apps_script_id() -> str:
-    """Return the configured Apps Script project id from env or local config."""
+    """Return the configured shared Apps Script project id from env or shared config."""
     configured = os.getenv("GOOGLE_APPS_SCRIPT_PROJECT_ID", "").strip()
     if configured:
         return configured
@@ -1236,7 +1217,7 @@ def _get_configured_apps_script_id() -> str:
 
 
 def _get_configured_apps_script_deployment_id() -> str:
-    """Return the configured Apps Script deployment id from env or local config."""
+    """Return the configured shared Apps Script deployment id from env or shared config."""
     configured = os.getenv("GOOGLE_APPS_SCRIPT_DEPLOYMENT_ID", "").strip()
     if configured:
         return configured
@@ -1246,13 +1227,33 @@ def _get_configured_apps_script_deployment_id() -> str:
 
 def _get_locally_managed_apps_script_id() -> str:
     """Return the locally managed Apps Script project id for per-user fallback runtime."""
-    stored = _load_apps_script_config().get("managedScriptId", "")
+    config = _load_apps_script_config()
+    session_key = GOOGLE_OAUTH_SESSION_KEY.get()
+    if session_key:
+        managed_sessions = config.get("managedSessions", {})
+        if isinstance(managed_sessions, dict):
+            session_entry = managed_sessions.get(session_key, {})
+            if isinstance(session_entry, dict):
+                stored = session_entry.get("scriptId", "")
+                if stored:
+                    return str(stored).strip()
+    stored = config.get("managedScriptId", "")
     return str(stored).strip() if stored else ""
 
 
 def _get_locally_managed_apps_script_deployment_id() -> str:
     """Return the locally managed Apps Script deployment id for per-user fallback runtime."""
-    stored = _load_apps_script_config().get("managedDeploymentId", "")
+    config = _load_apps_script_config()
+    session_key = GOOGLE_OAUTH_SESSION_KEY.get()
+    if session_key:
+        managed_sessions = config.get("managedSessions", {})
+        if isinstance(managed_sessions, dict):
+            session_entry = managed_sessions.get(session_key, {})
+            if isinstance(session_entry, dict):
+                stored = session_entry.get("deploymentId", "")
+                if stored:
+                    return str(stored).strip()
+    stored = config.get("managedDeploymentId", "")
     return str(stored).strip() if stored else ""
 
 
@@ -1385,19 +1386,70 @@ def _create_response_spreadsheet(form_title: str) -> dict[str, str]:
 def _build_native_linker_script_files() -> list[dict[str, Any]]:
     """Return Apps Script files that can set a form's native Sheets destination."""
     code_source = """
+function openFormWithRetry_(formId) {
+  let form = null;
+  let lastError = null;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      form = FormApp.openById(formId);
+      return form;
+    } catch (err) {
+      lastError = err;
+      Utilities.sleep(1500);
+    }
+  }
+  throw lastError || new Error('Unable to open form by id.');
+}
+
 function linkFormToSheet(formId, spreadsheetId) {
   if (!formId || !spreadsheetId) {
     throw new Error('formId and spreadsheetId are required.');
   }
 
-  const form = FormApp.openById(formId);
-  form.setDestination(FormApp.DestinationType.SPREADSHEET, spreadsheetId);
+  const form = openFormWithRetry_(formId);
+  let lastError = null;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      form.setDestination(FormApp.DestinationType.SPREADSHEET, spreadsheetId);
+      if (String(form.getDestinationId() || '') === String(spreadsheetId)) {
+        break;
+      }
+      throw new Error('Destination did not match requested spreadsheet yet.');
+    } catch (err) {
+      lastError = err;
+      Utilities.sleep(1500);
+    }
+  }
+  if (String(form.getDestinationId() || '') !== String(spreadsheetId)) {
+    throw lastError || new Error('Unable to link form to the requested spreadsheet.');
+  }
 
   return {
     formId: form.getId(),
     destinationId: form.getDestinationId(),
     destinationType: String(form.getDestinationType()),
     editUrl: form.getEditUrl(),
+  };
+}
+
+function inspectFormDestination(formId) {
+  if (!formId) {
+    throw new Error('formId is required.');
+  }
+
+  const form = openFormWithRetry_(formId);
+  return {
+    formId: form.getId(),
+    destinationId: String(form.getDestinationId() || ''),
+    destinationType: String(form.getDestinationType() || ''),
+    editUrl: form.getEditUrl(),
+  };
+}
+
+function ping() {
+  return {
+    ok: true,
+    timestamp: new Date().toISOString(),
   };
 }
 
@@ -1409,20 +1461,7 @@ function insertFormImages(formId, placements) {
     throw new Error('placements must be an array.');
   }
 
-  let form = null;
-  let lastError = null;
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    try {
-      form = FormApp.openById(formId);
-      break;
-    } catch (err) {
-      lastError = err;
-      Utilities.sleep(1500);
-    }
-  }
-  if (!form) {
-    throw lastError || new Error('Unable to open form by id.');
-  }
+  const form = openFormWithRetry_(formId);
   const orderedPlacements = placements
     .filter(p => p && p.base64 && p.mimeType)
     .sort((a, b) => (Number(a.index || 0) - Number(b.index || 0)));
@@ -1521,7 +1560,12 @@ def _update_native_linker_project_content(script_service: Any, script_id: str) -
     ).execute()
 
 
-def _create_native_linker_deployment(script_service: Any, script_id: str) -> str:
+def _create_native_linker_deployment(
+    script_service: Any,
+    script_id: str,
+    *,
+    persist_shared_config: bool = True,
+) -> str:
     """Create a fresh API executable deployment for the native-link script."""
     version = script_service.projects().versions().create(
         scriptId=script_id,
@@ -1543,16 +1587,56 @@ def _create_native_linker_deployment(script_service: Any, script_id: str) -> str
     if not deployment_id:
         raise RuntimeError("Apps Script API did not return a deploymentId.")
 
-    _upsert_apps_script_config(
-        {
-            "scriptId": script_id,
-            "scriptUrl": _apps_script_project_url(script_id),
-            "deploymentId": deployment_id,
-            "versionNumber": version_number,
-            "updatedAt": datetime.now(timezone.utc).isoformat(),
-        }
-    )
+    if persist_shared_config:
+        _upsert_apps_script_config(
+            {
+                "scriptId": script_id,
+                "scriptUrl": _apps_script_project_url(script_id),
+                "deploymentId": deployment_id,
+                "versionNumber": version_number,
+                "updatedAt": datetime.now(timezone.utc).isoformat(),
+            }
+        )
     return deployment_id
+
+
+def _wait_for_native_linker_runtime_ready(
+    script_service: Any,
+    deployment_id: str,
+    *,
+    attempts: int = 20,
+    delay_seconds: float = 2.0,
+) -> None:
+    """Wait until a freshly deployed Apps Script runtime can answer Execution API calls."""
+    last_error: str = ""
+    for attempt in range(attempts):
+        try:
+            response = script_service.scripts().run(
+                scriptId=deployment_id,
+                body={"function": "ping", "parameters": []},
+            ).execute()
+            if not (isinstance(response, dict) and response.get("error")):
+                return
+            last_error = json.dumps(response.get("error"), ensure_ascii=False)
+        except Exception as exc:  # pragma: no cover - depends on Google API runtime
+            last_error = str(exc)
+        if attempt < attempts - 1:
+            time.sleep(delay_seconds)
+    raise RuntimeError(
+        "Apps Script runtime was deployed but did not become ready for execution. "
+        f"Last error: {last_error}"
+    )
+
+
+def _build_apps_script_run_body(
+    function_name: str,
+    parameters: list[Any],
+) -> dict[str, Any]:
+    """Build an Execution API payload."""
+    return {
+        "function": function_name,
+        "parameters": parameters,
+    }
 
 
 def _ensure_native_linker_deployment(script_service: Any) -> dict[str, str]:
@@ -1560,6 +1644,7 @@ def _ensure_native_linker_deployment(script_service: Any) -> dict[str, str]:
     script_id, created = _ensure_native_linker_project(script_service)
     _update_native_linker_project_content(script_service, script_id)
     deployment_id = _create_native_linker_deployment(script_service, script_id)
+    _wait_for_native_linker_runtime_ready(script_service, deployment_id)
 
     return {
         "scriptId": script_id,
@@ -1570,6 +1655,7 @@ def _ensure_native_linker_deployment(script_service: Any) -> dict[str, str]:
 
 def _ensure_locally_managed_native_linker_deployment(script_service: Any) -> dict[str, str]:
     """Ensure a per-user managed Apps Script project and API deployment exist."""
+    session_key = GOOGLE_OAUTH_SESSION_KEY.get()
     script_id = _get_locally_managed_apps_script_id()
     if not script_id:
         response = script_service.projects().create(
@@ -1578,24 +1664,70 @@ def _ensure_locally_managed_native_linker_deployment(script_service: Any) -> dic
         script_id = str(response.get("scriptId", "") or "").strip()
         if not script_id:
             raise RuntimeError("Apps Script API did not return a managed fallback scriptId.")
+        created_at = datetime.now(timezone.utc).isoformat()
+        if session_key:
+            config = _load_apps_script_config()
+            managed_sessions = config.get("managedSessions", {})
+            if not isinstance(managed_sessions, dict):
+                managed_sessions = {}
+            session_entry = managed_sessions.get(session_key, {})
+            if not isinstance(session_entry, dict):
+                session_entry = {}
+            session_entry.update(
+                {
+                    "scriptId": script_id,
+                    "scriptUrl": _apps_script_project_url(script_id),
+                    "createdAt": created_at,
+                }
+            )
+            managed_sessions[session_key] = session_entry
+            config["managedSessions"] = managed_sessions
+            _save_apps_script_config(config)
+        else:
+            _upsert_apps_script_config(
+                {
+                    "managedScriptId": script_id,
+                    "managedScriptUrl": _apps_script_project_url(script_id),
+                    "managedCreatedAt": created_at,
+                }
+            )
+
+    _update_native_linker_project_content(script_service, script_id)
+    deployment_id = _create_native_linker_deployment(
+        script_service,
+        script_id,
+        persist_shared_config=False,
+    )
+    _wait_for_native_linker_runtime_ready(script_service, script_id)
+    updated_at = datetime.now(timezone.utc).isoformat()
+    if session_key:
+        config = _load_apps_script_config()
+        managed_sessions = config.get("managedSessions", {})
+        if not isinstance(managed_sessions, dict):
+            managed_sessions = {}
+        session_entry = managed_sessions.get(session_key, {})
+        if not isinstance(session_entry, dict):
+            session_entry = {}
+        session_entry.update(
+            {
+                "scriptId": script_id,
+                "deploymentId": deployment_id,
+                "scriptUrl": _apps_script_project_url(script_id),
+                "updatedAt": updated_at,
+            }
+        )
+        managed_sessions[session_key] = session_entry
+        config["managedSessions"] = managed_sessions
+        _save_apps_script_config(config)
+    else:
         _upsert_apps_script_config(
             {
                 "managedScriptId": script_id,
+                "managedDeploymentId": deployment_id,
                 "managedScriptUrl": _apps_script_project_url(script_id),
-                "managedCreatedAt": datetime.now(timezone.utc).isoformat(),
+                "managedUpdatedAt": updated_at,
             }
         )
-
-    _update_native_linker_project_content(script_service, script_id)
-    deployment_id = _create_native_linker_deployment(script_service, script_id)
-    _upsert_apps_script_config(
-        {
-            "managedScriptId": script_id,
-            "managedDeploymentId": deployment_id,
-            "managedScriptUrl": _apps_script_project_url(script_id),
-            "managedUpdatedAt": datetime.now(timezone.utc).isoformat(),
-        }
-    )
     return {
         "scriptId": script_id,
         "deploymentId": deployment_id,
@@ -1614,6 +1746,17 @@ def _get_shared_native_linker_runtime() -> dict[str, str]:
         "deploymentId": deployment_id,
         "scriptUrl": _apps_script_project_url(script_id),
     }
+
+
+def _get_missing_shared_runtime_guidance() -> str:
+    """Return setup guidance when no shared Apps Script runtime is configured."""
+    return (
+        "Configure a shared Apps Script runtime before using automatic linking or image "
+        "insertion. Set GOOGLE_APPS_SCRIPT_PROJECT_ID and GOOGLE_APPS_SCRIPT_DEPLOYMENT_ID "
+        "for the shared API executable, or configure GOOGLE_APPS_SCRIPT_WEB_APP_URL, "
+        "GOOGLE_APPS_SCRIPT_SHARED_SECRET, and GOOGLE_APPS_SCRIPT_ACTOR_EMAIL for the shared "
+        "web-app path."
+    )
 
 
 def _get_native_link_webapp_config() -> dict[str, str]:
@@ -2034,180 +2177,184 @@ def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str,
             }
 
     script_service = _build_apps_script_service()
-    prefer_managed_runtime = bool(GOOGLE_OAUTH_SESSION_KEY.get()) and not web_app_config
-    runtime: dict[str, str] = {}
-    using_shared_runtime = False
-
-    if prefer_managed_runtime:
-        try:
-            runtime = _ensure_locally_managed_native_linker_deployment(script_service)
-        except HttpError as exc:  # pragma: no cover - depends on Google API runtime
-            message = _describe_apps_script_http_error(exc)
-            return {
-                "ok": False,
-                "status": "apps-script-setup-failed",
-                "error": message,
-                "guidance": (
-                    "The backend could not prepare the per-user Apps Script runtime needed for "
-                    "native Google Forms response linking."
-                ),
-            }
-        except Exception as exc:  # pragma: no cover - depends on Google API runtime
-            return {
-                "ok": False,
-                "status": "apps-script-setup-failed",
-                "error": str(exc),
-                "guidance": (
-                    "The backend could not prepare the per-user Apps Script runtime needed for "
-                    "native Google Forms response linking."
-                ),
-            }
-    else:
-        runtime = _get_shared_native_linker_runtime()
-        using_shared_runtime = bool(runtime)
+    runtime = _get_shared_native_linker_runtime()
 
     if not runtime:
-        try:
-            runtime = _ensure_native_linker_deployment(script_service)
-        except HttpError as exc:  # pragma: no cover - depends on Google API runtime
-            message = _describe_apps_script_http_error(exc)
-            return {
-                "ok": False,
-                "status": "apps-script-setup-failed",
-                "error": message,
-                "guidance": (
-                    "Enable the Apps Script API for the Google Cloud project used by your OAuth "
-                    "client, and ensure the shared Apps Script project is attached to that same "
-                    "standard Google Cloud project before retrying."
-                ),
-            }
-        except Exception as exc:  # pragma: no cover - depends on Google API runtime
-            return {
-                "ok": False,
-                "status": "apps-script-setup-failed",
-                "error": str(exc),
-                "guidance": (
-                    "The backend could not prepare the Apps Script runtime needed for native Google "
-                    "Forms response linking."
-                ),
-            }
+        result = {
+            "ok": False,
+            "status": "shared-runtime-not-configured",
+            "error": "No shared Apps Script runtime is configured.",
+            "guidance": _get_missing_shared_runtime_guidance(),
+        }
+        if webapp_failure:
+            result["webAppFailure"] = webapp_failure
+        return result
 
-    def _should_try_managed_fallback(error_text: str) -> bool:
-        normalized = str(error_text or "").lower()
-        fallback_markers = (
-            "requested entity was not found",
-            "insufficient authentication scopes",
-            "authrequirederror",
-            "you do not have permission to call formapp.openbyid",
-        )
-        return using_shared_runtime and any(marker in normalized for marker in fallback_markers)
-
-    def _try_managed_runtime_fallback(primary_error: str, primary_guidance: str) -> dict[str, Any] | None:
+    def _verify_destination_with_runtime(
+        target_runtime: dict[str, str],
+        *,
+        mode: str,
+    ) -> dict[str, Any] | None:
+        deployment_id = str(target_runtime.get("deploymentId", "") or "").strip()
+        if not deployment_id:
+            return None
         try:
-            fallback_runtime = _ensure_locally_managed_native_linker_deployment(script_service)
-            fallback_response = script_service.scripts().run(
-                scriptId=fallback_runtime["scriptId"],
-                body={
-                    "function": "linkFormToSheet",
-                    "parameters": [form_id, spreadsheet_id],
-                },
+            verification_response = script_service.scripts().run(
+                scriptId=deployment_id,
+                body=_build_apps_script_run_body(
+                    "inspectFormDestination",
+                    [form_id],
+                ),
             ).execute()
-        except HttpError as fallback_exc:  # pragma: no cover - depends on Google API runtime
-            fallback_message = _describe_apps_script_http_error(fallback_exc)
-            return {
-                "ok": False,
-                "status": "native-link-failed",
-                "error": primary_error,
-                "guidance": primary_guidance,
-                "fallbackError": fallback_message,
-                "scriptId": runtime["scriptId"],
-                "deploymentId": runtime["deploymentId"],
-                "scriptUrl": runtime["scriptUrl"],
-            }
-        except Exception as fallback_exc:  # pragma: no cover - depends on Google API runtime
-            return {
-                "ok": False,
-                "status": "native-link-failed",
-                "error": primary_error,
-                "guidance": primary_guidance,
-                "fallbackError": str(fallback_exc),
-                "scriptId": runtime["scriptId"],
-                "deploymentId": runtime["deploymentId"],
-                "scriptUrl": runtime["scriptUrl"],
-            }
+        except Exception:
+            return None
 
-        if isinstance(fallback_response, dict) and fallback_response.get("error"):
-            return {
-                "ok": False,
-                "status": "native-link-failed",
-                "error": primary_error,
-                "guidance": primary_guidance,
-                "fallbackError": json.dumps(fallback_response.get("error"), ensure_ascii=False),
-                "scriptId": runtime["scriptId"],
-                "deploymentId": runtime["deploymentId"],
-                "scriptUrl": runtime["scriptUrl"],
-            }
+        if isinstance(verification_response, dict) and verification_response.get("error"):
+            return None
 
-        fallback_result = (
-            fallback_response.get("response", {}).get("result", {})
-            if isinstance(fallback_response, dict)
+        verification_result = (
+            verification_response.get("response", {}).get("result", {})
+            if isinstance(verification_response, dict)
             else {}
         )
-        destination_id = str(fallback_result.get("destinationId", "") or "").strip()
+        destination_id = str(verification_result.get("destinationId", "") or "").strip()
         if destination_id != spreadsheet_id:
-            return {
-                "ok": False,
-                "status": "native-link-fallback-mismatch",
-                "error": primary_error,
-                "guidance": primary_guidance,
-                "fallbackError": json.dumps(fallback_result, ensure_ascii=False),
-                "scriptId": runtime["scriptId"],
-                "deploymentId": runtime["deploymentId"],
-                "scriptUrl": runtime["scriptUrl"],
-            }
-
+            return None
         return {
             "ok": True,
             "status": "linked",
-            "mode": "managed-fallback",
-            "scriptId": fallback_runtime["scriptId"],
-            "deploymentId": fallback_runtime["deploymentId"],
-            "scriptUrl": fallback_runtime["scriptUrl"],
+            "mode": mode,
+            "scriptId": str(target_runtime.get("scriptId", "") or "").strip(),
+            "deploymentId": str(target_runtime.get("deploymentId", "") or "").strip(),
+            "scriptUrl": str(target_runtime.get("scriptUrl", "") or "").strip(),
             "destinationId": destination_id,
-            "destinationType": str(fallback_result.get("destinationType", "") or "").strip(),
-            "editUrl": str(fallback_result.get("editUrl", "") or "").strip(),
-            "raw": fallback_result,
+            "destinationType": str(
+                verification_result.get("destinationType", "") or ""
+            ).strip(),
+            "editUrl": str(verification_result.get("editUrl", "") or "").strip(),
+            "raw": verification_result,
         }
+
+    def _try_shared_runtime_or_webapp_fallback(
+        primary_error: str,
+        primary_guidance: str,
+    ) -> dict[str, Any] | None:
+        shared_runtime = _get_shared_native_linker_runtime()
+        if shared_runtime and shared_runtime.get("deploymentId") != runtime.get("deploymentId"):
+            try:
+                shared_response = script_service.scripts().run(
+                    scriptId=shared_runtime["deploymentId"],
+                    body=_build_apps_script_run_body(
+                        "linkFormToSheet",
+                        [form_id, spreadsheet_id],
+                    ),
+                ).execute()
+            except HttpError as shared_exc:  # pragma: no cover - depends on Google API runtime
+                shared_message = _describe_apps_script_http_error(shared_exc)
+                verified = _verify_destination_with_runtime(
+                    shared_runtime,
+                    mode="shared-runtime-fallback-verified",
+                )
+                if verified:
+                    return verified
+            except Exception as shared_exc:  # pragma: no cover - depends on Google API runtime
+                shared_message = str(shared_exc)
+                verified = _verify_destination_with_runtime(
+                    shared_runtime,
+                    mode="shared-runtime-fallback-verified",
+                )
+                if verified:
+                    return verified
+            else:
+                if isinstance(shared_response, dict) and shared_response.get("error"):
+                    shared_message = json.dumps(shared_response.get("error"), ensure_ascii=False)
+                    verified = _verify_destination_with_runtime(
+                        shared_runtime,
+                        mode="shared-runtime-fallback-verified",
+                    )
+                    if verified:
+                        return verified
+                else:
+                    shared_result = (
+                        shared_response.get("response", {}).get("result", {})
+                        if isinstance(shared_response, dict)
+                        else {}
+                    )
+                    shared_destination_id = str(
+                        shared_result.get("destinationId", "") or ""
+                    ).strip()
+                    if shared_destination_id == spreadsheet_id:
+                        return {
+                            "ok": True,
+                            "status": "linked",
+                            "mode": "shared-runtime-fallback",
+                            "scriptId": shared_runtime["scriptId"],
+                            "deploymentId": shared_runtime["deploymentId"],
+                            "scriptUrl": shared_runtime["scriptUrl"],
+                            "destinationId": shared_destination_id,
+                            "destinationType": str(
+                                shared_result.get("destinationType", "") or ""
+                            ).strip(),
+                            "editUrl": str(shared_result.get("editUrl", "") or "").strip(),
+                            "raw": shared_result,
+                        }
+                    verified = _verify_destination_with_runtime(
+                        shared_runtime,
+                        mode="shared-runtime-fallback-verified",
+                    )
+                    if verified:
+                        return verified
+                    shared_message = json.dumps(shared_result, ensure_ascii=False)
+            return {
+                "ok": False,
+                "status": "native-link-failed",
+                "error": primary_error,
+                "guidance": primary_guidance,
+                "sharedFallbackError": shared_message,
+                "scriptId": runtime.get("scriptId", ""),
+                "deploymentId": runtime.get("deploymentId", ""),
+                "scriptUrl": runtime.get("scriptUrl", ""),
+            }
+        else:
+            return {
+                "ok": False,
+                "status": "native-link-failed",
+                "error": primary_error,
+                "guidance": primary_guidance,
+                "scriptId": runtime.get("scriptId", ""),
+                "deploymentId": runtime.get("deploymentId", ""),
+                "scriptUrl": runtime.get("scriptUrl", ""),
+            }
 
     response: dict[str, Any] | None = None
     last_error_result: dict[str, Any] | None = None
     for attempt in range(3):
         try:
             response = script_service.scripts().run(
-                scriptId=runtime["scriptId"],
-                body={
-                    "function": "linkFormToSheet",
-                    "parameters": [form_id, spreadsheet_id],
-                },
+                scriptId=runtime["deploymentId"],
+                body=_build_apps_script_run_body(
+                    "linkFormToSheet",
+                    [form_id, spreadsheet_id],
+                ),
             ).execute()
             break
         except HttpError as exc:  # pragma: no cover - depends on Google API runtime
             message = _describe_apps_script_http_error(exc)
+            verified = _verify_destination_with_runtime(
+                runtime,
+                mode="verified-current-runtime",
+            )
+            if verified:
+                return verified
             guidance = (
                 "Native linking requires the configured shared Apps Script API executable to use "
                 "the same standard Google Cloud project as this app's OAuth client, with the Apps "
                 "Script API enabled. Reconnect Google after adding the new script scopes if needed."
             )
-            if _should_try_managed_fallback(message):
-                fallback_result = _try_managed_runtime_fallback(message, guidance)
-                if fallback_result and fallback_result.get("ok"):
-                    return fallback_result
-                if fallback_result:
-                    last_error_result = fallback_result
-                    break
             last_error_result = {
                 "ok": False,
                 "status": "native-link-failed",
+                "mode": "shared-runtime",
                 "error": message,
                 "guidance": guidance,
                 "scriptId": runtime["scriptId"],
@@ -2221,21 +2368,21 @@ def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str,
             time.sleep(2)
         except Exception as exc:  # pragma: no cover - depends on Google API runtime
             message = str(exc)
+            verified = _verify_destination_with_runtime(
+                runtime,
+                mode="verified-current-runtime",
+            )
+            if verified:
+                return verified
             guidance = (
                 "Native linking requires an Apps Script API executable that shares the same "
                 "standard Google Cloud project as this app's OAuth client, with the Apps Script "
                 "API enabled. Reconnect Google after adding the new script scopes if needed."
             )
-            if _should_try_managed_fallback(message):
-                fallback_result = _try_managed_runtime_fallback(message, guidance)
-                if fallback_result and fallback_result.get("ok"):
-                    return fallback_result
-                if fallback_result:
-                    last_error_result = fallback_result
-                    break
             last_error_result = {
                 "ok": False,
                 "status": "native-link-failed",
+                "mode": "shared-runtime",
                 "error": message,
                 "guidance": guidance,
                 "scriptId": runtime["scriptId"],
@@ -2254,6 +2401,7 @@ def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str,
         fallback_result = {
             "ok": False,
             "status": "native-link-failed",
+            "mode": "shared-runtime",
             "error": "Unknown native-link failure.",
             "guidance": "The Apps Script runtime could not complete native form-to-sheet linking.",
             "scriptId": runtime["scriptId"],
@@ -2266,19 +2414,20 @@ def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str,
 
     if isinstance(response, dict) and response.get("error"):
         error_payload = json.dumps(response.get("error"), ensure_ascii=False)
+        verified = _verify_destination_with_runtime(
+            runtime,
+            mode="verified-current-runtime",
+        )
+        if verified:
+            return verified
         guidance = (
             "The Apps Script runtime executed but did not complete the native link. "
             "Verify the script project's Cloud project setup and OAuth scopes."
         )
-        if _should_try_managed_fallback(error_payload):
-            fallback_result = _try_managed_runtime_fallback(error_payload, guidance)
-            if fallback_result and fallback_result.get("ok"):
-                return fallback_result
-            if fallback_result:
-                return fallback_result
         error_result = {
             "ok": False,
             "status": "native-link-failed",
+            "mode": "shared-runtime",
             "error": error_payload,
             "guidance": guidance,
             "scriptId": runtime["scriptId"],
@@ -2317,103 +2466,12 @@ def _insert_form_images_via_apps_script(
 
     script_service = _build_apps_script_service()
     runtime = _get_shared_native_linker_runtime()
-    using_shared_runtime = bool(runtime)
     if not runtime:
-        try:
-            runtime = _ensure_native_linker_deployment(script_service)
-        except HttpError as exc:  # pragma: no cover - depends on Google API runtime
-            message = _describe_apps_script_http_error(exc)
-            return {
-                "ok": False,
-                "status": "apps-script-setup-failed",
-                "error": message,
-                "guidance": (
-                    "Enable the Apps Script API for the Google Cloud project used by your OAuth "
-                    "client, then reconnect Google so the script scopes are granted."
-                ),
-            }
-        except Exception as exc:  # pragma: no cover - depends on Google API runtime
-            return {
-                "ok": False,
-                "status": "apps-script-setup-failed",
-                "error": str(exc),
-                "guidance": (
-                    "The backend could not prepare the Apps Script runtime needed to insert form images."
-                ),
-            }
-
-    def _should_try_managed_fallback(error_text: str) -> bool:
-        normalized = str(error_text or "").lower()
-        fallback_markers = (
-            "requested entity was not found",
-            "insufficient authentication scopes",
-            "authrequirederror",
-            "you do not have permission to call formapp.openbyid",
-        )
-        return using_shared_runtime and any(marker in normalized for marker in fallback_markers)
-
-    def _try_managed_runtime_fallback(primary_error: str, primary_guidance: str) -> dict[str, Any] | None:
-        try:
-            fallback_runtime = _ensure_locally_managed_native_linker_deployment(script_service)
-            fallback_response = script_service.scripts().run(
-                scriptId=fallback_runtime["scriptId"],
-                body={
-                    "function": "insertFormImages",
-                    "parameters": [form_id, placements],
-                },
-            ).execute()
-        except HttpError as fallback_exc:  # pragma: no cover - depends on Google API runtime
-            fallback_message = _describe_apps_script_http_error(fallback_exc)
-            return {
-                "ok": False,
-                "status": "apps-script-image-insert-failed",
-                "error": primary_error,
-                "guidance": primary_guidance,
-                "fallbackError": fallback_message,
-                "scriptId": runtime.get("scriptId", ""),
-                "deploymentId": runtime.get("deploymentId", ""),
-                "scriptUrl": runtime.get("scriptUrl", ""),
-            }
-        except Exception as fallback_exc:  # pragma: no cover - depends on Google API runtime
-            return {
-                "ok": False,
-                "status": "apps-script-image-insert-failed",
-                "error": primary_error,
-                "guidance": primary_guidance,
-                "fallbackError": str(fallback_exc),
-                "scriptId": runtime.get("scriptId", ""),
-                "deploymentId": runtime.get("deploymentId", ""),
-                "scriptUrl": runtime.get("scriptUrl", ""),
-            }
-
-        if isinstance(fallback_response, dict) and fallback_response.get("error"):
-            return {
-                "ok": False,
-                "status": "apps-script-image-insert-failed",
-                "error": primary_error,
-                "guidance": primary_guidance,
-                "fallbackError": json.dumps(fallback_response.get("error"), ensure_ascii=False),
-                "scriptId": runtime.get("scriptId", ""),
-                "deploymentId": runtime.get("deploymentId", ""),
-                "scriptUrl": runtime.get("scriptUrl", ""),
-            }
-
-        fallback_result = (
-            fallback_response.get("response", {}).get("result", {})
-            if isinstance(fallback_response, dict)
-            else {}
-        )
-        created_count = int(fallback_result.get("createdCount", 0) or 0)
         return {
-            "ok": created_count >= len(placements),
-            "status": "images-inserted" if created_count >= len(placements) else "images-partial",
-            "mode": "managed-fallback",
-            "createdCount": created_count,
-            "created": fallback_result.get("created", []),
-            "scriptId": fallback_runtime["scriptId"],
-            "deploymentId": fallback_runtime["deploymentId"],
-            "scriptUrl": fallback_runtime["scriptUrl"],
-            "fallbackError": "" if created_count >= len(placements) else json.dumps(fallback_result, ensure_ascii=False),
+            "ok": False,
+            "status": "shared-runtime-not-configured",
+            "error": "No shared Apps Script runtime is configured.",
+            "guidance": _get_missing_shared_runtime_guidance(),
         }
 
     response: dict[str, Any] | None = None
@@ -2421,23 +2479,16 @@ def _insert_form_images_via_apps_script(
     for attempt in range(3):
         try:
             response = script_service.scripts().run(
-                scriptId=runtime["scriptId"],
-                body={
-                    "function": "insertFormImages",
-                    "parameters": [form_id, placements],
-                },
+                scriptId=runtime["deploymentId"],
+                body=_build_apps_script_run_body(
+                    "insertFormImages",
+                    [form_id, placements],
+                ),
             ).execute()
             break
         except HttpError as exc:  # pragma: no cover - depends on Google API runtime
             message = _describe_apps_script_http_error(exc)
             guidance = "The Apps Script runtime could not insert images into the Google Form."
-            if _should_try_managed_fallback(message):
-                fallback_result = _try_managed_runtime_fallback(message, guidance)
-                if fallback_result and fallback_result.get("ok"):
-                    return fallback_result
-                if fallback_result:
-                    last_error_result = fallback_result
-                    break
             last_error_result = {
                 "ok": False,
                 "status": "apps-script-image-insert-failed",
@@ -2452,13 +2503,6 @@ def _insert_form_images_via_apps_script(
         except Exception as exc:  # pragma: no cover - depends on Google API runtime
             message = str(exc)
             guidance = "The Apps Script runtime could not insert images into the Google Form."
-            if _should_try_managed_fallback(message):
-                fallback_result = _try_managed_runtime_fallback(message, guidance)
-                if fallback_result and fallback_result.get("ok"):
-                    return fallback_result
-                if fallback_result:
-                    last_error_result = fallback_result
-                    break
             last_error_result = {
                 "ok": False,
                 "status": "apps-script-image-insert-failed",
@@ -2484,12 +2528,6 @@ def _insert_form_images_via_apps_script(
     if isinstance(response, dict) and response.get("error"):
         error_payload = json.dumps(response.get("error"), ensure_ascii=False)
         guidance = "The Apps Script runtime ran but did not complete image insertion."
-        if _should_try_managed_fallback(error_payload):
-            fallback_result = _try_managed_runtime_fallback(error_payload, guidance)
-            if fallback_result and fallback_result.get("ok"):
-                return fallback_result
-            if fallback_result:
-                return fallback_result
         return {
             "ok": False,
             "status": "apps-script-image-insert-failed",
@@ -4090,6 +4128,125 @@ def _ensure_sheet_exists(
     ).execute()
 
 
+def _pick_postprocess_source_sheet(sheets: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Pick the most likely raw response sheet, even if it is currently empty."""
+    fallback_sheet: dict[str, Any] | None = None
+    for sheet in sheets:
+        title = str(sheet.get("properties", {}).get("title", "") or "")
+        if not title or _looks_like_generated_analysis_sheet(title):
+            continue
+        lowered = title.casefold()
+        if any(
+            marker in lowered
+            for marker in (
+                "form responses",
+                "response",
+                "responses",
+                "คำตอบแบบฟอร์ม",
+                "คำตอบ",
+            )
+        ):
+            return sheet
+        if fallback_sheet is None:
+            fallback_sheet = sheet
+    return fallback_sheet
+
+
+def _initialize_empty_postprocess_tabs(
+    service: Any,
+    spreadsheet_id: str,
+    spreadsheet_title: str,
+    source_title: str,
+    existing_sheets: list[dict[str, Any]],
+    output_sheet_name: str,
+) -> dict[str, Any]:
+    """Create ready-to-use analysis tabs even when the linked response sheet is still empty."""
+    processed_sheet_name, detail_sheet_name, summary_sheet_name = _derive_postprocess_sheet_names(
+        source_title or spreadsheet_title,
+        [],
+        output_sheet_name,
+    )
+    _ensure_sheet_exists(service, spreadsheet_id, processed_sheet_name, existing_sheets)
+    _ensure_sheet_exists(service, spreadsheet_id, detail_sheet_name, existing_sheets)
+    _ensure_sheet_exists(service, spreadsheet_id, summary_sheet_name, existing_sheets)
+
+    service.spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id,
+        range=_quote_sheet_title(processed_sheet_name),
+        body={},
+    ).execute()
+    service.spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id,
+        range=_quote_sheet_title(detail_sheet_name),
+        body={},
+    ).execute()
+    service.spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id,
+        range=_quote_sheet_title(summary_sheet_name),
+        body={},
+    ).execute()
+
+    waiting_message = (
+        "ยังไม่มีคำตอบในฟอร์ม ชีตนี้จะถูกเติมข้อมูลหลังมีการส่งคำตอบครั้งแรก"
+        if _contains_thai(source_title or spreadsheet_title)
+        else "No form responses yet. This sheet will populate after the first submission."
+    )
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"{_quote_sheet_title(processed_sheet_name)}!A1",
+        valueInputOption="RAW",
+        body={"values": [[waiting_message]]},
+    ).execute()
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"{_quote_sheet_title(detail_sheet_name)}!A1",
+        valueInputOption="RAW",
+        body={
+            "values": [[
+                "Response ID",
+                "Timestamp",
+                "Question",
+                "Answer",
+                "Answer Type",
+                "Answer Length",
+            ]]
+        },
+    ).execute()
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"{_quote_sheet_title(summary_sheet_name)}!A1",
+        valueInputOption="RAW",
+        body={"values": [["Question", "Answer", "Count", "Percent"]]},
+    ).execute()
+
+    return {
+        "ok": True,
+        "status": "formatted",
+        "spreadsheetId": spreadsheet_id,
+        "spreadsheetTitle": spreadsheet_title,
+        "sourceSheet": source_title,
+        "outputSheet": processed_sheet_name,
+        "detailSheet": detail_sheet_name,
+        "summarySheet": summary_sheet_name,
+        "headerRowIndex": 0,
+        "columnCount": 0,
+        "rowCountWritten": 0,
+        "detailColumnCount": 6,
+        "detailRowCountWritten": 0,
+        "questionSummaryRowCount": 0,
+        "rawHeaders": [],
+        "analysisHeaders": [
+            "Response ID",
+            "Timestamp",
+            "Question",
+            "Answer",
+            "Answer Type",
+            "Answer Length",
+        ],
+        "note": waiting_message,
+    }
+
+
 def _generate_missing_questions(
     title: str,
     description: str,
@@ -4366,6 +4523,34 @@ def _describe_apps_script_http_error(exc: HttpError) -> str:
     return message
 
 
+def _is_retryable_google_http_error(exc: HttpError) -> bool:
+    """Return whether a Google API HttpError is likely transient."""
+    status = getattr(exc.resp, "status", None)
+    return status in {429, 500, 502, 503, 504}
+
+
+def _create_google_form_with_retry(
+    forms_service: Any,
+    form_body: dict[str, Any],
+    *,
+    attempts: int = 4,
+    delay_seconds: float = 2.0,
+) -> dict[str, Any]:
+    """Create a Google Form with bounded retries for transient upstream failures."""
+    last_exc: HttpError | None = None
+    for attempt in range(attempts):
+        try:
+            return forms_service.forms().create(body=form_body).execute()
+        except HttpError as exc:
+            last_exc = exc
+            if not _is_retryable_google_http_error(exc) or attempt == attempts - 1:
+                raise
+            time.sleep(delay_seconds * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Google Forms API form creation did not return a response.")
+
+
 @tool
 def create_form_with_response_sheet(
     title: str,
@@ -4461,7 +4646,10 @@ def create_form_with_response_sheet(
                 "documentTitle": title.strip(),
             }
         }
-        form_response = forms_service.forms().create(body=form_body).execute()
+        form_response = _create_google_form_with_retry(
+            forms_service,
+            form_body,
+        )
         form_id = form_response.get("formId", "")
         if not form_id:
             raise RuntimeError("Google Forms API did not return a formId.")
@@ -4649,7 +4837,7 @@ def format_response_sheet_for_analysis(
         raise RuntimeError("spreadsheet_target is required.")
 
     spreadsheet_id_value = extract_spreadsheet_id(target)
-    credentials = _load_google_sheets_credentials()
+    credentials = _load_google_workspace_credentials()
     service = build_google_api(
         "sheets",
         "v4",
@@ -4699,7 +4887,9 @@ def format_response_sheet_for_analysis(
                 best_rows = values
 
         if selected_sheet is None:
-            raise RuntimeError("No populated sheet was found to format.")
+            selected_sheet = _pick_postprocess_source_sheet(sheets)
+            if selected_sheet is None:
+                raise RuntimeError("No populated sheet was found to format.")
 
     source_title = str(selected_sheet.get("properties", {}).get("title", "") or "")
     raw_values = (
@@ -4709,9 +4899,33 @@ def format_response_sheet_for_analysis(
         .execute()
         .get("values", [])
     )
+    if not raw_values:
+        return json.dumps(
+            _initialize_empty_postprocess_tabs(
+                service,
+                spreadsheet_id_value,
+                spreadsheet_title,
+                source_title,
+                sheets,
+                output_sheet_name,
+            ),
+            ensure_ascii=False,
+            indent=2,
+        )
     headers, cleaned_rows, header_row_index = _build_analysis_ready_table(raw_values)
     if not headers:
-        raise RuntimeError("Could not detect a usable header row in the source sheet.")
+        return json.dumps(
+            _initialize_empty_postprocess_tabs(
+                service,
+                spreadsheet_id_value,
+                spreadsheet_title,
+                source_title,
+                sheets,
+                output_sheet_name,
+            ),
+            ensure_ascii=False,
+            indent=2,
+        )
     analysis_headers, analysis_rows, summary_rows = _build_normalized_analysis_rows(
         headers,
         cleaned_rows,
@@ -4795,8 +5009,8 @@ def format_response_sheet_for_analysis(
 
 def _postprocess_newly_linked_response_sheet(
     spreadsheet_id: str,
-    retries: int = 3,
-    delay_seconds: float = 2.0,
+    retries: int = 8,
+    delay_seconds: float = 3.0,
 ) -> dict[str, Any]:
     """Best-effort formatting of a newly linked response sheet into analysis tabs."""
     last_error = ""
@@ -4807,6 +5021,11 @@ def _postprocess_newly_linked_response_sheet(
             )
             payload = json.loads(result) if isinstance(result, str) else result
             if isinstance(payload, dict):
+                raw_headers = payload.get("rawHeaders", [])
+                column_count = int(payload.get("columnCount", 0) or 0)
+                if (not raw_headers or column_count == 0) and attempt < max(1, retries) - 1:
+                    time.sleep(delay_seconds)
+                    continue
                 payload["processedSheetName"] = str(payload.get("outputSheet", "") or "")
                 payload["analysisSheetName"] = str(payload.get("detailSheet", "") or "")
                 payload["ok"] = True
@@ -4918,7 +5137,7 @@ def inspect_spreadsheet_for_analysis(
         )
 
     spreadsheet_id_value = extract_spreadsheet_id(target)
-    credentials = _load_google_sheets_credentials()
+    credentials = _load_google_workspace_credentials()
     service = build_google_api(
         "sheets",
         "v4",
@@ -6959,6 +7178,8 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
         spreadsheet_id = str(payload.get("spreadsheetId", "") or "")
         spreadsheet_title = str(payload.get("spreadsheetTitle", "") or "")
         spreadsheet_url = str(payload.get("spreadsheetUrl", "") or "")
+        link_status = str(payload.get("linkStatus", "") or "").strip()
+        link_ok = link_status == "linked"
         postprocess_status = str(payload.get("postprocessStatus", "") or "")
         processed_sheet_name = str(payload.get("processedSheetName", "") or "")
         analysis_sheet_name = str(payload.get("analysisSheetName", "") or "")
@@ -7072,7 +7293,12 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
         if next_step:
             localized_next_step = next_step
             if user_language == "th":
-                if postprocess_status == "formatted":
+                if not link_ok:
+                    localized_next_step = (
+                        "ฟอร์มและสเปรดชีตถูกสร้างแล้ว แต่การเชื่อมสเปรดชีตอัตโนมัติยังไม่สำเร็จ "
+                        "ให้ใช้ลิงก์ที่ส่งกลับไว้ก่อน แล้วค่อยลองเชื่อมใหม่อีกครั้ง"
+                    )
+                elif postprocess_status == "formatted":
                     localized_next_step = (
                         "ฟอร์มนี้ถูกเชื่อมกับ Google Spreadsheet และจัดรูปแบบชีตวิเคราะห์เบื้องต้นแล้ว "
                         "ส่งลิงก์สเปรดชีตกลับมาได้ทุกเมื่อหากต้องการให้ฉันวิเคราะห์หรือจัดรูปแบบใหม่"
@@ -7082,6 +7308,11 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
                         "ฟอร์มนี้ถูกเชื่อมกับ Google Spreadsheet เรียบร้อยแล้ว "
                         "เมื่อมีคำตอบเข้ามาแล้ว ส่งลิงก์สเปรดชีตกลับมาได้ทุกเมื่อเพื่อให้ฉันวิเคราะห์หรือจัดรูปแบบใหม่"
                     )
+            elif not link_ok:
+                localized_next_step = (
+                    "The form and spreadsheet were created, but automatic linking did not complete. "
+                    "Use the returned links for now, then retry linking after the Apps Script runtime is corrected."
+                )
             elif postprocess_status == "formatted":
                 localized_next_step = (
                     "The form is linked and the first-pass analysis sheets are already in place. "
