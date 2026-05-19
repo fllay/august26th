@@ -4074,213 +4074,220 @@ def create_form_with_response_sheet(
     source_prompt: str = "",
     strict_source_questions: bool = False,
     is_quiz: bool = False,
+    google_oauth_session_key: str = "",
 ) -> str:
     """Create a Google Form, link a response spreadsheet, and optionally add description/questions."""
-    if not title.strip():
-        raise RuntimeError("title is required")
-
-    forms_service = _build_forms_service()
-    normalized_source_prompt = source_prompt.strip()
-    inferred_question_count = extract_question_count(normalized_source_prompt) if normalized_source_prompt else None
-    effective_expected_question_count = expected_question_count or inferred_question_count or 0
-
-    questions = _parse_questions_input(questions_json, questions_text)
-    respondent_questions = _parse_respondent_questions_input(respondent_questions_json)
-    if not respondent_questions and normalized_source_prompt:
-        respondent_questions = extract_requested_respondent_questions(normalized_source_prompt)
-    section_structure = _parse_section_structure_input(section_structure_json)
-    if not section_structure and normalized_source_prompt:
-        section_structure = extract_requested_section_structure(normalized_source_prompt)
-
-    if strict_source_questions and questions:
-        effective_expected_question_count = max(
-            0,
-            _count_non_section_questions(questions) - len(respondent_questions),
-        )
-
-    if (
-        not strict_source_questions
-        and
-        effective_expected_question_count > 0
-        and _count_non_section_questions(questions) - len(respondent_questions) < effective_expected_question_count
-        and normalized_source_prompt
-    ):
-        regenerated_main_questions = _generate_full_question_set_from_brief(
-            title=title,
-            description=description,
-            source_prompt=normalized_source_prompt,
-            respondent_questions=respondent_questions,
-            expected_question_count=effective_expected_question_count,
-        )
-        if regenerated_main_questions:
-            questions = regenerated_main_questions
-
-    questions = _ensure_default_respondent_questions(
-        title,
-        description,
-        questions,
-        respondent_questions,
-        section_structure,
+    token_session = GOOGLE_OAUTH_SESSION_KEY.set(
+        _sanitize_google_oauth_session_key(google_oauth_session_key)
     )
-    if not strict_source_questions and effective_expected_question_count > 0:
-        actual_main_question_count = (
-            _count_non_section_questions(questions) - len(respondent_questions)
-        )
-        if actual_main_question_count < effective_expected_question_count:
-            missing_questions = _generate_missing_questions(
+    try:
+        if not title.strip():
+            raise RuntimeError("title is required")
+
+        forms_service = _build_forms_service()
+        normalized_source_prompt = source_prompt.strip()
+        inferred_question_count = extract_question_count(normalized_source_prompt) if normalized_source_prompt else None
+        effective_expected_question_count = expected_question_count or inferred_question_count or 0
+
+        questions = _parse_questions_input(questions_json, questions_text)
+        respondent_questions = _parse_respondent_questions_input(respondent_questions_json)
+        if not respondent_questions and normalized_source_prompt:
+            respondent_questions = extract_requested_respondent_questions(normalized_source_prompt)
+        section_structure = _parse_section_structure_input(section_structure_json)
+        if not section_structure and normalized_source_prompt:
+            section_structure = extract_requested_section_structure(normalized_source_prompt)
+
+        if strict_source_questions and questions:
+            effective_expected_question_count = max(
+                0,
+                _count_non_section_questions(questions) - len(respondent_questions),
+            )
+
+        if (
+            not strict_source_questions
+            and
+            effective_expected_question_count > 0
+            and _count_non_section_questions(questions) - len(respondent_questions) < effective_expected_question_count
+            and normalized_source_prompt
+        ):
+            regenerated_main_questions = _generate_full_question_set_from_brief(
                 title=title,
                 description=description,
-                existing_questions=questions,
-                respondent_questions=respondent_questions,
-                missing_count=effective_expected_question_count - actual_main_question_count,
                 source_prompt=normalized_source_prompt,
+                respondent_questions=respondent_questions,
+                expected_question_count=effective_expected_question_count,
             )
-            questions.extend(missing_questions)
+            if regenerated_main_questions:
+                questions = regenerated_main_questions
+
+        questions = _ensure_default_respondent_questions(
+            title,
+            description,
+            questions,
+            respondent_questions,
+            section_structure,
+        )
+        if not strict_source_questions and effective_expected_question_count > 0:
             actual_main_question_count = (
                 _count_non_section_questions(questions) - len(respondent_questions)
             )
             if actual_main_question_count < effective_expected_question_count:
-                raise RuntimeError(
-                    "Generated form content is incomplete: "
-                    f"expected {effective_expected_question_count} main questions, "
-                    f"but only received {actual_main_question_count}. "
-                    "Generate every requested question explicitly and do not use placeholders."
+                missing_questions = _generate_missing_questions(
+                    title=title,
+                    description=description,
+                    existing_questions=questions,
+                    respondent_questions=respondent_questions,
+                    missing_count=effective_expected_question_count - actual_main_question_count,
+                    source_prompt=normalized_source_prompt,
                 )
-    form_body = {
-        "info": {
-            "title": title.strip(),
-            "documentTitle": title.strip(),
+                questions.extend(missing_questions)
+                actual_main_question_count = (
+                    _count_non_section_questions(questions) - len(respondent_questions)
+                )
+                if actual_main_question_count < effective_expected_question_count:
+                    raise RuntimeError(
+                        "Generated form content is incomplete: "
+                        f"expected {effective_expected_question_count} main questions, "
+                        f"but only received {actual_main_question_count}. "
+                        "Generate every requested question explicitly and do not use placeholders."
+                    )
+        form_body = {
+            "info": {
+                "title": title.strip(),
+                "documentTitle": title.strip(),
+            }
         }
-    }
-    form_response = forms_service.forms().create(body=form_body).execute()
-    form_id = form_response.get("formId", "")
-    if not form_id:
-        raise RuntimeError("Google Forms API did not return a formId.")
+        form_response = forms_service.forms().create(body=form_body).execute()
+        form_id = form_response.get("formId", "")
+        if not form_id:
+            raise RuntimeError("Google Forms API did not return a formId.")
 
-    questions = _materialize_question_images(questions)
-    image_placements = _build_apps_script_image_placements(questions)
-    rest_questions = questions
-    if image_placements:
-        rest_questions = _strip_images_from_questions_for_rest(questions)
+        questions = _materialize_question_images(questions)
+        image_placements = _build_apps_script_image_placements(questions)
+        rest_questions = questions
+        if image_placements:
+            rest_questions = _strip_images_from_questions_for_rest(questions)
 
-    _apply_form_batch_updates(
-        forms_service=forms_service,
-        form_id=form_id,
-        description=description,
-        questions=rest_questions,
-        is_quiz=is_quiz,
-    )
-
-    image_insert_result: dict[str, Any] = {}
-    if image_placements:
-        image_insert_result = _insert_form_images_via_apps_script(
+        _apply_form_batch_updates(
+            forms_service=forms_service,
             form_id=form_id,
-            placements=image_placements,
+            description=description,
+            questions=rest_questions,
+            is_quiz=is_quiz,
         )
-        if not image_insert_result.get("ok"):
-            guidance = str(image_insert_result.get("guidance", "") or "").strip()
-            error = str(image_insert_result.get("error", "") or "Unknown image insertion failure").strip()
+
+        image_insert_result: dict[str, Any] = {}
+        if image_placements:
+            image_insert_result = _insert_form_images_via_apps_script(
+                form_id=form_id,
+                placements=image_placements,
+            )
+            if not image_insert_result.get("ok"):
+                guidance = str(image_insert_result.get("guidance", "") or "").strip()
+                error = str(image_insert_result.get("error", "") or "Unknown image insertion failure").strip()
+                raise RuntimeError(
+                    f"Form questions were created, but image insertion failed. {error}"
+                    + (f" {guidance}" if guidance else "")
+                )
+            inserted_count = int(image_insert_result.get("createdCount", 0) or 0)
+            if inserted_count < len(image_placements):
+                raise RuntimeError(
+                    "Form questions were created, but not all images were inserted. "
+                    f"Expected {len(image_placements)} image placements but Apps Script reported {inserted_count} inserted."
+                )
+
+        spreadsheet_details = _create_response_spreadsheet(title.strip())
+        spreadsheet_id = spreadsheet_details["spreadsheetId"]
+        link_result = _link_form_to_sheet_natively(form_id=form_id, spreadsheet_id=spreadsheet_id)
+        if not link_result.get("ok"):
+            guidance = str(link_result.get("guidance", "") or "").strip()
+            error = str(link_result.get("error", "") or "Unknown native linking failure").strip()
             raise RuntimeError(
-                f"Form questions were created, but image insertion failed. {error}"
+                f"Form questions were created, but response-sheet linking failed. {error}"
                 + (f" {guidance}" if guidance else "")
             )
-        inserted_count = int(image_insert_result.get("createdCount", 0) or 0)
-        if inserted_count < len(image_placements):
+
+        destination_id = str(link_result.get("destinationId", "") or "").strip()
+        if destination_id and destination_id != spreadsheet_id:
             raise RuntimeError(
-                "Form questions were created, but not all images were inserted. "
-                f"Expected {len(image_placements)} image placements but Apps Script reported {inserted_count} inserted."
+                "Form questions were created, but the linked response sheet did not match the created spreadsheet. "
+                f"Expected {spreadsheet_id} but Google reported {destination_id}."
             )
 
-    spreadsheet_details = _create_response_spreadsheet(title.strip())
-    spreadsheet_id = spreadsheet_details["spreadsheetId"]
-    link_result = _link_form_to_sheet_natively(form_id=form_id, spreadsheet_id=spreadsheet_id)
-    if not link_result.get("ok"):
-        guidance = str(link_result.get("guidance", "") or "").strip()
-        error = str(link_result.get("error", "") or "Unknown native linking failure").strip()
-        raise RuntimeError(
-            f"Form questions were created, but response-sheet linking failed. {error}"
-            + (f" {guidance}" if guidance else "")
-        )
-
-    destination_id = str(link_result.get("destinationId", "") or "").strip()
-    if destination_id and destination_id != spreadsheet_id:
-        raise RuntimeError(
-            "Form questions were created, but the linked response sheet did not match the created spreadsheet. "
-            f"Expected {spreadsheet_id} but Google reported {destination_id}."
-        )
-
-    linked_at = datetime.now(timezone.utc).isoformat()
-    _upsert_form_sheet_link(
-        form_id,
-        {
-            "spreadsheetId": spreadsheet_id,
-            "spreadsheetTitle": spreadsheet_details["spreadsheetTitle"],
-            "spreadsheetUrl": spreadsheet_details["spreadsheetUrl"],
-            "formUrl": f"https://docs.google.com/forms/d/{form_id}/edit",
-            "linkStatus": str(link_result.get("status", "") or "linked"),
-            "linkMode": str(link_result.get("mode", "") or "api-executable"),
-            "linkedAt": linked_at,
-            "scriptId": str(link_result.get("scriptId", "") or ""),
-            "deploymentId": str(link_result.get("deploymentId", "") or ""),
-            "scriptUrl": str(link_result.get("scriptUrl", "") or ""),
-        },
-    )
-
-    postprocess_result = _postprocess_newly_linked_response_sheet(spreadsheet_id)
-    if postprocess_result.get("ok"):
+        linked_at = datetime.now(timezone.utc).isoformat()
         _upsert_form_sheet_link(
             form_id,
             {
-                "postprocessStatus": "formatted",
+                "spreadsheetId": spreadsheet_id,
+                "spreadsheetTitle": spreadsheet_details["spreadsheetTitle"],
+                "spreadsheetUrl": spreadsheet_details["spreadsheetUrl"],
+                "formUrl": f"https://docs.google.com/forms/d/{form_id}/edit",
+                "linkStatus": str(link_result.get("status", "") or "linked"),
+                "linkMode": str(link_result.get("mode", "") or "api-executable"),
+                "linkedAt": linked_at,
+                "scriptId": str(link_result.get("scriptId", "") or ""),
+                "deploymentId": str(link_result.get("deploymentId", "") or ""),
+                "scriptUrl": str(link_result.get("scriptUrl", "") or ""),
+            },
+        )
+
+        postprocess_result = _postprocess_newly_linked_response_sheet(spreadsheet_id)
+        if postprocess_result.get("ok"):
+            _upsert_form_sheet_link(
+                form_id,
+                {
+                    "postprocessStatus": "formatted",
+                    "processedSheetName": str(postprocess_result.get("processedSheetName", "") or ""),
+                    "analysisSheetName": str(postprocess_result.get("analysisSheetName", "") or ""),
+                    "summarySheetName": str(postprocess_result.get("summarySheetName", "") or ""),
+                    "postprocessedAt": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        else:
+            _upsert_form_sheet_link(
+                form_id,
+                {
+                    "postprocessStatus": str(postprocess_result.get("status", "") or "format-failed"),
+                    "postprocessError": str(postprocess_result.get("error", "") or ""),
+                },
+            )
+
+        responder_uri = form_response.get("responderUri", "")
+        edit_uri = f"https://docs.google.com/forms/d/{form_id}/edit"
+
+        return json.dumps(
+            {
+                "formId": form_id,
+                "formUrl": edit_uri,
+                "editUrl": edit_uri,
+                "title": title.strip(),
+                "description": description.strip(),
+                "responderUri": responder_uri,
+                "responseUrl": responder_uri,
+                "questionCount": len(questions),
+                "insertedImageCount": int(image_insert_result.get("createdCount", 0) or 0),
+                "isQuiz": bool(is_quiz),
+                "spreadsheetId": spreadsheet_id,
+                "spreadsheetTitle": spreadsheet_details["spreadsheetTitle"],
+                "spreadsheetUrl": spreadsheet_details["spreadsheetUrl"],
+                "linkStatus": str(link_result.get("status", "") or "linked"),
+                "linkedAt": linked_at,
+                "postprocessStatus": str(postprocess_result.get("status", "") or ""),
                 "processedSheetName": str(postprocess_result.get("processedSheetName", "") or ""),
                 "analysisSheetName": str(postprocess_result.get("analysisSheetName", "") or ""),
                 "summarySheetName": str(postprocess_result.get("summarySheetName", "") or ""),
-                "postprocessedAt": datetime.now(timezone.utc).isoformat(),
-            },
-        )
-    else:
-        _upsert_form_sheet_link(
-            form_id,
-            {
-                "postprocessStatus": str(postprocess_result.get("status", "") or "format-failed"),
                 "postprocessError": str(postprocess_result.get("error", "") or ""),
+                "nextStep": (
+                    "The form is already linked to a Google Spreadsheet. "
+                    "If responses already exist, the analysis sheets were created automatically. "
+                    "Send that spreadsheet link back any time you want the agent to inspect or reformat the data."
+                ),
             },
+            ensure_ascii=False,
+            indent=2,
         )
-
-    responder_uri = form_response.get("responderUri", "")
-    edit_uri = f"https://docs.google.com/forms/d/{form_id}/edit"
-
-    return json.dumps(
-        {
-            "formId": form_id,
-            "formUrl": edit_uri,
-            "editUrl": edit_uri,
-            "title": title.strip(),
-            "description": description.strip(),
-            "responderUri": responder_uri,
-            "responseUrl": responder_uri,
-            "questionCount": len(questions),
-            "insertedImageCount": int(image_insert_result.get("createdCount", 0) or 0),
-            "isQuiz": bool(is_quiz),
-            "spreadsheetId": spreadsheet_id,
-            "spreadsheetTitle": spreadsheet_details["spreadsheetTitle"],
-            "spreadsheetUrl": spreadsheet_details["spreadsheetUrl"],
-            "linkStatus": str(link_result.get("status", "") or "linked"),
-            "linkedAt": linked_at,
-            "postprocessStatus": str(postprocess_result.get("status", "") or ""),
-            "processedSheetName": str(postprocess_result.get("processedSheetName", "") or ""),
-            "analysisSheetName": str(postprocess_result.get("analysisSheetName", "") or ""),
-            "summarySheetName": str(postprocess_result.get("summarySheetName", "") or ""),
-            "postprocessError": str(postprocess_result.get("error", "") or ""),
-            "nextStep": (
-                "The form is already linked to a Google Spreadsheet. "
-                "If responses already exist, the analysis sheets were created automatically. "
-                "Send that spreadsheet link back any time you want the agent to inspect or reformat the data."
-            ),
-        },
-        ensure_ascii=False,
-        indent=2,
-    )
+    finally:
+        GOOGLE_OAUTH_SESSION_KEY.reset(token_session)
 
 
 @tool
@@ -6508,6 +6515,7 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
                 "source_prompt": effective_creation_brief or latest_human_content,
                 "strict_source_questions": bool(file_questions) or exact_source_mode,
                 "is_quiz": is_quiz,
+                "google_oauth_session_key": GOOGLE_OAUTH_SESSION_KEY.get() or "",
             }
         )
         if not isinstance(result, str):
