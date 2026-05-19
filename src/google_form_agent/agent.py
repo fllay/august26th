@@ -6149,6 +6149,22 @@ def get_google_oauth_session_key_from_request(request: ModelRequest) -> str | No
     return None
 
 
+def run_with_google_oauth_session(
+    google_oauth_session_key: str | None,
+    func: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Execute sync work with an explicit Google OAuth session binding."""
+    token_session = GOOGLE_OAUTH_SESSION_KEY.set(
+        _sanitize_google_oauth_session_key(google_oauth_session_key)
+    )
+    try:
+        return func(*args, **kwargs)
+    finally:
+        GOOGLE_OAUTH_SESSION_KEY.reset(token_session)
+
+
 def inject_attached_file_context(
     messages: list[AnyMessage],
     attached_file_context: str,
@@ -6662,9 +6678,8 @@ class LocalLLMMessageFormatMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Any],
     ) -> ModelResponse | AIMessage:
-        token_session = GOOGLE_OAUTH_SESSION_KEY.set(
-            get_google_oauth_session_key_from_request(request)
-        )
+        google_oauth_session_key = get_google_oauth_session_key_from_request(request)
+        token_session = GOOGLE_OAUTH_SESSION_KEY.set(google_oauth_session_key)
         try:
             original_messages = list(request.messages)
             system_message = (
@@ -6678,6 +6693,8 @@ class LocalLLMMessageFormatMiddleware(AgentMiddleware):
                 get_attached_file_context(request),
             )
             direct_sheet_response = await asyncio.to_thread(
+                run_with_google_oauth_session,
+                google_oauth_session_key,
                 maybe_complete_manual_sheet_format_handoff,
                 messages,
             )
@@ -6688,6 +6705,8 @@ class LocalLLMMessageFormatMiddleware(AgentMiddleware):
                 get_attached_file_context(request),
             )
             direct_form_response = await asyncio.to_thread(
+                run_with_google_oauth_session,
+                google_oauth_session_key,
                 maybe_complete_form_creation_request,
                 direct_form_messages,
             )
