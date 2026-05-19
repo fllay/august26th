@@ -7143,7 +7143,7 @@ def build_mcp_client() -> MultiServerMCPClient:
         "GOOGLE_CLIENT_ID": get_required_env("GOOGLE_CLIENT_ID"),
         "GOOGLE_CLIENT_SECRET": get_required_env("GOOGLE_CLIENT_SECRET"),
     }
-    refresh_token = load_google_refresh_token()
+    refresh_token = load_google_refresh_token(discover_single_session=False)
     if refresh_token:
         forms_server_env["GOOGLE_REFRESH_TOKEN"] = refresh_token
 
