@@ -1996,6 +1996,7 @@ def _link_form_to_sheet_via_webapp(
 def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str, Any]:
     """Attempt to set the form's native Google Sheets response destination."""
     web_app_config = _get_native_link_webapp_config()
+    webapp_failure: dict[str, Any] | None = None
     if web_app_config:
         try:
             _share_native_link_targets_with_actor(
@@ -2004,7 +2005,7 @@ def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str,
                 actor_email=web_app_config["actorEmail"],
             )
         except Exception as exc:
-            return {
+            webapp_failure = {
                 "ok": False,
                 "status": "native-link-share-failed",
                 "error": str(exc),
@@ -2013,26 +2014,24 @@ def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str,
                     "Apps Script actor account required for web-app-based native linking."
                 ),
             }
-
-        webapp_result = _link_form_to_sheet_via_webapp(
-            form_id=form_id,
-            spreadsheet_id=spreadsheet_id,
-            web_app_url=web_app_config["webAppUrl"],
-            shared_secret=web_app_config["sharedSecret"],
-        )
-        if webapp_result.get("ok"):
-            webapp_result["mode"] = "web-app"
-            return webapp_result
-
-    if web_app_config:
-        return {
-            **webapp_result,
-            "mode": "web-app",
-            "guidance": (
-                str(webapp_result.get("guidance", "") or "").strip()
-                or "Shared Apps Script web app native linking failed."
-            ),
-        }
+        else:
+            webapp_result = _link_form_to_sheet_via_webapp(
+                form_id=form_id,
+                spreadsheet_id=spreadsheet_id,
+                web_app_url=web_app_config["webAppUrl"],
+                shared_secret=web_app_config["sharedSecret"],
+            )
+            if webapp_result.get("ok"):
+                webapp_result["mode"] = "web-app"
+                return webapp_result
+            webapp_failure = {
+                **webapp_result,
+                "mode": "web-app",
+                "guidance": (
+                    str(webapp_result.get("guidance", "") or "").strip()
+                    or "Shared Apps Script web app native linking failed."
+                ),
+            }
 
     runtime = _get_shared_native_linker_runtime()
     using_shared_runtime = bool(runtime)
@@ -2150,58 +2149,90 @@ def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str,
             "raw": fallback_result,
         }
 
-    try:
-        response = script_service.scripts().run(
-            scriptId=runtime["scriptId"],
-            body={
-                "function": "linkFormToSheet",
-                "parameters": [form_id, spreadsheet_id],
-            },
-        ).execute()
-    except HttpError as exc:  # pragma: no cover - depends on Google API runtime
-        message = _describe_apps_script_http_error(exc)
-        guidance = (
-            "Native linking requires the configured shared Apps Script API executable to use "
-            "the same standard Google Cloud project as this app's OAuth client, with the Apps "
-            "Script API enabled. Reconnect Google after adding the new script scopes if needed."
-        )
-        if _should_try_managed_fallback(message):
-            fallback_result = _try_managed_runtime_fallback(message, guidance)
-            if fallback_result and fallback_result.get("ok"):
-                return fallback_result
-            if fallback_result:
-                return fallback_result
-        return {
+    response: dict[str, Any] | None = None
+    last_error_result: dict[str, Any] | None = None
+    for attempt in range(3):
+        try:
+            response = script_service.scripts().run(
+                scriptId=runtime["scriptId"],
+                body={
+                    "function": "linkFormToSheet",
+                    "parameters": [form_id, spreadsheet_id],
+                },
+            ).execute()
+            break
+        except HttpError as exc:  # pragma: no cover - depends on Google API runtime
+            message = _describe_apps_script_http_error(exc)
+            guidance = (
+                "Native linking requires the configured shared Apps Script API executable to use "
+                "the same standard Google Cloud project as this app's OAuth client, with the Apps "
+                "Script API enabled. Reconnect Google after adding the new script scopes if needed."
+            )
+            if _should_try_managed_fallback(message):
+                fallback_result = _try_managed_runtime_fallback(message, guidance)
+                if fallback_result and fallback_result.get("ok"):
+                    return fallback_result
+                if fallback_result:
+                    last_error_result = fallback_result
+                    break
+            last_error_result = {
+                "ok": False,
+                "status": "native-link-failed",
+                "error": message,
+                "guidance": guidance,
+                "scriptId": runtime["scriptId"],
+                "deploymentId": runtime["deploymentId"],
+                "scriptUrl": runtime["scriptUrl"],
+            }
+            if webapp_failure:
+                last_error_result["webAppFailure"] = webapp_failure
+            if "Requested entity was not found" not in message or attempt == 2:
+                return last_error_result
+            time.sleep(2)
+        except Exception as exc:  # pragma: no cover - depends on Google API runtime
+            message = str(exc)
+            guidance = (
+                "Native linking requires an Apps Script API executable that shares the same "
+                "standard Google Cloud project as this app's OAuth client, with the Apps Script "
+                "API enabled. Reconnect Google after adding the new script scopes if needed."
+            )
+            if _should_try_managed_fallback(message):
+                fallback_result = _try_managed_runtime_fallback(message, guidance)
+                if fallback_result and fallback_result.get("ok"):
+                    return fallback_result
+                if fallback_result:
+                    last_error_result = fallback_result
+                    break
+            last_error_result = {
+                "ok": False,
+                "status": "native-link-failed",
+                "error": message,
+                "guidance": guidance,
+                "scriptId": runtime["scriptId"],
+                "deploymentId": runtime["deploymentId"],
+                "scriptUrl": runtime["scriptUrl"],
+            }
+            if webapp_failure:
+                last_error_result["webAppFailure"] = webapp_failure
+            if "Requested entity was not found" not in message or attempt == 2:
+                return last_error_result
+            time.sleep(2)
+
+    if response is None:
+        if last_error_result:
+            return last_error_result
+        fallback_result = {
             "ok": False,
             "status": "native-link-failed",
-            "error": message,
-            "guidance": guidance,
+            "error": "Unknown native-link failure.",
+            "guidance": "The Apps Script runtime could not complete native form-to-sheet linking.",
             "scriptId": runtime["scriptId"],
             "deploymentId": runtime["deploymentId"],
             "scriptUrl": runtime["scriptUrl"],
         }
-    except Exception as exc:  # pragma: no cover - depends on Google API runtime
-        message = str(exc)
-        guidance = (
-            "Native linking requires an Apps Script API executable that shares the same "
-            "standard Google Cloud project as this app's OAuth client, with the Apps Script "
-            "API enabled. Reconnect Google after adding the new script scopes if needed."
-        )
-        if _should_try_managed_fallback(message):
-            fallback_result = _try_managed_runtime_fallback(message, guidance)
-            if fallback_result and fallback_result.get("ok"):
-                return fallback_result
-            if fallback_result:
-                return fallback_result
-        return {
-            "ok": False,
-            "status": "native-link-failed",
-            "error": message,
-            "guidance": guidance,
-            "scriptId": runtime["scriptId"],
-            "deploymentId": runtime["deploymentId"],
-            "scriptUrl": runtime["scriptUrl"],
-        }
+        if webapp_failure:
+            fallback_result["webAppFailure"] = webapp_failure
+        return fallback_result
 
     if isinstance(response, dict) and response.get("error"):
         error_payload = json.dumps(response.get("error"), ensure_ascii=False)
@@ -2215,7 +2246,7 @@ def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str,
                 return fallback_result
             if fallback_result:
                 return fallback_result
-        return {
+        error_result = {
             "ok": False,
             "status": "native-link-failed",
             "error": error_payload,
@@ -2224,10 +2255,13 @@ def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str,
             "deploymentId": runtime["deploymentId"],
             "scriptUrl": runtime["scriptUrl"],
         }
+        if webapp_failure:
+            error_result["webAppFailure"] = webapp_failure
+        return error_result
 
     result = response.get("response", {}).get("result", {}) if isinstance(response, dict) else {}
     destination_id = str(result.get("destinationId", "") or "").strip()
-    return {
+    success_result = {
         "ok": destination_id == spreadsheet_id,
         "status": "linked" if destination_id == spreadsheet_id else "mismatch",
         "scriptId": runtime["scriptId"],
@@ -2238,6 +2272,9 @@ def _link_form_to_sheet_natively(form_id: str, spreadsheet_id: str) -> dict[str,
         "editUrl": str(result.get("editUrl", "") or "").strip(),
         "raw": result,
     }
+    if webapp_failure:
+        success_result["webAppFailure"] = webapp_failure
+    return success_result
 
 
 def _insert_form_images_via_apps_script(
