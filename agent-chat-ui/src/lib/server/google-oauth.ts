@@ -7,8 +7,8 @@ const DEFAULT_TOKEN_PATH = path.resolve(
   process.cwd(),
   "../.data/google-oauth.json",
 );
-const GOOGLE_OAUTH_SESSION_COOKIE_NAME = "google_oauth_session";
-const STATE_COOKIE_NAME = "google_oauth_state";
+export const GOOGLE_OAUTH_SESSION_COOKIE_NAME = "google_oauth_session";
+export const GOOGLE_OAUTH_STATE_COOKIE_NAME = "google_oauth_state";
 const SCOPES = [
   "https://www.googleapis.com/auth/forms",
   "https://www.googleapis.com/auth/forms.body",
@@ -131,7 +131,7 @@ export async function buildGoogleOauthUrl(request: Request): Promise<string> {
   const state = randomUUID();
   const cookieStore = await cookies();
 
-  cookieStore.set(STATE_COOKIE_NAME, state, {
+  cookieStore.set(GOOGLE_OAUTH_STATE_COOKIE_NAME, state, {
     httpOnly: true,
     sameSite: "lax",
     secure: redirectUri.startsWith("https://"),
@@ -158,8 +158,8 @@ export async function exchangeCodeForToken(
   state: string | null,
 ): Promise<StoredGoogleToken> {
   const cookieStore = await cookies();
-  const expectedState = cookieStore.get(STATE_COOKIE_NAME)?.value;
-  cookieStore.delete(STATE_COOKIE_NAME);
+  const expectedState = cookieStore.get(GOOGLE_OAUTH_STATE_COOKIE_NAME)?.value;
+  cookieStore.delete(GOOGLE_OAUTH_STATE_COOKIE_NAME);
 
   if (!expectedState || !state || expectedState !== state) {
     throw new Error("Invalid OAuth state. Please try connecting Google again.");
