@@ -18,6 +18,13 @@ import { useEffect, useMemo, useState } from "react";
 import { useQueryState, parseAsBoolean } from "nuqs";
 import { useArtifact } from "../artifact";
 import { ThumbsDown, ThumbsUp } from "lucide-react";
+import {
+  SpreadsheetAnalysisVisual,
+  type SpreadsheetAnalysisVisualPayload,
+} from "./spreadsheet-analysis-visual";
+
+const SPREADSHEET_ANALYSIS_VISUAL_REGEX =
+  /\n*<<<SPREADSHEET_ANALYSIS_VISUAL>>>\s*([\s\S]*?)\s*<<<END_SPREADSHEET_ANALYSIS_VISUAL>>>\s*/i;
 
 function parseTimestamp(value: unknown): number | null {
   if (typeof value !== "string" || !value) return null;
@@ -183,6 +190,26 @@ function injectSourceLinks(text: string): string {
   return result;
 }
 
+function extractSpreadsheetAnalysisVisual(
+  text: string,
+): { visibleText: string; visual: SpreadsheetAnalysisVisualPayload | null } {
+  if (!text) return { visibleText: "", visual: null };
+  const match = text.match(SPREADSHEET_ANALYSIS_VISUAL_REGEX);
+  if (!match) {
+    return { visibleText: text, visual: null };
+  }
+  const visibleText = text.replace(SPREADSHEET_ANALYSIS_VISUAL_REGEX, "\n\n").trim();
+  try {
+    const parsed = JSON.parse(match[1]) as SpreadsheetAnalysisVisualPayload;
+    if (parsed?.kind === "spreadsheet-analysis-visual" && Array.isArray(parsed?.charts)) {
+      return { visibleText, visual: parsed };
+    }
+  } catch {
+    // ignore malformed hidden payloads and fall back to plain text
+  }
+  return { visibleText, visual: null };
+}
+
 export function AssistantMessage({
   message,
   isLoading,
@@ -201,7 +228,8 @@ export function AssistantMessage({
   const content = message?.content ?? [];
   const rawContentString = getContentString(content);
   const { thinking, rest } = separateThinking(rawContentString);
-  const contentString = rest;
+  const { visibleText: contentString, visual: spreadsheetVisual } =
+    useMemo(() => extractSpreadsheetAnalysisVisual(rest), [rest]);
   const [hideToolCalls] = useQueryState(
     "hideToolCalls",
     parseAsBoolean.withDefault(false),
@@ -511,6 +539,9 @@ export function AssistantMessage({
               <div className="py-1">
                 <MarkdownText>{contentWithSources}</MarkdownText>
               </div>
+            )}
+            {spreadsheetVisual && (
+              <SpreadsheetAnalysisVisual payload={spreadsheetVisual} />
             )}
 
             {!hideToolCalls && !hasDetailsPanel && !isLoading && (

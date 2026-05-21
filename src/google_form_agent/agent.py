@@ -10,6 +10,7 @@ import html
 from httplib2.error import ServerNotFoundError
 import io
 import json
+import math
 import os
 import re
 import time
@@ -221,6 +222,8 @@ FILE_TEXT_RE = re.compile(
     r"<<<FILE_TEXT>>>\s*(?P<context>[\s\S]*?)\s*<<<END_FILE_TEXT>>>",
     re.IGNORECASE,
 )
+SPREADSHEET_ANALYSIS_VISUAL_START = "<<<SPREADSHEET_ANALYSIS_VISUAL>>>"
+SPREADSHEET_ANALYSIS_VISUAL_END = "<<<END_SPREADSHEET_ANALYSIS_VISUAL>>>"
 EMBEDDED_IMAGE_BLOCK_RE = re.compile(
     r"<<<EMBEDDED_IMAGE(?P<meta>[^>]*)>>>\s*(?P<data>[\s\S]*?)\s*<<<END_EMBEDDED_IMAGE>>>",
     re.IGNORECASE,
@@ -410,6 +413,16 @@ def looks_like_spreadsheet_analysis_request(text: str) -> bool:
         "data",
         "sheet",
         "spreadsheet",
+        "วิเคราะห์",
+        "สรุป",
+        "กราฟ",
+        "ชาร์ต",
+        "ข้อมูล",
+        "ชีต",
+        "สเปรดชีต",
+        "ดูแนวโน้ม",
+        "นับ",
+        "เปรียบเทียบ",
     )
     return any(keyword in lowered for keyword in analysis_keywords)
 
@@ -4007,6 +4020,15 @@ def _is_metadata_header(header: str) -> bool:
             "จังหวัด",
             "ผู้เข้าอบรม",
             "ผู้เข้ารับการอบรม",
+            "รุ่น",
+            "cohort",
+            "batch",
+            "class",
+            "session",
+            "คะแนน",
+            "score",
+            "result",
+            "total score",
         )
     )
 
@@ -4097,6 +4119,60 @@ def _build_normalized_analysis_rows(
     return analysis_headers, analysis_rows, summary_rows
 
 
+def _build_processed_response_table(
+    headers: list[str],
+    cleaned_rows: list[list[str]],
+) -> tuple[list[str], list[list[str]]]:
+    """Build a more useful wide processed-response sheet with derived helper columns."""
+    metadata_indices, question_indices, timestamp_index = _classify_analysis_columns(headers)
+    prefer_thai = _contains_thai(" ".join(headers[: min(len(headers), 8)]))
+
+    processed_headers: list[str] = [
+        "รหัสคำตอบ" if prefer_thai else "Response ID",
+    ]
+    if timestamp_index is not None and timestamp_index < len(headers):
+        processed_headers.append(headers[timestamp_index])
+    processed_headers.extend(
+        [
+            "จำนวนข้อที่ตอบ" if prefer_thai else "Answered Questions",
+            "อัตราการตอบ" if prefer_thai else "Completion Rate",
+        ]
+    )
+    processed_headers.extend(headers[index] for index in metadata_indices)
+    processed_headers.extend(headers[index] for index in question_indices)
+
+    total_question_count = max(len(question_indices), 1)
+    processed_rows: list[list[str]] = []
+    for row_number, row in enumerate(cleaned_rows, start=1):
+        answered_count = 0
+        question_values: list[str] = []
+        for index in question_indices:
+            value = row[index] if index < len(row) else ""
+            normalized_value = str(value or "").strip()
+            question_values.append(normalized_value)
+            if normalized_value:
+                answered_count += 1
+
+        completion_rate = round((answered_count / total_question_count) * 100, 1)
+        processed_row: list[str] = [str(row_number)]
+        if timestamp_index is not None and timestamp_index < len(headers):
+            processed_row.append(row[timestamp_index] if timestamp_index < len(row) else "")
+        processed_row.extend(
+            [
+                str(answered_count),
+                f"{completion_rate:.1f}%",
+            ]
+        )
+        processed_row.extend(
+            row[index] if index < len(row) else ""
+            for index in metadata_indices
+        )
+        processed_row.extend(question_values)
+        processed_rows.append(processed_row)
+
+    return processed_headers, processed_rows
+
+
 def _ensure_sheet_exists(
     service: Any,
     spreadsheet_id: str,
@@ -4161,23 +4237,19 @@ def _initialize_empty_postprocess_tabs(
     output_sheet_name: str,
 ) -> dict[str, Any]:
     """Create ready-to-use analysis tabs even when the linked response sheet is still empty."""
+    prefer_thai = _contains_thai(source_title or spreadsheet_title)
     processed_sheet_name, detail_sheet_name, summary_sheet_name = _derive_postprocess_sheet_names(
         source_title or spreadsheet_title,
         [],
         output_sheet_name,
     )
     _ensure_sheet_exists(service, spreadsheet_id, processed_sheet_name, existing_sheets)
-    _ensure_sheet_exists(service, spreadsheet_id, detail_sheet_name, existing_sheets)
+    _delete_sheet_if_exists(service, spreadsheet_id, detail_sheet_name, existing_sheets)
     _ensure_sheet_exists(service, spreadsheet_id, summary_sheet_name, existing_sheets)
 
     service.spreadsheets().values().clear(
         spreadsheetId=spreadsheet_id,
         range=_quote_sheet_title(processed_sheet_name),
-        body={},
-    ).execute()
-    service.spreadsheets().values().clear(
-        spreadsheetId=spreadsheet_id,
-        range=_quote_sheet_title(detail_sheet_name),
         body={},
     ).execute()
     service.spreadsheets().values().clear(
@@ -4188,29 +4260,19 @@ def _initialize_empty_postprocess_tabs(
 
     waiting_message = (
         "ยังไม่มีคำตอบในฟอร์ม ชีตนี้จะถูกเติมข้อมูลหลังมีการส่งคำตอบครั้งแรก"
-        if _contains_thai(source_title or spreadsheet_title)
+        if prefer_thai
         else "No form responses yet. This sheet will populate after the first submission."
+    )
+    processed_headers = (
+        ["รหัสคำตอบ", "จำนวนข้อที่ตอบ", "อัตราการตอบ"]
+        if prefer_thai
+        else ["Response ID", "Answered Questions", "Completion Rate"]
     )
     service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
         range=f"{_quote_sheet_title(processed_sheet_name)}!A1",
         valueInputOption="RAW",
-        body={"values": [[waiting_message]]},
-    ).execute()
-    service.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=f"{_quote_sheet_title(detail_sheet_name)}!A1",
-        valueInputOption="RAW",
-        body={
-            "values": [[
-                "Response ID",
-                "Timestamp",
-                "Question",
-                "Answer",
-                "Answer Type",
-                "Answer Length",
-            ]]
-        },
+        body={"values": [processed_headers, [waiting_message, "", ""]]},
     ).execute()
     service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
@@ -4226,15 +4288,16 @@ def _initialize_empty_postprocess_tabs(
         "spreadsheetTitle": spreadsheet_title,
         "sourceSheet": source_title,
         "outputSheet": processed_sheet_name,
-        "detailSheet": detail_sheet_name,
+        "detailSheet": "",
         "summarySheet": summary_sheet_name,
         "headerRowIndex": 0,
         "columnCount": 0,
         "rowCountWritten": 0,
-        "detailColumnCount": 6,
+        "detailColumnCount": 0,
         "detailRowCountWritten": 0,
         "questionSummaryRowCount": 0,
         "rawHeaders": [],
+        "processedHeaders": processed_headers,
         "analysisHeaders": [
             "Response ID",
             "Timestamp",
@@ -4245,6 +4308,35 @@ def _initialize_empty_postprocess_tabs(
         ],
         "note": waiting_message,
     }
+
+
+def _delete_sheet_if_exists(
+    service: Any,
+    spreadsheet_id: str,
+    sheet_title: str,
+    existing_sheets: list[dict[str, Any]],
+) -> None:
+    """Delete the destination sheet when it already exists."""
+    for sheet in existing_sheets:
+        properties = sheet.get("properties", {}) if isinstance(sheet, dict) else {}
+        if str(properties.get("title", "") or "") != sheet_title:
+            continue
+        sheet_id = properties.get("sheetId")
+        if sheet_id is None:
+            return
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "deleteSheet": {
+                            "sheetId": int(sheet_id),
+                        }
+                    }
+                ]
+            },
+        ).execute()
+        return
 
 
 def _generate_missing_questions(
@@ -4930,6 +5022,10 @@ def format_response_sheet_for_analysis(
         headers,
         cleaned_rows,
     )
+    processed_headers, processed_rows = _build_processed_response_table(
+        headers,
+        cleaned_rows,
+    )
 
     processed_sheet_name, detail_sheet_name, summary_sheet_name = _derive_postprocess_sheet_names(
         source_title,
@@ -4937,19 +5033,13 @@ def format_response_sheet_for_analysis(
         output_sheet_name,
     )
     _ensure_sheet_exists(service, spreadsheet_id_value, processed_sheet_name, sheets)
-    _ensure_sheet_exists(service, spreadsheet_id_value, detail_sheet_name, sheets)
+    _delete_sheet_if_exists(service, spreadsheet_id_value, detail_sheet_name, sheets)
     _ensure_sheet_exists(service, spreadsheet_id_value, summary_sheet_name, sheets)
     processed_range = f"{_quote_sheet_title(processed_sheet_name)}!A1"
-    detail_range = f"{_quote_sheet_title(detail_sheet_name)}!A1"
     summary_range = f"{_quote_sheet_title(summary_sheet_name)}!A1"
     service.spreadsheets().values().clear(
         spreadsheetId=spreadsheet_id_value,
         range=_quote_sheet_title(processed_sheet_name),
-        body={},
-    ).execute()
-    service.spreadsheets().values().clear(
-        spreadsheetId=spreadsheet_id_value,
-        range=_quote_sheet_title(detail_sheet_name),
         body={},
     ).execute()
     service.spreadsheets().values().clear(
@@ -4961,13 +5051,7 @@ def format_response_sheet_for_analysis(
         spreadsheetId=spreadsheet_id_value,
         range=processed_range,
         valueInputOption="RAW",
-        body={"values": [headers, *cleaned_rows]},
-    ).execute()
-    service.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id_value,
-        range=detail_range,
-        valueInputOption="RAW",
-        body={"values": [analysis_headers, *analysis_rows]},
+        body={"values": [processed_headers, *processed_rows]},
     ).execute()
     service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id_value,
@@ -4987,19 +5071,20 @@ def format_response_sheet_for_analysis(
             "spreadsheetTitle": spreadsheet_title,
             "sourceSheet": source_title,
             "outputSheet": processed_sheet_name,
-            "detailSheet": detail_sheet_name,
+            "detailSheet": "",
             "summarySheet": summary_sheet_name,
             "headerRowIndex": header_row_index + 1,
-            "columnCount": len(headers),
-            "rowCountWritten": len(cleaned_rows),
-            "detailColumnCount": len(analysis_headers),
-            "detailRowCountWritten": len(analysis_rows),
+            "columnCount": len(processed_headers),
+            "rowCountWritten": len(processed_rows),
+            "detailColumnCount": 0,
+            "detailRowCountWritten": 0,
             "questionSummaryRowCount": len(summary_rows),
             "rawHeaders": headers,
+            "processedHeaders": processed_headers,
             "analysisHeaders": analysis_headers,
             "note": (
-                "The raw response data was cleaned into a wide processed-response sheet, "
-                "with an additional long-form detail sheet and a separate question summary sheet."
+                "The raw response data was transformed into a wide processed-response sheet with helper columns, "
+                "plus a separate question summary sheet."
             ),
         },
         ensure_ascii=False,
@@ -5066,6 +5151,1455 @@ def _postprocess_newly_linked_response_sheet(
         "error": last_error or "Unknown response-sheet post-processing failure.",
         "attempts": max(1, retries),
     }
+
+
+def _coerce_summary_count(value: Any) -> int:
+    text = str(value or "").strip().replace(",", "")
+    if not text:
+        return 0
+    try:
+        return int(float(text))
+    except ValueError:
+        return 0
+
+
+def _coerce_summary_percent(value: Any) -> float:
+    text = str(value or "").strip().replace("%", "").replace(",", "")
+    if not text:
+        return 0.0
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def _load_summary_rows_from_sheet(
+    service: Any,
+    spreadsheet_id: str,
+    summary_sheet_name: str,
+) -> list[list[str]]:
+    values = (
+        service.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            range=_quote_sheet_title(summary_sheet_name),
+        )
+        .execute()
+        .get("values", [])
+    )
+    if not values or len(values) <= 1:
+        return []
+
+    rows: list[list[str]] = []
+    for row in values[1:]:
+        padded = [str(cell or "").strip() for cell in row[:4]]
+        while len(padded) < 4:
+            padded.append("")
+        if not padded[0] or not padded[1]:
+            continue
+        rows.append(padded[:4])
+    return rows
+
+
+def _load_processed_sheet_table(
+    service: Any,
+    spreadsheet_id: str,
+    processed_sheet_name: str,
+) -> tuple[list[str], list[list[str]]]:
+    values = (
+        service.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            range=_quote_sheet_title(processed_sheet_name),
+        )
+        .execute()
+        .get("values", [])
+    )
+    if not values:
+        return [], []
+    headers = [str(cell or "").strip() for cell in values[0]]
+    rows: list[list[str]] = []
+    width = len(headers)
+    for row in values[1:]:
+        normalized = [str(cell or "").strip() for cell in row[:width]]
+        if len(normalized) < width:
+            normalized.extend([""] * (width - len(normalized)))
+        if _is_effectively_blank_row(normalized):
+            continue
+        rows.append(normalized)
+    return headers, rows
+
+
+def _fallback_chart_type_for_question(points: list[dict[str, Any]]) -> str:
+    unique_answers = len(points)
+    if unique_answers <= 1:
+        return "bar"
+    total = sum(int(point.get("value", 0) or 0) for point in points)
+    top_share = (
+        max((int(point.get("value", 0) or 0) for point in points), default=0) / total
+        if total > 0
+        else 0.0
+    )
+    average_label_length = (
+        sum(len(str(point.get("label", "") or "")) for point in points) / unique_answers
+        if unique_answers
+        else 0.0
+    )
+    if unique_answers <= 4 and average_label_length <= 28 and top_share <= 0.9:
+        return "pie"
+    return "bar"
+
+
+def _fallback_chart_reason(chart_type: str, points: list[dict[str, Any]]) -> str:
+    unique_answers = len(points)
+    if chart_type == "pie":
+        return (
+            f"Used a pie chart because this question has {unique_answers} compact categories with a part-to-whole breakdown."
+        )
+    return (
+        f"Used a bar chart because this question has {unique_answers} answer categories or labels that are easier to compare on an axis."
+    )
+
+
+def _question_looks_like_low_value_dashboard_topic(question: str) -> bool:
+    lowered = question.strip().casefold()
+    return any(
+        marker in lowered
+        for marker in (
+            "ชื่อ",
+            "อีเมล",
+            "เบอร์โทร",
+            "หน่วยงาน",
+            "timestamp",
+            "ประทับเวลา",
+            "ข้อใดต่อไปนี้ถูกต้อง",
+            "ข้อใดไม่ใช่",
+            "ตัวอย่าง",
+            "คืออะไร",
+            "what is",
+            "which of the following",
+        )
+    )
+
+
+def _metadata_header_is_segmentable(header: str) -> bool:
+    lowered = header.strip().casefold()
+    if not lowered:
+        return False
+    blocked_markers = (
+        "ชื่อ",
+        "name",
+        "อีเมล",
+        "email",
+        "เบอร์",
+        "phone",
+        "โทร",
+        "timestamp",
+        "ประทับเวลา",
+    )
+    if any(marker in lowered for marker in blocked_markers):
+        return False
+    allowed_markers = (
+        "หน่วยงาน",
+        "department",
+        "organization",
+        "agency",
+        "position",
+        "ตำแหน่ง",
+        "province",
+        "จังหวัด",
+        "school",
+        "unit",
+        "role",
+        "group",
+        "สถานศึกษา",
+    )
+    return any(marker in lowered for marker in allowed_markers)
+
+
+def _request_prefers_raw_question_charts(analysis_request: str) -> bool:
+    lowered = str(analysis_request or "").strip().casefold()
+    return any(
+        marker in lowered
+        for marker in (
+            "per question",
+            "each question",
+            "question by question",
+            "รายข้อ",
+            "ทีละข้อ",
+            "แต่ละข้อ",
+            "plot each question",
+        )
+    )
+
+
+def _compute_answer_distribution_entropy(points: list[dict[str, Any]]) -> float:
+    total = sum(max(int(point.get("value", 0) or 0), 0) for point in points)
+    if total <= 0:
+        return 0.0
+    entropy = 0.0
+    for point in points:
+        value = max(int(point.get("value", 0) or 0), 0)
+        if value <= 0:
+            continue
+        probability = value / total
+        entropy -= probability * math.log2(probability)
+    return entropy
+
+
+def _choose_chart_specs_with_ai(
+    grouped_questions: list[dict[str, Any]],
+    analysis_request: str,
+) -> list[dict[str, Any]]:
+    if not grouped_questions:
+        return []
+
+    analysis_brief = analysis_request.strip().casefold()
+    request_mentions_compare = any(
+        keyword in analysis_brief
+        for keyword in ("compare", "comparison", "เปรียบเทียบ", "เทียบ", "difference")
+    )
+    request_mentions_share = any(
+        keyword in analysis_brief
+        for keyword in ("share", "distribution", "percent", "สัดส่วน", "กระจาย", "เปอร์เซ็นต์")
+    )
+
+    scored_specs: list[dict[str, Any]] = []
+    for item in grouped_questions:
+        question = str(item.get("question", "") or "").strip()
+        points = list(item.get("points", []))
+        if not question or not points:
+            continue
+
+        unique_answers = len(points)
+        total_answers = max(int(item.get("totalAnswers", 0) or 0), 0)
+        dominant_share_percent = float(item.get("dominantSharePercent", 0.0) or 0.0)
+        entropy = _compute_answer_distribution_entropy(points)
+        long_label_count = sum(
+            1 for point in points if len(str(point.get("label", "") or "")) > 40
+        )
+        average_label_length = (
+            sum(len(str(point.get("label", "") or "")) for point in points) / unique_answers
+            if unique_answers
+            else 0.0
+        )
+        non_trivial_answers = sum(
+            1 for point in points if float(point.get("percent", 0.0) or 0.0) >= 5.0
+        )
+
+        score = 0.0
+        score += min(total_answers / 25.0, 6.0)
+        score += min(entropy * 2.2, 6.0)
+        score += min(non_trivial_answers * 0.8, 4.0)
+        score += 2.0 if 2 <= unique_answers <= 7 else 0.0
+        score -= 4.0 if dominant_share_percent >= 95.0 else 0.0
+        score -= 2.0 if dominant_share_percent >= 88.0 else 0.0
+        score -= 2.0 if unique_answers > 12 else 0.0
+        score -= min(long_label_count * 0.4, 2.0)
+        if request_mentions_compare:
+            score += 1.0
+        if request_mentions_share and unique_answers <= 6:
+            score += 0.7
+
+        hard_skip_reason = ""
+        if _question_looks_like_low_value_dashboard_topic(question):
+            hard_skip_reason = (
+                "Skipped this topic because it looks like an administrative or fact-recall question that is not useful for the first-pass dashboard."
+            )
+        elif non_trivial_answers <= 1:
+            hard_skip_reason = (
+                "Skipped this topic because nearly all responses collapse into one answer, so the chart would not add useful contrast."
+            )
+        elif unique_answers == 2 and dominant_share_percent >= 75.0:
+            hard_skip_reason = (
+                "Skipped this topic because the binary split is too one-sided to be informative in the first-pass dashboard."
+            )
+        elif unique_answers <= 4 and dominant_share_percent >= 85.0 and entropy < 0.85:
+            hard_skip_reason = (
+                "Skipped this topic because one answer dominates the distribution too strongly for a meaningful chart."
+            )
+        elif unique_answers > 10:
+            hard_skip_reason = (
+                "Skipped this topic because it has too many answer categories for a compact first-pass chart."
+            )
+        elif average_label_length > 48 and unique_answers >= 5:
+            hard_skip_reason = (
+                "Skipped this topic because the answer labels are too long for a compact comparison chart."
+            )
+
+        chart_type = _fallback_chart_type_for_question(points)
+        if chart_type == "pie" and request_mentions_compare:
+            chart_type = "bar"
+        if unique_answers > 6 or average_label_length > 28 or long_label_count > 0:
+            chart_type = "bar"
+        elif (
+            request_mentions_share
+            and 2 <= unique_answers <= 5
+            and dominant_share_percent < 90.0
+            and average_label_length <= 24
+        ):
+            chart_type = "pie"
+
+        if hard_skip_reason:
+            chart_type = "none"
+        elif score < 3.8:
+            chart_type = "none"
+
+        if chart_type == "none":
+            reason = hard_skip_reason or (
+                "Skipped this topic because the answers are too one-sided or not distinct enough to add value in the first-pass dashboard."
+            )
+        elif chart_type == "pie":
+            reason = (
+                f"Used a pie chart because this topic has {unique_answers} compact categories and is best read as a part-to-whole split."
+            )
+        else:
+            reason = (
+                f"Used a bar chart because this topic has {unique_answers} answer categories and the comparison is clearer on a shared axis."
+            )
+
+        scored_specs.append(
+            {
+                "question": question,
+                "chartType": chart_type,
+                "reason": reason,
+                "showPriority": 0,
+                "score": score,
+            }
+        )
+
+    if not scored_specs:
+        return []
+
+    visible_specs = sorted(
+        (spec for spec in scored_specs if spec["chartType"] != "none"),
+        key=lambda spec: (-float(spec["score"]), str(spec["question"]).casefold()),
+    )[:4]
+    if not visible_specs:
+        visible_specs = sorted(
+            scored_specs,
+            key=lambda spec: (-float(spec["score"]), str(spec["question"]).casefold()),
+        )[:2]
+
+    for index, spec in enumerate(visible_specs, start=1):
+        spec["showPriority"] = index
+
+    return [
+        {
+            "question": str(spec["question"]),
+            "chartType": str(spec["chartType"]),
+            "reason": str(spec["reason"]),
+            "showPriority": int(spec["showPriority"]),
+        }
+        for spec in visible_specs
+    ]
+
+
+def _truncate_dashboard_label(label: str, max_length: int = 44) -> str:
+    normalized = " ".join(str(label or "").split())
+    if len(normalized) <= max_length:
+        return normalized
+    return f"{normalized[: max_length - 1].rstrip()}…"
+
+
+_DOMAIN_SEED_GROUPS = (
+    {
+        "slug": "ai",
+        "display": "AI",
+        "keywords": (" ai ", "ปัญญาประดิษฐ์", "เอไอ", "machine learning", "artificial intelligence"),
+    },
+    {
+        "slug": "lora",
+        "display": "LoRa",
+        "keywords": ("lora",),
+    },
+    {
+        "slug": "iot",
+        "display": "IoT",
+        "keywords": ("iot", "internet of things"),
+    },
+    {
+        "slug": "kidbright",
+        "display": "KidBright",
+        "keywords": ("kidbright",),
+    },
+    {
+        "slug": "platform",
+        "display": "Platform",
+        "keywords": ("platform", "แพลตฟอร์ม"),
+    },
+    {
+        "slug": "network",
+        "display": "Network",
+        "keywords": ("network", "เครือข่าย", "wifi", "wi-fi", "router", "networking"),
+    },
+    {
+        "slug": "programming",
+        "display": "Programming",
+        "keywords": ("program", "coding", "code", "เขียนโปรแกรม", "โปรแกรมมิง"),
+    },
+    {
+        "slug": "data",
+        "display": "Data",
+        "keywords": ("data", "ข้อมูล", "dataset"),
+    },
+    {
+        "slug": "sensor",
+        "display": "Sensors",
+        "keywords": ("sensor", "เซนเซอร์"),
+    },
+)
+
+_DOMAIN_TOKEN_STOPWORDS = {
+    "what",
+    "which",
+    "following",
+    "question",
+    "questions",
+    "answer",
+    "answers",
+    "choose",
+    "example",
+    "examples",
+    "system",
+    "platform",
+    "process",
+    "incorrect",
+    "correct",
+    "benefit",
+    "benefits",
+    "topic",
+    "topics",
+    "about",
+    "using",
+    "use",
+    "with",
+    "from",
+    "that",
+    "this",
+    "คือ",
+    "ข้อใด",
+    "ตัวอย่าง",
+    "ระบบ",
+    "ข้อมูล",
+}
+
+
+def _extract_question_domain_labels(
+    question: str,
+    repeated_token_labels: dict[str, str],
+) -> list[str]:
+    normalized = f" {str(question or '').strip().casefold()} "
+    labels: list[str] = []
+    for seed in _DOMAIN_SEED_GROUPS:
+        if any(keyword in normalized for keyword in seed["keywords"]):
+            labels.append(str(seed["display"]))
+    for token, display in repeated_token_labels.items():
+        if f" {token} " in normalized or token in normalized:
+            labels.append(display)
+    deduped: list[str] = []
+    for label in labels:
+        if label not in deduped:
+            deduped.append(label)
+    return deduped
+
+
+def _infer_repeated_domain_tokens(grouped_questions: list[dict[str, Any]]) -> dict[str, str]:
+    token_examples: dict[str, str] = {}
+    token_counts: dict[str, int] = {}
+    for item in grouped_questions:
+        question = str(item.get("question", "") or "")
+        seen_tokens: set[str] = set()
+        for raw_token in re.findall(r"[A-Za-z][A-Za-z0-9\-]{1,24}", question):
+            token = raw_token.casefold()
+            if token in _DOMAIN_TOKEN_STOPWORDS or len(token) < 2:
+                continue
+            seen_tokens.add(token)
+            token_examples.setdefault(token, raw_token)
+        for token in seen_tokens:
+            token_counts[token] = token_counts.get(token, 0) + 1
+
+    repeated: dict[str, str] = {}
+    seeded_labels = {
+        str(seed["display"]).casefold()
+        for seed in _DOMAIN_SEED_GROUPS
+    }
+    for token, count in token_counts.items():
+        if count < 2:
+            continue
+        display = str(token_examples.get(token, token))
+        if display.casefold() in seeded_labels:
+            continue
+        repeated[token] = display
+    return repeated
+
+
+def _build_domain_specific_topics(
+    grouped_questions: list[dict[str, Any]],
+    existing_titles: set[str],
+    *,
+    prefer_thai: bool,
+) -> list[dict[str, Any]]:
+    if not grouped_questions:
+        return []
+
+    repeated_token_labels = _infer_repeated_domain_tokens(grouped_questions)
+    domain_members: dict[str, list[dict[str, Any]]] = {}
+    for item in grouped_questions:
+        question = str(item.get("question", "") or "").strip()
+        if not question:
+            continue
+        for label in _extract_question_domain_labels(question, repeated_token_labels):
+            domain_members.setdefault(label, []).append(item)
+
+    candidates: list[dict[str, Any]] = []
+    for label, members in domain_members.items():
+        if len(members) < 2:
+            continue
+        disagreement_values = [
+            max(0.0, 100.0 - float(member.get("dominantSharePercent", 0.0) or 0.0))
+            for member in members
+        ]
+        if not disagreement_values:
+            continue
+        average_disagreement = sum(disagreement_values) / len(disagreement_values)
+        average_consensus = sum(
+            float(member.get("dominantSharePercent", 0.0) or 0.0)
+            for member in members
+        ) / len(members)
+        if average_disagreement >= 18.0:
+            metric = "disagreement"
+            ordered_members = sorted(
+                members,
+                key=lambda member: (
+                    -(100.0 - float(member.get("dominantSharePercent", 0.0) or 0.0)),
+                    -float(member.get("totalAnswers", 0) or 0),
+                    str(member.get("question", "")).casefold(),
+                ),
+            )[:5]
+            title = (
+                f"ประเด็นด้าน {label} ที่ยังสับสน"
+                if prefer_thai
+                else f"{label} topics with the most confusion"
+            )
+            summary = (
+                f"คำถามในกลุ่ม {label} ยังมีคำตอบกระจายหลายจุด โดยประเด็นที่สับสนที่สุดอยู่ทางขวาของกราฟ เหมาะสำหรับใช้หาจุดที่ควรอธิบายเพิ่ม"
+                if prefer_thai
+                else f"This view isolates the {label}-related questions where answers are still most split, highlighting where explanation or reteaching is likely needed."
+            )
+        else:
+            metric = "consensus"
+            ordered_members = sorted(
+                members,
+                key=lambda member: (
+                    -float(member.get("dominantSharePercent", 0.0) or 0.0),
+                    float(_compute_answer_distribution_entropy(member.get("points", []))),
+                    -float(member.get("totalAnswers", 0) or 0),
+                    str(member.get("question", "")).casefold(),
+                ),
+            )[:5]
+            title = (
+                f"ประเด็นด้าน {label} ที่เข้าใจตรงกันมากที่สุด"
+                if prefer_thai
+                else f"{label} topics with the strongest agreement"
+            )
+            summary = (
+                f"คำถามในกลุ่ม {label} มีแนวโน้มตอบไปในทิศทางเดียวกันมากกว่าเรื่องอื่น จึงใช้ดูว่าเนื้อหาส่วนใดผู้ตอบเข้าใจร่วมกันแล้ว"
+                if prefer_thai
+                else f"This view focuses on the {label}-related questions with the strongest agreement, showing which parts of that domain already look well understood."
+            )
+
+        if title in existing_titles:
+            continue
+
+        series = []
+        for member in ordered_members:
+            dominant_share = float(member.get("dominantSharePercent", 0.0) or 0.0)
+            value = max(0.0, 100.0 - dominant_share) if metric == "disagreement" else dominant_share
+            series.append(
+                {
+                    "label": _truncate_dashboard_label(str(member.get("question", "") or ""), 56),
+                    "value": round(value, 2),
+                    "percent": round(value, 2),
+                }
+            )
+        if len(series) < 2:
+            continue
+
+        candidates.append(
+            {
+                "id": f"derived-domain-{re.sub(r'[^a-z0-9]+', '-', label.casefold()).strip('-') or 'topic'}",
+                "title": title,
+                "chartType": "bar",
+                "total": len(members),
+                "series": series,
+                "summary": summary,
+                "_priority": (
+                    len(members),
+                    average_disagreement if metric == "disagreement" else average_consensus,
+                ),
+            }
+        )
+
+    ranked = sorted(
+        candidates,
+        key=lambda item: (
+            -int(item["_priority"][0]),
+            -float(item["_priority"][1]),
+            str(item.get("title", "")).casefold(),
+        ),
+    )[:2]
+    for item in ranked:
+        item.pop("_priority", None)
+        existing_titles.add(str(item.get("title", "") or "").strip())
+    return ranked
+
+
+def _build_synthetic_dashboard_topics(
+    grouped_questions: list[dict[str, Any]],
+    existing_titles: set[str],
+    *,
+    prefer_thai: bool,
+) -> list[dict[str, Any]]:
+    if not grouped_questions:
+        return []
+
+    disagreement_points: list[dict[str, Any]] = []
+    consensus_points: list[dict[str, Any]] = []
+    for item in grouped_questions:
+        question = str(item.get("question", "") or "").strip()
+        if not question:
+            continue
+        total_answers = max(int(item.get("totalAnswers", 0) or 0), 0)
+        dominant_share = float(item.get("dominantSharePercent", 0.0) or 0.0)
+        entropy = _compute_answer_distribution_entropy(item.get("points", []))
+        disagreement = round(max(0.0, 100.0 - dominant_share), 2)
+        if disagreement >= 8.0:
+            disagreement_points.append(
+                {
+                    "label": _truncate_dashboard_label(question),
+                    "value": disagreement,
+                    "percent": disagreement,
+                    "_sort_entropy": entropy,
+                    "_sort_total": total_answers,
+                }
+            )
+        consensus_points.append(
+            {
+                "label": _truncate_dashboard_label(question),
+                "value": round(dominant_share, 2),
+                "percent": round(dominant_share, 2),
+                "_sort_entropy": entropy,
+                "_sort_total": total_answers,
+            }
+        )
+
+    synthetic_charts: list[dict[str, Any]] = []
+    disagreement_title = (
+        "คำถามที่คำตอบแตกมากที่สุด"
+        if prefer_thai
+        else "Most split questions"
+    )
+    if (
+        disagreement_title not in existing_titles
+        and len(disagreement_points) >= 2
+    ):
+        top_disagreement = sorted(
+            disagreement_points,
+            key=lambda point: (
+                -float(point["value"]),
+                -float(point["_sort_entropy"]),
+                -int(point["_sort_total"]),
+                str(point["label"]).casefold(),
+            ),
+        )[:5]
+        synthetic_charts.append(
+            {
+                "id": "derived-most-split",
+                "title": disagreement_title,
+                "chartType": "bar",
+                "total": len(top_disagreement),
+                "series": [
+                    {
+                        "label": point["label"],
+                        "value": point["value"],
+                        "percent": point["percent"],
+                    }
+                    for point in top_disagreement
+                ],
+                "reason": (
+                    "หัวข้อนี้ถูกสร้างขึ้นเพื่อเน้นคำถามที่มีความเห็นกระจายมากที่สุด เมื่อคำถามรายข้อเดี่ยว ๆ ยังไม่เด่นพอสำหรับแดชบอร์ดรอบแรก"
+                    if prefer_thai
+                    else "This derived topic highlights the questions with the widest spread of answers when individual question charts are not strong enough for the first-pass dashboard."
+                ),
+            }
+        )
+        existing_titles.add(disagreement_title)
+
+    consensus_title = (
+        "คำถามที่คำตอบไปในทิศทางเดียวกันมากที่สุด"
+        if prefer_thai
+        else "Strongest consensus questions"
+    )
+    if consensus_title not in existing_titles and len(consensus_points) >= 2:
+        top_consensus = sorted(
+            consensus_points,
+            key=lambda point: (
+                -float(point["value"]),
+                float(point["_sort_entropy"]),
+                -int(point["_sort_total"]),
+                str(point["label"]).casefold(),
+            ),
+        )[:5]
+        synthetic_charts.append(
+            {
+                "id": "derived-strongest-consensus",
+                "title": consensus_title,
+                "chartType": "bar",
+                "total": len(top_consensus),
+                "series": [
+                    {
+                        "label": point["label"],
+                        "value": point["value"],
+                        "percent": point["percent"],
+                    }
+                    for point in top_consensus
+                ],
+                "reason": (
+                    "หัวข้อนี้ถูกสร้างขึ้นเพื่อสรุปว่าคำถามใดมีฉันทามติสูงที่สุด ซึ่งช่วยให้เห็นภาพรวมของประเด็นที่ผู้ตอบเห็นตรงกัน"
+                    if prefer_thai
+                    else "This derived topic summarizes which questions reached the strongest consensus, giving a compact overview of where respondents aligned most clearly."
+                ),
+            }
+        )
+        existing_titles.add(consensus_title)
+
+    return synthetic_charts
+
+
+def _build_segment_composition_topic(
+    processed_headers: list[str],
+    processed_rows: list[list[str]],
+    existing_titles: set[str],
+    *,
+    prefer_thai: bool,
+) -> dict[str, Any] | None:
+    if not processed_headers or not processed_rows:
+        return None
+
+    best_candidate: dict[str, Any] | None = None
+    for index, header in enumerate(processed_headers):
+        if not _metadata_header_is_segmentable(header):
+            continue
+        counts: dict[str, int] = {}
+        for row in processed_rows:
+            if index >= len(row):
+                continue
+            value = str(row[index] or "").strip()
+            if not value:
+                continue
+            counts[value] = counts.get(value, 0) + 1
+        unique_values = len(counts)
+        if unique_values < 2 or unique_values > 6:
+            continue
+        total = sum(counts.values())
+        if total <= 0:
+            continue
+        entropy = _compute_answer_distribution_entropy(
+            [{"label": key, "value": value} for key, value in counts.items()]
+        )
+        score = entropy + min(total / 25.0, 3.0)
+        candidate = {
+            "header": header,
+            "counts": counts,
+            "score": score,
+            "total": total,
+        }
+        if best_candidate is None or float(candidate["score"]) > float(best_candidate["score"]):
+            best_candidate = candidate
+
+    if best_candidate is None:
+        return None
+
+    title = (
+        f"สัดส่วนผู้ตอบตาม{best_candidate['header']}"
+        if prefer_thai
+        else f"Respondent composition by {best_candidate['header']}"
+    )
+    if title in existing_titles:
+        return None
+    sorted_points = sorted(
+        best_candidate["counts"].items(),
+        key=lambda item: (-item[1], str(item[0]).casefold()),
+    )[:6]
+    total = int(best_candidate["total"])
+    return {
+        "id": "derived-respondent-composition",
+        "title": title,
+        "chartType": "bar",
+        "total": total,
+        "series": [
+            {
+                "label": _truncate_dashboard_label(label),
+                "value": count,
+                "percent": round((count / total) * 100, 2) if total else 0.0,
+            }
+            for label, count in sorted_points
+        ],
+        "reason": (
+            f"หัวข้อนี้ถูกสร้างขึ้นเพื่อให้เห็นโครงสร้างผู้ตอบตาม{best_candidate['header']} ซึ่งช่วยตีความผลคำตอบในภาพรวมได้ลึกขึ้น"
+            if prefer_thai
+            else f"This derived topic shows respondent composition by {best_candidate['header']}, adding segment context for the rest of the analysis."
+        ),
+    }
+
+
+def _build_overall_question_agreement_topic(
+    grouped_questions: list[dict[str, Any]],
+    existing_titles: set[str],
+    *,
+    prefer_thai: bool,
+) -> dict[str, Any] | None:
+    if not grouped_questions:
+        return None
+
+    title = (
+        "ภาพรวมระดับความเห็นตรงกันของคำถาม"
+        if prefer_thai
+        else "Overall question agreement profile"
+    )
+    if title in existing_titles:
+        return None
+
+    buckets = [
+        {
+            "label": "เห็นตรงกันสูง" if prefer_thai else "High consensus",
+            "min": 80.0,
+            "max": 101.0,
+        },
+        {
+            "label": "เห็นตรงกันปานกลาง" if prefer_thai else "Moderate consensus",
+            "min": 60.0,
+            "max": 80.0,
+        },
+        {
+            "label": "คำตอบค่อนข้างแตก" if prefer_thai else "Mixed responses",
+            "min": 0.0,
+            "max": 60.0,
+        },
+    ]
+    counts = {bucket["label"]: 0 for bucket in buckets}
+    total_questions = 0
+    for item in grouped_questions:
+        total_answers = max(int(item.get("totalAnswers", 0) or 0), 0)
+        if total_answers <= 0:
+            continue
+        total_questions += 1
+        dominant_share = float(item.get("dominantSharePercent", 0.0) or 0.0)
+        for bucket in buckets:
+            if bucket["min"] <= dominant_share < bucket["max"]:
+                counts[bucket["label"]] += 1
+                break
+
+    if total_questions < 2:
+        return None
+
+    series = [
+        {
+            "label": bucket["label"],
+            "value": counts[bucket["label"]],
+            "percent": round((counts[bucket["label"]] / total_questions) * 100, 2),
+        }
+        for bucket in buckets
+        if counts[bucket["label"]] > 0
+    ]
+    if len(series) < 2:
+        return None
+
+    return {
+        "id": "derived-overall-agreement-profile",
+        "title": title,
+        "chartType": "bar",
+        "total": total_questions,
+        "series": series,
+        "reason": (
+            "กราฟนี้สรุปภาพรวมว่าคำถามส่วนใหญ่มีระดับความเห็นตรงกันมากน้อยเพียงใด เพื่อให้เห็นโครงสร้างของผลลัพธ์ทั้งชุดในมุมเดียว"
+            if prefer_thai
+            else "This chart summarizes how the questions distribute across high-consensus, moderate-consensus, and mixed-response patterns, so the full result set can be read at a glance."
+        ),
+    }
+
+
+def _build_score_distribution_topic(
+    processed_headers: list[str],
+    processed_rows: list[list[str]],
+    existing_titles: set[str],
+    *,
+    prefer_thai: bool,
+) -> dict[str, Any] | None:
+    if not processed_headers or not processed_rows:
+        return None
+
+    score_index: int | None = None
+    for index, header in enumerate(processed_headers):
+        lowered = header.strip().casefold()
+        if "score" in lowered or "คะแนน" in lowered:
+            score_index = index
+            break
+    if score_index is None:
+        return None
+
+    counts: dict[str, int] = {}
+    numeric_values: list[float] = []
+    for row in processed_rows:
+        if score_index >= len(row):
+            continue
+        raw_value = str(row[score_index] or "").strip()
+        if not raw_value:
+            continue
+        try:
+            numeric_value = float(raw_value)
+        except ValueError:
+            continue
+        numeric_values.append(numeric_value)
+        label = str(int(numeric_value)) if numeric_value.is_integer() else f"{numeric_value:.1f}"
+        counts[label] = counts.get(label, 0) + 1
+
+    if len(numeric_values) < 3 or len(counts) < 2:
+        return None
+
+    title = "การกระจายคะแนนรวม" if prefer_thai else "Overall score distribution"
+    if title in existing_titles:
+        return None
+    total = len(numeric_values)
+    sorted_points = sorted(
+        counts.items(),
+        key=lambda item: float(item[0]),
+    )[:12]
+    return {
+        "id": "derived-score-distribution",
+        "title": title,
+        "chartType": "bar",
+        "total": total,
+        "series": [
+            {
+                "label": label,
+                "value": count,
+                "percent": round((count / total) * 100, 2) if total else 0.0,
+            }
+            for label, count in sorted_points
+        ],
+        "reason": (
+            "กราฟนี้แสดงการกระจายคะแนนรวมของผู้ตอบทั้งหมด เพื่อให้เห็นระดับผลลัพธ์โดยรวมของแบบทดสอบ"
+            if prefer_thai
+            else "This chart shows the overall score distribution across respondents, which is more useful than plotting question titles against percentages."
+        ),
+    }
+
+
+def _build_deep_analysis_insights(
+    grouped_questions: list[dict[str, Any]],
+    processed_headers: list[str],
+    processed_rows: list[list[str]],
+    *,
+    prefer_thai: bool,
+) -> list[dict[str, str]]:
+    insights: list[dict[str, str]] = []
+    if not grouped_questions:
+        return insights
+
+    sorted_by_disagreement = sorted(
+        grouped_questions,
+        key=lambda item: (
+            -(100.0 - float(item.get("dominantSharePercent", 0.0) or 0.0)),
+            -float(item.get("totalAnswers", 0) or 0),
+            str(item.get("question", "")).casefold(),
+        ),
+    )
+    sorted_by_consensus = sorted(
+        grouped_questions,
+        key=lambda item: (
+            -float(item.get("dominantSharePercent", 0.0) or 0.0),
+            float(_compute_answer_distribution_entropy(item.get("points", []))),
+            -float(item.get("totalAnswers", 0) or 0),
+            str(item.get("question", "")).casefold(),
+        ),
+    )
+
+    most_split = sorted_by_disagreement[0] if sorted_by_disagreement else None
+    if most_split:
+        top_answers = most_split.get("points", [])[:2]
+        if top_answers:
+            details = ", ".join(
+                f"{point['label']} {round(float(point.get('percent', 0.0) or 0.0), 1)}%"
+                for point in top_answers
+            )
+            insights.append(
+                {
+                    "title": "ประเด็นที่เห็นต่างมากที่สุด" if prefer_thai else "Largest disagreement",
+                    "summary": (
+                        f"{most_split['question']} มีคำตอบกระจายสูง โดยคำตอบหลักคือ {details}"
+                        if prefer_thai
+                        else f"{most_split['question']} is the most split topic, led by {details}."
+                    ),
+                }
+            )
+
+    strongest_consensus = sorted_by_consensus[0] if sorted_by_consensus else None
+    if strongest_consensus and strongest_consensus.get("points"):
+        top_point = strongest_consensus["points"][0]
+        insights.append(
+            {
+                "title": "ประเด็นที่เห็นตรงกันมากที่สุด" if prefer_thai else "Strongest consensus",
+                "summary": (
+                    f"{strongest_consensus['question']} มีคำตอบไปในทิศทางเดียวกันมากที่สุด โดย {top_point['label']} คิดเป็น {round(float(top_point.get('percent', 0.0) or 0.0), 1)}%"
+                    if prefer_thai
+                    else f"{strongest_consensus['question']} has the strongest consensus, with {top_point['label']} at {round(float(top_point.get('percent', 0.0) or 0.0), 1)}%."
+                ),
+            }
+        )
+
+    repeated_token_labels = _infer_repeated_domain_tokens(grouped_questions)
+    domain_members: dict[str, list[dict[str, Any]]] = {}
+    for item in grouped_questions:
+        question = str(item.get("question", "") or "").strip()
+        if not question:
+            continue
+        for label in _extract_question_domain_labels(question, repeated_token_labels):
+            domain_members.setdefault(label, []).append(item)
+
+    strongest_domain_label = ""
+    strongest_domain_gap = -1.0
+    strongest_domain_question = ""
+    for label, members in domain_members.items():
+        if len(members) < 2:
+            continue
+        worst_member = max(
+            members,
+            key=lambda member: (
+                100.0 - float(member.get("dominantSharePercent", 0.0) or 0.0),
+                float(member.get("totalAnswers", 0) or 0.0),
+            ),
+        )
+        disagreement = 100.0 - float(worst_member.get("dominantSharePercent", 0.0) or 0.0)
+        if disagreement > strongest_domain_gap:
+            strongest_domain_gap = disagreement
+            strongest_domain_label = label
+            strongest_domain_question = str(worst_member.get("question", "") or "").strip()
+
+    if strongest_domain_label and strongest_domain_question:
+        insights.append(
+            {
+                "title": (
+                    f"จุดที่ยังสับสนในหัวข้อ {strongest_domain_label}"
+                    if prefer_thai
+                    else f"{strongest_domain_label} confusion hotspot"
+                ),
+                "summary": (
+                    f"เมื่อดูคำถามที่เกี่ยวข้องกับ {strongest_domain_label} โดยรวมแล้ว ประเด็นที่ยังเห็นความไม่แน่ใจชัดที่สุดคือ {strongest_domain_question}"
+                    if prefer_thai
+                    else f"Within the {strongest_domain_label} domain, the clearest remaining confusion appears in {strongest_domain_question}."
+                ),
+            }
+        )
+
+    metadata_indices, _, _ = _classify_analysis_columns(processed_headers) if processed_headers else ([], [], None)
+    for index in metadata_indices:
+        header = processed_headers[index]
+        if not _metadata_header_is_segmentable(header):
+            continue
+        counts: dict[str, int] = {}
+        for row in processed_rows:
+            if index >= len(row):
+                continue
+            value = str(row[index] or "").strip()
+            if not value:
+                continue
+            counts[value] = counts.get(value, 0) + 1
+        if len(counts) < 2 or len(counts) > 6:
+            continue
+        total = sum(counts.values())
+        if total <= 0:
+            continue
+        label, count = sorted(
+            counts.items(),
+            key=lambda item: (-item[1], str(item[0]).casefold()),
+        )[0]
+        insights.append(
+            {
+                "title": f"โครงสร้างผู้ตอบตาม{header}" if prefer_thai else f"Respondent mix by {header}",
+                "summary": (
+                    f"กลุ่ม {label} มีจำนวนมากที่สุด คิดเป็น {round((count / total) * 100, 1)}% ของผู้ตอบทั้งหมด"
+                    if prefer_thai
+                    else f"{label} is the largest segment at {round((count / total) * 100, 1)}% of respondents."
+                ),
+            }
+        )
+        break
+
+    return insights[:4]
+
+
+def _build_spreadsheet_visual_payload(
+    *,
+    spreadsheet_id: str,
+    spreadsheet_title: str,
+    spreadsheet_url: str,
+    processed_sheet_name: str,
+    summary_sheet_name: str,
+    row_count_written: int,
+    summary_rows: list[list[str]],
+    analysis_request: str,
+    processed_headers: list[str],
+    processed_rows: list[list[str]],
+    user_language: str,
+) -> dict[str, Any]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for question, answer, count_raw, percent_raw in summary_rows:
+        grouped.setdefault(question, []).append(
+            {
+                "label": answer,
+                "value": _coerce_summary_count(count_raw),
+                "percent": _coerce_summary_percent(percent_raw),
+            }
+        )
+
+    grouped_questions: list[dict[str, Any]] = []
+    for question, points in grouped.items():
+        ordered_points = sorted(
+            points,
+            key=lambda point: (-int(point["value"]), str(point["label"]).casefold()),
+        )
+        total = sum(int(point["value"]) for point in ordered_points)
+        if total <= 0:
+            continue
+        dominant_share_percent = (
+            round((max(int(point["value"]) for point in ordered_points) / total) * 100, 2)
+            if ordered_points
+            else 0.0
+        )
+        grouped_questions.append(
+            {
+                "question": question,
+                "points": ordered_points,
+                "totalAnswers": total,
+                "dominantSharePercent": dominant_share_percent,
+            }
+        )
+
+    charts: list[dict[str, Any]] = []
+    if _request_prefers_raw_question_charts(analysis_request):
+        chart_specs = _choose_chart_specs_with_ai(grouped_questions, analysis_request)
+        grouped_lookup = {item["question"]: item for item in grouped_questions}
+        for index, spec in enumerate(
+            sorted(chart_specs, key=lambda item: int(item.get("showPriority", 9999))),
+            start=1,
+        ):
+            question = str(spec.get("question", "") or "")
+            if not question or question not in grouped_lookup:
+                continue
+            if str(spec.get("chartType", "") or "").lower() == "none":
+                continue
+            grouped_item = grouped_lookup[question]
+            ordered_points = grouped_item["points"]
+            total = int(grouped_item["totalAnswers"])
+            chart_type = str(spec.get("chartType", "") or "bar").lower()
+            if chart_type not in {"bar", "pie"}:
+                chart_type = _fallback_chart_type_for_question(ordered_points)
+            charts.append(
+                {
+                    "id": f"question-{index}",
+                    "title": question,
+                    "chartType": chart_type,
+                    "total": total,
+                    "series": ordered_points,
+                    "reason": str(spec.get("reason", "") or ""),
+                }
+            )
+            if len(charts) >= 4:
+                break
+
+    existing_titles = {
+        str(chart.get("title", "") or "").strip()
+        for chart in charts
+        if str(chart.get("title", "") or "").strip()
+    }
+    prefer_thai = _contains_thai(spreadsheet_title) or any(
+        _contains_thai(item["question"]) for item in grouped_questions
+    )
+
+    existing_titles = {
+        str(chart.get("title", "") or "").strip()
+        for chart in charts
+        if str(chart.get("title", "") or "").strip()
+    }
+    domain_charts = _build_domain_specific_topics(
+        grouped_questions,
+        existing_titles,
+        prefer_thai=prefer_thai,
+    )
+    for chart in domain_charts:
+        if len(charts) >= 3:
+            break
+        charts.append(chart)
+        existing_titles.add(str(chart.get("title", "") or "").strip())
+
+    score_chart = _build_score_distribution_topic(
+        processed_headers,
+        processed_rows,
+        existing_titles,
+        prefer_thai=prefer_thai,
+    )
+    if score_chart and len(charts) < 3:
+        charts.append(score_chart)
+        existing_titles.add(str(score_chart.get("title", "") or "").strip())
+
+    overall_agreement_chart = _build_overall_question_agreement_topic(
+        grouped_questions,
+        existing_titles,
+        prefer_thai=prefer_thai,
+    )
+    if overall_agreement_chart and len(charts) < 3:
+        charts.append(overall_agreement_chart)
+        existing_titles.add(str(overall_agreement_chart.get("title", "") or "").strip())
+
+    segment_chart = _build_segment_composition_topic(
+        processed_headers,
+        processed_rows,
+        existing_titles,
+        prefer_thai=prefer_thai,
+    )
+    if segment_chart and len(charts) < 3:
+        charts.append(segment_chart)
+
+    insights = _build_deep_analysis_insights(
+        grouped_questions,
+        processed_headers,
+        processed_rows,
+        prefer_thai=prefer_thai,
+    )
+
+    return {
+        "version": 1,
+        "kind": "spreadsheet-analysis-visual",
+        "userLanguage": "th" if user_language == "th" else "en",
+        "spreadsheetId": spreadsheet_id,
+        "spreadsheetTitle": spreadsheet_title,
+        "spreadsheetUrl": spreadsheet_url,
+        "processedSheetName": processed_sheet_name,
+        "summarySheetName": summary_sheet_name,
+        "rowCountWritten": row_count_written,
+        "questionCount": len(grouped),
+        "analysisRequest": analysis_request.strip(),
+        "insights": insights,
+        "charts": charts,
+    }
+
+
+def _append_spreadsheet_visual_payload(text: str, payload: dict[str, Any]) -> str:
+    return (
+        f"{text.strip()}\n\n"
+        f"{SPREADSHEET_ANALYSIS_VISUAL_START}\n"
+        f"{json.dumps(payload, ensure_ascii=False)}\n"
+        f"{SPREADSHEET_ANALYSIS_VISUAL_END}"
+    ).strip()
+
+
+def maybe_complete_spreadsheet_analysis_request(messages: list[AnyMessage]) -> AIMessage | None:
+    """Directly inspect and summarize a response spreadsheet with chart-ready data."""
+    latest_human_index = -1
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].type == "human":
+            latest_human_index = index
+            break
+
+    if latest_human_index == -1:
+        return None
+
+    latest_human_content = content_to_text(messages[latest_human_index].content)
+    targets = extract_spreadsheet_targets(latest_human_content)
+    if not targets:
+        return None
+
+    stripped_request = strip_spreadsheet_targets(latest_human_content, targets).strip()
+    if stripped_request.lower().startswith("spreadsheet_task"):
+        return None
+    normalized_request = stripped_request.casefold()
+    explicit_format_markers = (
+        "format",
+        "reformat",
+        "prepare",
+        "analysis-ready",
+        "จัดรูปแบบ",
+        "จัดใหม่",
+        "เตรียมวิเคราะห์",
+        "เตรียม",
+        "ลบชีต",
+        "remove tab",
+        "remove sheet",
+    )
+    if any(marker in normalized_request for marker in explicit_format_markers):
+        return None
+    if not stripped_request and targets:
+        pass
+    elif not looks_like_spreadsheet_analysis_request(stripped_request or latest_human_content):
+        return None
+    if any(
+        marker in normalized_request
+        for marker in (
+            "format",
+            "จัดรูปแบบ",
+            "reformat",
+            "เตรียม",
+            "เตรียมวิเคราะห์",
+        )
+    ):
+        return None
+
+    user_language = infer_user_language(latest_human_content)
+    target = targets[0]
+
+    try:
+        formatted = format_response_sheet_for_analysis.invoke({"spreadsheet_target": target})
+        payload = json.loads(formatted) if isinstance(formatted, str) else formatted
+        if not isinstance(payload, dict):
+            return None
+
+        spreadsheet_id = str(payload.get("spreadsheetId", "") or "").strip()
+        spreadsheet_title = str(payload.get("spreadsheetTitle", "") or "").strip()
+        processed_sheet_name = str(payload.get("outputSheet", "") or "").strip()
+        summary_sheet_name = str(payload.get("summarySheet", "") or "").strip()
+        row_count_written = int(payload.get("rowCountWritten", 0) or 0)
+        summary_row_count = int(payload.get("questionSummaryRowCount", 0) or 0)
+        spreadsheet_url = (
+            f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+            if spreadsheet_id
+            else ""
+        )
+
+        credentials = _load_google_workspace_credentials()
+        service = build_google_api(
+            "sheets",
+            "v4",
+            credentials=credentials,
+            cache_discovery=False,
+        )
+        summary_rows = (
+            _load_summary_rows_from_sheet(service, spreadsheet_id, summary_sheet_name)
+            if spreadsheet_id and summary_sheet_name
+            else []
+        )
+        processed_headers, processed_rows = (
+            _load_processed_sheet_table(service, spreadsheet_id, processed_sheet_name)
+            if spreadsheet_id and processed_sheet_name
+            else ([], [])
+        )
+        visual_payload = _build_spreadsheet_visual_payload(
+            spreadsheet_id=spreadsheet_id,
+            spreadsheet_title=spreadsheet_title,
+            spreadsheet_url=spreadsheet_url,
+            processed_sheet_name=processed_sheet_name,
+            summary_sheet_name=summary_sheet_name,
+            row_count_written=row_count_written,
+            summary_rows=summary_rows,
+            analysis_request=stripped_request or latest_human_content,
+            processed_headers=processed_headers,
+            processed_rows=processed_rows,
+            user_language=user_language,
+        )
+
+        unique_questions = int(visual_payload.get("questionCount", 0) or 0)
+        chart_count = len(visual_payload.get("charts", []))
+        selected_topics = [
+            str(chart.get("title", "") or "").strip()
+            for chart in visual_payload.get("charts", [])
+            if str(chart.get("title", "") or "").strip()
+        ]
+        insight_titles = [
+            str(insight.get("title", "") or "").strip()
+            for insight in visual_payload.get("insights", [])
+            if isinstance(insight, dict) and str(insight.get("title", "") or "").strip()
+        ]
+        top_chart = visual_payload["charts"][0] if chart_count else None
+        top_insight = ""
+        if top_chart and top_chart.get("series"):
+            top_point = top_chart["series"][0]
+            top_insight = (
+                f"{top_chart['title']}: {top_point['label']} ({top_point['value']})"
+            )
+
+        if user_language == "th":
+            response_lines = [
+                "ฉันวิเคราะห์สเปรดชีตและเตรียมกราฟสรุปให้แล้ว",
+                "",
+                f"- สเปรดชีต: {spreadsheet_title or spreadsheet_id}",
+                f"- ชีตคำตอบที่จัดรูปแบบ: {processed_sheet_name}",
+                f"- ชีตสรุปคำตอบรายข้อ: {summary_sheet_name}",
+                f"- จำนวนแถวคำตอบที่ใช้วิเคราะห์: {row_count_written}",
+                f"- จำนวนคำถามที่มีคำตอบ: {unique_questions}",
+                f"- จำนวนรายการสรุปคำตอบ: {summary_row_count}",
+                f"- จำนวนกราฟที่แสดงในแชต: {chart_count}",
+            ]
+            if selected_topics:
+                response_lines.append(
+                    f"- หัวข้อที่เลือกมาพล็อต: {', '.join(selected_topics[:4])}"
+                )
+            if insight_titles:
+                response_lines.append(
+                    f"- มุมวิเคราะห์เชิงลึก: {', '.join(insight_titles[:3])}"
+                )
+            if top_insight:
+                response_lines.append(f"- ประเด็นเด่น: {top_insight}")
+            if spreadsheet_url:
+                response_lines.extend(["", f"ลิงก์สเปรดชีต: {spreadsheet_url}"])
+        else:
+            response_lines = [
+                "I analyzed the spreadsheet and prepared chart views for the results.",
+                "",
+                f"- Spreadsheet: {spreadsheet_title or spreadsheet_id}",
+                f"- Processed responses sheet: {processed_sheet_name}",
+                f"- Question summary sheet: {summary_sheet_name}",
+                f"- Response rows analyzed: {row_count_written}",
+                f"- Questions with responses: {unique_questions}",
+                f"- Summary rows: {summary_row_count}",
+                f"- Charts shown in chat: {chart_count}",
+            ]
+            if selected_topics:
+                response_lines.append(
+                    f"- Topics selected for plotting: {', '.join(selected_topics[:4])}"
+                )
+            if insight_titles:
+                response_lines.append(
+                    f"- Deep-analysis lenses: {', '.join(insight_titles[:3])}"
+                )
+            if top_insight:
+                response_lines.append(f"- Top finding: {top_insight}")
+            if spreadsheet_url:
+                response_lines.extend(["", f"Spreadsheet link: {spreadsheet_url}"])
+
+        response_lines.extend(
+            [
+                "",
+                (
+                    "กราฟในแชตอ้างอิงจากชีตสรุปคำตอบรายข้อ และยังใช้ลิงก์สเปรดชีตเดิมสำหรับวิเคราะห์ต่อได้"
+                    if user_language == "th"
+                    else "The charts in chat are based on the question summary sheet, and you can keep using the same spreadsheet link for deeper analysis."
+                ),
+            ]
+        )
+        response_text = "\n".join(response_lines).strip()
+        return AIMessage(content=_append_spreadsheet_visual_payload(response_text, visual_payload))
+    except Exception as exc:
+        raise RuntimeError(
+            (
+                "ฉันตรวจพบว่านี่เป็นคำขอวิเคราะห์สเปรดชีต แต่การเตรียมกราฟวิเคราะห์ล้มเหลว "
+                if user_language == "th"
+                else "I recognized this as a spreadsheet-analysis request, but preparing the analysis graphs failed. "
+            )
+            + f"Details: {exc}"
+        ) from exc
 
 
 @tool
@@ -6909,6 +8443,24 @@ def maybe_complete_manual_sheet_format_handoff(messages: list[AnyMessage]) -> AI
     if normalized_request.startswith("spreadsheet_task"):
         return None
 
+    explicit_format_request = any(
+        marker in normalized_request
+        for marker in (
+            "format",
+            "reformat",
+            "prepare",
+            "analysis-ready",
+            "จัดรูปแบบ",
+            "จัดใหม่",
+            "เตรียมวิเคราะห์",
+            "เตรียม",
+            "ทำให้อ่านง่าย",
+            "ลบชีต",
+            "remove tab",
+            "remove sheet",
+        )
+    )
+
     prior_ai_texts: list[str] = []
     for index in range(latest_human_index - 1, -1, -1):
         if messages[index].type == "ai":
@@ -6945,7 +8497,7 @@ def maybe_complete_manual_sheet_format_handoff(messages: list[AnyMessage]) -> AI
         )
     )
 
-    if not looks_like_handoff_reply and not is_link_only_reply and not (
+    if not explicit_format_request and not looks_like_handoff_reply and not is_link_only_reply and not (
         prior_form_context and is_short_follow_up
     ):
         return None
@@ -6978,10 +8530,10 @@ def maybe_complete_manual_sheet_format_handoff(messages: list[AnyMessage]) -> AI
                 "",
                 f"- สเปรดชีต: {spreadsheet_title or spreadsheet_id}",
                 f"- ชีตต้นฉบับ: {source_sheet}",
-                f"- ชีตรายละเอียดคำตอบ: {output_sheet}",
+                f"- ชีตคำตอบที่จัดรูปแบบ: {output_sheet}",
                 f"- ชีตสรุปคำตอบรายข้อ: {summary_sheet}",
                 f"- จำนวนแถวคำตอบที่เขียน: {row_count}",
-                f"- จำนวนคอลัมน์ในชีตรายละเอียด: {column_count}",
+                f"- จำนวนคอลัมน์ในชีตคำตอบที่จัดรูปแบบ: {column_count}",
                 f"- จำนวนแถวในชีตสรุป: {summary_row_count}",
             ]
         else:
@@ -6991,11 +8543,9 @@ def maybe_complete_manual_sheet_format_handoff(messages: list[AnyMessage]) -> AI
                 f"- Spreadsheet: {spreadsheet_title or spreadsheet_id}",
                 f"- Source sheet: {source_sheet}",
                 f"- Processed responses sheet: {output_sheet}",
-                f"- Detailed responses sheet: {detail_sheet}",
                 f"- Question summary sheet: {summary_sheet}",
                 f"- Response rows written: {row_count}",
                 f"- Columns in processed sheet: {column_count}",
-                f"- Rows in detailed sheet: {detail_row_count}",
                 f"- Summary rows written: {summary_row_count}",
             ]
         if spreadsheet_url:
@@ -7006,9 +8556,9 @@ def maybe_complete_manual_sheet_format_handoff(messages: list[AnyMessage]) -> AI
             [
                 "",
                 (
-                    "ใช้ชีตรายละเอียดคำตอบสำหรับการวิเคราะห์รายแถว และใช้ชีตสรุปคำตอบรายข้อสำหรับการนับ เปอร์เซ็นต์ กราฟ และการวิเคราะห์ต่อ"
+                    "ใช้ชีตคำตอบที่จัดรูปแบบสำหรับการไล่ดูคำตอบแบบกว้าง และใช้ชีตสรุปคำตอบรายข้อสำหรับการนับ เปอร์เซ็นต์ กราฟ และการวิเคราะห์ต่อ"
                     if user_language == "th"
-                    else "Use the detailed responses sheet for row-level analysis and the question summary sheet for counts, percentages, charts, and further analysis."
+                    else "Use the processed responses sheet for wide row inspection and the question summary sheet for counts, percentages, charts, and further analysis."
                 ),
             ]
         )
@@ -7182,7 +8732,6 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
         link_ok = link_status == "linked"
         postprocess_status = str(payload.get("postprocessStatus", "") or "")
         processed_sheet_name = str(payload.get("processedSheetName", "") or "")
-        analysis_sheet_name = str(payload.get("analysisSheetName", "") or "")
         summary_sheet_name = str(payload.get("summarySheetName", "") or "")
         postprocess_error = str(payload.get("postprocessError", "") or "")
 
@@ -7269,10 +8818,6 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
             if processed_sheet_name:
                 response_lines.append(
                     f"- {'ชีตคำตอบที่จัดรูปแบบ' if user_language == 'th' else 'Processed responses sheet'}: {processed_sheet_name}"
-                )
-            if analysis_sheet_name:
-                response_lines.append(
-                    f"- {'ชีตรายละเอียดคำตอบ' if user_language == 'th' else 'Response details sheet'}: {analysis_sheet_name}"
                 )
             if summary_sheet_name:
                 response_lines.append(
@@ -7362,6 +8907,14 @@ class LocalLLMMessageFormatMiddleware(AgentMiddleware):
             )
             if direct_sheet_response is not None:
                 return direct_sheet_response
+            direct_analysis_response = await asyncio.to_thread(
+                run_with_google_oauth_session,
+                google_oauth_session_key,
+                maybe_complete_spreadsheet_analysis_request,
+                messages,
+            )
+            if direct_analysis_response is not None:
+                return direct_analysis_response
             direct_form_messages = inject_attached_file_context(
                 original_messages,
                 get_attached_file_context(request),
@@ -7536,7 +9089,7 @@ async def build_agent() -> Any:
         model=model,
         tools=tools,
         middleware=[LocalLLMMessageFormatMiddleware()],
-        backend=FilesystemBackend(root_dir=str(PROJECT_ROOT)),
+        backend=FilesystemBackend(root_dir=str(PROJECT_ROOT), virtual_mode=False),
         skills=[SKILLS_DIR.as_posix()],
         system_prompt=SYSTEM_PROMPT,
     )
