@@ -15,6 +15,7 @@ services:
       - 8.8.8.8
     volumes:
       - google_oauth_data:/data
+      - langgraph_runtime_data:/app/.langgraph_api
     healthcheck:
       test:
         [
@@ -54,3 +55,4 @@ services:
 
 volumes:
   google_oauth_data:
+  langgraph_runtime_data:

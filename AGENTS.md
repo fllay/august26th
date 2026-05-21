@@ -74,6 +74,7 @@ These instructions apply to this repository unless a more specific `AGENTS.md` e
 - When the server still reports `Shared Google OAuth token is missing Apps Script scopes` after the web UI scope list has already been updated, assume the running deployment is still using an older saved token file or was not rebuilt. Clear the saved OAuth token files for the active browser session, keep `GOOGLE_REFRESH_TOKEN` blank, rebuild, then reconnect Google.
 - When the public domain changes, update `WEBUI_APP_URL` and the Google OAuth client's authorized JavaScript origin plus redirect URI (`https://<domain>/api/google/oauth/callback`). After a domain change, reconnect Google from the new domain so the session-scoped token file is recreated for that origin/session.
 - Run backend and web UI together with `docker compose up --build`; Docker Desktop must be running with the Linux engine.
+- Thread history and LangGraph checkpoints for the backend should persist under `/app/.langgraph_api`. In Docker Compose, mount that path to a named volume (for example `langgraph_runtime_data`) so thread history survives backend container restarts. Be aware that `docker compose down -v` will remove that history.
 - Current product workflow is:
   1. user asks the agent to create a form
   2. agent creates the Google Form
