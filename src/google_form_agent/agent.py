@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -31,6 +32,7 @@ from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build as build_google_api
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaInMemoryUpload
+from psycopg import connect as pg_connect
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
@@ -67,6 +69,8 @@ GOOGLE_OAUTH_SESSION_KEY = contextvars.ContextVar[str | None](
     "google_oauth_session_key",
     default=None,
 )
+FORM_RESPONSE_SYNC_WORKER_STARTED = False
+FORM_RESPONSE_SYNC_WORKER_LOCK = threading.Lock()
 DEFAULT_RESPONDENT_INFO_QUESTIONS = [
     {"title": "ชื่อ-นามสกุล", "type": "text", "required": True},
     {"title": "หน่วยงาน/สถานศึกษา", "type": "text", "required": True},
@@ -1288,6 +1292,442 @@ def _upsert_form_sheet_link(form_id: str, details: dict[str, Any]) -> None:
     _save_form_sheet_links(links)
 
 
+def _sanitize_pg_connection_string(conn: str) -> str:
+    return (
+        conn.strip()
+        .replace("postgresql+psycopg", "postgresql")
+        .replace("postgresql+asyncpg", "postgresql")
+        .replace("postgresql+pg8000", "postgresql")
+    )
+
+
+def _get_form_response_pg_connection_string() -> str:
+    configured = os.getenv("FORM_RESPONSE_PG_CONN_STR", "").strip()
+    if configured:
+        return _sanitize_pg_connection_string(configured)
+    fallback = os.getenv("PG_CONN_STR", "").strip()
+    if fallback:
+        return _sanitize_pg_connection_string(fallback)
+    return ""
+
+
+def _initialize_form_response_pg_schema(connection: Any) -> None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_forms (
+                form_id TEXT PRIMARY KEY,
+                spreadsheet_id TEXT,
+                form_title TEXT,
+                form_url TEXT,
+                responder_url TEXT,
+                spreadsheet_url TEXT,
+                google_oauth_session_key TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        cursor.execute(
+            """
+            ALTER TABLE agent_forms
+            ADD COLUMN IF NOT EXISTS google_oauth_session_key TEXT
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS form_responses (
+                form_id TEXT NOT NULL,
+                response_id TEXT NOT NULL,
+                created_time TIMESTAMPTZ,
+                last_submitted_time TIMESTAMPTZ,
+                respondent_email TEXT,
+                response_json JSONB NOT NULL,
+                synced_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (form_id, response_id),
+                FOREIGN KEY (form_id) REFERENCES agent_forms(form_id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS form_response_answers (
+                form_id TEXT NOT NULL,
+                response_id TEXT NOT NULL,
+                question_id TEXT NOT NULL,
+                question_title TEXT NOT NULL,
+                answer_text TEXT,
+                PRIMARY KEY (form_id, response_id, question_id),
+                FOREIGN KEY (form_id, response_id)
+                    REFERENCES form_responses(form_id, response_id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_forms_spreadsheet_id ON agent_forms(spreadsheet_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_form_response_answers_question_title "
+            "ON form_response_answers(form_id, question_title)"
+        )
+
+
+def _open_form_response_db() -> Any:
+    conn_str = _get_form_response_pg_connection_string()
+    if not conn_str:
+        raise RuntimeError(
+            "Postgres response store is not configured. Set FORM_RESPONSE_PG_CONN_STR or PG_CONN_STR."
+        )
+    connection = pg_connect(conn_str)
+    _initialize_form_response_pg_schema(connection)
+    return connection
+
+
+def _describe_form_response_store() -> str:
+    return "postgres"
+
+
+def _upsert_agent_form_record(
+    form_id: str,
+    *,
+    spreadsheet_id: str = "",
+    form_title: str = "",
+    form_url: str = "",
+    responder_url: str = "",
+    spreadsheet_url: str = "",
+    google_oauth_session_key: str = "",
+) -> None:
+    if not form_id.strip():
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    with _open_form_response_db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO agent_forms (
+                    form_id, spreadsheet_id, form_title, form_url, responder_url, spreadsheet_url,
+                    google_oauth_session_key, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT(form_id) DO UPDATE SET
+                    spreadsheet_id = excluded.spreadsheet_id,
+                    form_title = excluded.form_title,
+                    form_url = excluded.form_url,
+                    responder_url = excluded.responder_url,
+                    spreadsheet_url = excluded.spreadsheet_url,
+                    google_oauth_session_key = excluded.google_oauth_session_key,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    form_id.strip(),
+                    spreadsheet_id.strip(),
+                    form_title.strip(),
+                    form_url.strip(),
+                    responder_url.strip(),
+                    spreadsheet_url.strip(),
+                    _sanitize_google_oauth_session_key(google_oauth_session_key) or "",
+                    now,
+                    now,
+                ),
+            )
+
+
+def _find_agent_form_by_spreadsheet_id(spreadsheet_id: str) -> tuple[str, dict[str, Any]]:
+    normalized = spreadsheet_id.strip()
+    if not normalized:
+        return "", {}
+
+    for form_id, details in _load_form_sheet_links().items():
+        if str(details.get("spreadsheetId", "") or "").strip() == normalized:
+            payload = dict(details)
+            payload["formId"] = form_id
+            return form_id, payload
+    return "", {}
+
+
+def _resolve_agent_form_session_key(
+    form_id: str,
+    details: dict[str, Any],
+) -> str | None:
+    candidates = [
+        details.get("googleOauthSessionKey"),
+        details.get("google_oauth_session_key"),
+    ]
+    for candidate in candidates:
+        normalized = _sanitize_google_oauth_session_key(candidate)
+        if normalized:
+            return normalized
+
+    try:
+        with _open_form_response_db() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT google_oauth_session_key FROM agent_forms WHERE form_id = %s",
+                    (form_id,),
+                )
+                row = cursor.fetchone()
+    except Exception:
+        row = None
+
+    if row and len(row) >= 1:
+        normalized = _sanitize_google_oauth_session_key(row[0])
+        if normalized:
+            return normalized
+    return _sanitize_google_oauth_session_key(GOOGLE_OAUTH_SESSION_KEY.get())
+
+
+def _best_effort_sync_agent_form_responses(
+    form_id: str,
+    *,
+    spreadsheet_id: str = "",
+    form_title: str = "",
+    form_url: str = "",
+    responder_url: str = "",
+    spreadsheet_url: str = "",
+    google_oauth_session_key: str = "",
+) -> dict[str, Any]:
+    try:
+        return _sync_agent_form_responses_to_sql(
+            form_id,
+            spreadsheet_id=spreadsheet_id,
+            form_title=form_title,
+            form_url=form_url,
+            responder_url=responder_url,
+            spreadsheet_url=spreadsheet_url,
+            google_oauth_session_key=google_oauth_session_key,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "sync-failed",
+            "error": str(exc),
+            "formId": form_id.strip(),
+            "store": _describe_form_response_store(),
+        }
+
+
+def _best_effort_sync_agent_form_responses_by_spreadsheet(spreadsheet_id: str) -> dict[str, Any]:
+    form_id, details = _find_agent_form_by_spreadsheet_id(spreadsheet_id)
+    if not form_id:
+        return {"ok": False, "status": "not-agent-managed", "error": "No agent-managed form matched the spreadsheet."}
+
+    session_key = _resolve_agent_form_session_key(form_id, details)
+    token_session = GOOGLE_OAUTH_SESSION_KEY.set(session_key)
+    try:
+        result = _best_effort_sync_agent_form_responses(
+            form_id,
+            spreadsheet_id=str(details.get("spreadsheetId", "") or ""),
+            form_title=str(details.get("spreadsheetTitle", "") or ""),
+            form_url=str(details.get("formUrl", "") or ""),
+            responder_url=str(details.get("responseUrl", "") or ""),
+            spreadsheet_url=str(details.get("spreadsheetUrl", "") or ""),
+            google_oauth_session_key=session_key or "",
+        )
+        if session_key:
+            _upsert_form_sheet_link(
+                form_id,
+                {
+                    "googleOauthSessionKey": session_key,
+                },
+            )
+        return result
+    finally:
+        GOOGLE_OAUTH_SESSION_KEY.reset(token_session)
+
+
+def _iter_agent_managed_form_records() -> list[tuple[str, dict[str, Any]]]:
+    return [
+        (form_id, details)
+        for form_id, details in _load_form_sheet_links().items()
+        if isinstance(form_id, str) and form_id.strip() and isinstance(details, dict)
+    ]
+
+
+def _run_form_response_sync_cycle() -> None:
+    for form_id, details in _iter_agent_managed_form_records():
+        session_key = _resolve_agent_form_session_key(form_id, details)
+        token_session = GOOGLE_OAUTH_SESSION_KEY.set(session_key)
+        try:
+            _best_effort_sync_agent_form_responses(
+                form_id,
+                spreadsheet_id=str(details.get("spreadsheetId", "") or ""),
+                form_title=str(details.get("spreadsheetTitle", "") or ""),
+                form_url=str(details.get("formUrl", "") or ""),
+                responder_url=str(details.get("responseUrl", "") or ""),
+                spreadsheet_url=str(details.get("spreadsheetUrl", "") or ""),
+                google_oauth_session_key=session_key or "",
+            )
+        finally:
+            GOOGLE_OAUTH_SESSION_KEY.reset(token_session)
+
+
+def _form_response_sync_worker() -> None:
+    interval_seconds = max(
+        15,
+        int(float(os.getenv("FORM_RESPONSE_SYNC_INTERVAL_SECONDS", "30") or "30")),
+    )
+    while True:
+        try:
+            _run_form_response_sync_cycle()
+        except Exception:
+            pass
+        time.sleep(interval_seconds)
+
+
+def _ensure_form_response_sync_worker_started() -> None:
+    global FORM_RESPONSE_SYNC_WORKER_STARTED
+    with FORM_RESPONSE_SYNC_WORKER_LOCK:
+        if FORM_RESPONSE_SYNC_WORKER_STARTED:
+            return
+        worker = threading.Thread(
+            target=_form_response_sync_worker,
+            name="form-response-sync-worker",
+            daemon=True,
+        )
+        worker.start()
+        FORM_RESPONSE_SYNC_WORKER_STARTED = True
+
+
+def _list_google_form_responses(forms_service: Any, form_id: str) -> list[dict[str, Any]]:
+    responses: list[dict[str, Any]] = []
+    page_token = ""
+    while True:
+        request = forms_service.forms().responses().list(
+            formId=form_id,
+            pageSize=5000,
+            pageToken=page_token or None,
+        )
+        payload = request.execute()
+        page_responses = payload.get("responses", []) or []
+        responses.extend(
+            response for response in page_responses if isinstance(response, dict)
+        )
+        page_token = str(payload.get("nextPageToken", "") or "").strip()
+        if not page_token:
+            break
+    return responses
+
+
+def _sync_agent_form_responses_to_sql(
+    form_id: str,
+    *,
+    spreadsheet_id: str = "",
+    form_title: str = "",
+    form_url: str = "",
+    responder_url: str = "",
+    spreadsheet_url: str = "",
+    google_oauth_session_key: str = "",
+) -> dict[str, Any]:
+    normalized_form_id = form_id.strip()
+    if not normalized_form_id:
+        return {"ok": False, "status": "missing-form-id", "error": "form_id is required"}
+
+    forms_service = _build_forms_service()
+    form_payload = forms_service.forms().get(formId=normalized_form_id).execute()
+    resolved_form_title = str(form_payload.get("info", {}).get("title", "") or "").strip()
+    resolved_form_url = form_url.strip() or f"https://docs.google.com/forms/d/{normalized_form_id}/edit"
+    _upsert_agent_form_record(
+        normalized_form_id,
+        spreadsheet_id=spreadsheet_id,
+        form_title=resolved_form_title or form_title,
+        form_url=resolved_form_url,
+        responder_url=responder_url,
+        spreadsheet_url=spreadsheet_url,
+        google_oauth_session_key=google_oauth_session_key,
+    )
+    responses = _list_google_form_responses(forms_service, normalized_form_id)
+    question_map = _extract_form_question_map(form_payload)
+    question_lookup = {
+        question["questionId"]: question["title"]
+        for question in question_map
+        if isinstance(question.get("questionId"), str)
+    }
+    synced_at = datetime.now(timezone.utc).isoformat()
+
+    with _open_form_response_db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM form_response_answers WHERE form_id = %s",
+                (normalized_form_id,),
+            )
+            cursor.execute(
+                "DELETE FROM form_responses WHERE form_id = %s",
+                (normalized_form_id,),
+            )
+
+            response_rows: list[tuple[str, str, str, str, str, str, str]] = []
+            answer_rows: list[tuple[str, str, str, str, str]] = []
+            for response in responses:
+                response_id = str(response.get("responseId", "") or "").strip()
+                if not response_id:
+                    continue
+                created_time = str(response.get("createTime", "") or "").strip()
+                last_submitted_time = str(response.get("lastSubmittedTime", "") or "").strip()
+                respondent_email = str(response.get("respondentEmail", "") or "").strip()
+                response_rows.append(
+                    (
+                        normalized_form_id,
+                        response_id,
+                        created_time,
+                        last_submitted_time,
+                        respondent_email,
+                        json.dumps(response, ensure_ascii=False),
+                        synced_at,
+                    )
+                )
+                answers = response.get("answers", {})
+                if not isinstance(answers, dict):
+                    continue
+                for question_id, answer in answers.items():
+                    if not isinstance(question_id, str):
+                        continue
+                    if not isinstance(answer, dict):
+                        answer = {}
+                    answer_rows.append(
+                        (
+                            normalized_form_id,
+                            response_id,
+                            question_id,
+                            str(question_lookup.get(question_id, question_id) or question_id),
+                            _stringify_form_answer(answer),
+                        )
+                    )
+
+            if response_rows:
+                cursor.executemany(
+                    """
+                    INSERT INTO form_responses (
+                        form_id, response_id, created_time, last_submitted_time,
+                        respondent_email, response_json, synced_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
+                    """,
+                    response_rows,
+                )
+            if answer_rows:
+                cursor.executemany(
+                    """
+                    INSERT INTO form_response_answers (
+                        form_id, response_id, question_id, question_title, answer_text
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    answer_rows,
+                )
+
+    return {
+        "ok": True,
+        "status": "synced",
+        "formId": normalized_form_id,
+        "responseCount": len(response_rows),
+        "answerCount": len(answer_rows),
+        "store": _describe_form_response_store(),
+        "syncedAt": synced_at,
+    }
+
+
 def _get_latest_form_sheet_link() -> tuple[str, dict[str, Any]]:
     """Return the most recently linked form entry, if any."""
     links = _load_form_sheet_links()
@@ -1984,13 +2424,25 @@ def _strip_images_from_questions_for_rest(
     questions: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Return a copy of the questions with only REST-compatible images preserved."""
+    def keep_rest_image(image: Any) -> list[dict[str, Any]]:
+        if not isinstance(image, dict):
+            return []
+        source_uri = str(image.get("source_uri", "") or "").strip()
+        if (
+            source_uri
+            and len(source_uri) <= 2048
+            and source_uri.startswith(("http://", "https://"))
+        ):
+            return [image]
+        return []
+
     stripped_questions: list[dict[str, Any]] = []
     for question in questions:
         updated_question = dict(question)
         question_images = question.get("images", [])
         if isinstance(question_images, list) and question_images:
             first_question_image = question_images[0]
-            updated_question["images"] = [first_question_image] if isinstance(first_question_image, dict) else []
+            updated_question["images"] = keep_rest_image(first_question_image)
         else:
             updated_question["images"] = []
         options = question.get("options", [])
@@ -2004,7 +2456,7 @@ def _strip_images_from_questions_for_rest(
                 option_images = option.get("images", [])
                 if isinstance(option_images, list) and option_images:
                     first_image = option_images[0]
-                    updated_option["images"] = [first_image] if isinstance(first_image, dict) else []
+                    updated_option["images"] = keep_rest_image(first_image)
                 else:
                     updated_option["images"] = []
                 updated_option["extra_images"] = []
@@ -4816,6 +5268,7 @@ def create_form_with_response_sheet(
                 "spreadsheetTitle": spreadsheet_details["spreadsheetTitle"],
                 "spreadsheetUrl": spreadsheet_details["spreadsheetUrl"],
                 "formUrl": f"https://docs.google.com/forms/d/{form_id}/edit",
+                "googleOauthSessionKey": GOOGLE_OAUTH_SESSION_KEY.get() or "",
                 "linkStatus": link_status,
                 "linkMode": str(link_result.get("mode", "") or "api-executable"),
                 "linkedAt": linked_at,
@@ -4825,6 +5278,24 @@ def create_form_with_response_sheet(
                 "deploymentId": str(link_result.get("deploymentId", "") or ""),
                 "scriptUrl": str(link_result.get("scriptUrl", "") or ""),
             },
+        )
+        _upsert_agent_form_record(
+            form_id,
+            spreadsheet_id=spreadsheet_id,
+            form_title=title.strip(),
+            form_url=f"https://docs.google.com/forms/d/{form_id}/edit",
+            responder_url=str(form_response.get("responderUri", "") or "").strip(),
+            spreadsheet_url=spreadsheet_details["spreadsheetUrl"],
+            google_oauth_session_key=GOOGLE_OAUTH_SESSION_KEY.get() or "",
+        )
+        response_store_result = _best_effort_sync_agent_form_responses(
+            form_id,
+            spreadsheet_id=spreadsheet_id,
+            form_title=title.strip(),
+            form_url=f"https://docs.google.com/forms/d/{form_id}/edit",
+            responder_url=str(form_response.get("responderUri", "") or "").strip(),
+            spreadsheet_url=spreadsheet_details["spreadsheetUrl"],
+            google_oauth_session_key=GOOGLE_OAUTH_SESSION_KEY.get() or "",
         )
 
         if link_ok:
@@ -4892,6 +5363,10 @@ def create_form_with_response_sheet(
                 "analysisSheetName": str(postprocess_result.get("analysisSheetName", "") or ""),
                 "summarySheetName": str(postprocess_result.get("summarySheetName", "") or ""),
                 "postprocessError": str(postprocess_result.get("error", "") or ""),
+                "responseStoreStatus": str(response_store_result.get("status", "") or ""),
+                "responseStoreError": str(response_store_result.get("error", "") or ""),
+                "responseStoreBackend": str(response_store_result.get("store", "") or ""),
+                "responseStoreResponseCount": int(response_store_result.get("responseCount", 0) or 0),
                 "nextStep": (
                     "The form is already linked to a Google Spreadsheet. "
                     "If responses already exist, the analysis sheets were created automatically. "
@@ -4931,6 +5406,9 @@ def format_response_sheet_for_analysis(
         raise RuntimeError("spreadsheet_target is required.")
 
     spreadsheet_id_value = extract_spreadsheet_id(target)
+    response_store_result = _best_effort_sync_agent_form_responses_by_spreadsheet(
+        spreadsheet_id_value
+    )
     credentials = _load_google_workspace_credentials()
     service = build_google_api(
         "sheets",
@@ -4994,29 +5472,47 @@ def format_response_sheet_for_analysis(
         .get("values", [])
     )
     if not raw_values:
+        empty_payload = _initialize_empty_postprocess_tabs(
+            service,
+            spreadsheet_id_value,
+            spreadsheet_title,
+            source_title,
+            sheets,
+            output_sheet_name,
+        )
+        empty_payload.update(
+            {
+                "responseStoreStatus": str(response_store_result.get("status", "") or ""),
+                "responseStoreError": str(response_store_result.get("error", "") or ""),
+                "responseStoreBackend": str(response_store_result.get("store", "") or ""),
+                "responseStoreResponseCount": int(response_store_result.get("responseCount", 0) or 0),
+            }
+        )
         return json.dumps(
-            _initialize_empty_postprocess_tabs(
-                service,
-                spreadsheet_id_value,
-                spreadsheet_title,
-                source_title,
-                sheets,
-                output_sheet_name,
-            ),
+            empty_payload,
             ensure_ascii=False,
             indent=2,
         )
     headers, cleaned_rows, header_row_index = _build_analysis_ready_table(raw_values)
     if not headers:
+        empty_payload = _initialize_empty_postprocess_tabs(
+            service,
+            spreadsheet_id_value,
+            spreadsheet_title,
+            source_title,
+            sheets,
+            output_sheet_name,
+        )
+        empty_payload.update(
+            {
+                "responseStoreStatus": str(response_store_result.get("status", "") or ""),
+                "responseStoreError": str(response_store_result.get("error", "") or ""),
+                "responseStoreBackend": str(response_store_result.get("store", "") or ""),
+                "responseStoreResponseCount": int(response_store_result.get("responseCount", 0) or 0),
+            }
+        )
         return json.dumps(
-            _initialize_empty_postprocess_tabs(
-                service,
-                spreadsheet_id_value,
-                spreadsheet_title,
-                source_title,
-                sheets,
-                output_sheet_name,
-            ),
+            empty_payload,
             ensure_ascii=False,
             indent=2,
         )
@@ -5084,6 +5580,10 @@ def format_response_sheet_for_analysis(
             "rawHeaders": headers,
             "processedHeaders": processed_headers,
             "analysisHeaders": analysis_headers,
+            "responseStoreStatus": str(response_store_result.get("status", "") or ""),
+            "responseStoreError": str(response_store_result.get("error", "") or ""),
+            "responseStoreBackend": str(response_store_result.get("store", "") or ""),
+            "responseStoreResponseCount": int(response_store_result.get("responseCount", 0) or 0),
             "note": (
                 "The raw response data was transformed into a wide processed-response sheet with helper columns, "
                 "plus a separate question summary sheet."
@@ -6539,6 +7039,9 @@ def maybe_complete_spreadsheet_analysis_request(messages: list[AnyMessage]) -> A
             cache_discovery=False,
         )
         spreadsheet_id = extract_spreadsheet_id(target)
+        response_store_result = _best_effort_sync_agent_form_responses_by_spreadsheet(
+            spreadsheet_id
+        )
         payload = _resolve_existing_postprocess_payload(service, spreadsheet_id)
         if payload is None:
             formatted = format_response_sheet_for_analysis.invoke({"spreadsheet_target": target})
@@ -6565,9 +7068,26 @@ def maybe_complete_spreadsheet_analysis_request(messages: list[AnyMessage]) -> A
         )
         processed_headers, processed_rows = (
             _load_processed_sheet_table(service, spreadsheet_id, processed_sheet_name)
-            if spreadsheet_id and processed_sheet_name
+        if spreadsheet_id and processed_sheet_name
             else ([], [])
         )
+        if isinstance(payload, dict):
+            payload.setdefault(
+                "responseStoreStatus",
+                str(response_store_result.get("status", "") or ""),
+            )
+            payload.setdefault(
+                "responseStoreError",
+                str(response_store_result.get("error", "") or ""),
+            )
+            payload.setdefault(
+                "responseStoreBackend",
+                str(response_store_result.get("store", "") or ""),
+            )
+            payload.setdefault(
+                "responseStoreResponseCount",
+                int(response_store_result.get("responseCount", 0) or 0),
+            )
         visual_payload = _build_spreadsheet_visual_payload(
             spreadsheet_id=spreadsheet_id,
             spreadsheet_title=spreadsheet_title,
@@ -9143,6 +9663,7 @@ def build_mcp_client() -> MultiServerMCPClient:
 
 async def build_agent() -> Any:
     """Create the Deep Agent with Google Forms MCP tools."""
+    _ensure_form_response_sync_worker_started()
     model = build_chat_model()
     client = build_mcp_client()
     mcp_tools = await client.get_tools()

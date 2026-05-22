@@ -29,6 +29,45 @@ The OAuth flow also stores the connected Google account's basic profile
 (name, email, avatar URL) for the active browser session so the web UI can show
 which account is currently connected.
 
+## SQL Response Store
+
+Forms created by the agent can also sync their Google Form response data into a
+Postgres database.
+
+Default Docker Compose setup:
+
+```env
+POSTGRES_DB=august26th
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=postgres
+PG_CONN_STR=postgresql://postgres:postgres@postgres:5432/august26th
+```
+
+Optional dedicated backend response-store connection:
+
+```env
+FORM_RESPONSE_PG_CONN_STR=
+```
+
+If `FORM_RESPONSE_PG_CONN_STR` is blank, the backend reuses `PG_CONN_STR`.
+
+Current behavior:
+
+- when the agent creates a Google Form, it registers that form in the response store
+- when the agent creates or later analyzes/reformats the linked response spreadsheet,
+  it re-syncs the current Google Form responses into Postgres
+- only forms tracked in the agent's local form-to-sheet registry are synced
+- while the backend is running, a background sync worker also refreshes those
+  agent-managed form responses on a polling interval
+
+Optional poll interval:
+
+```env
+FORM_RESPONSE_SYNC_INTERVAL_SECONDS=30
+```
+
+This is still a best-effort polling sync, not a webhook listener.
+
 The app now derives the OAuth callback URL automatically from the incoming
 request host. If users open the UI from a different host or IP, add that exact
 `/api/google/oauth/callback` URL to the Google OAuth client as well.

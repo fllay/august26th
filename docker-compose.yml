@@ -1,4 +1,25 @@
 services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-august26th}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-august26th}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
   backend:
     build:
       context: .
@@ -8,6 +29,8 @@ services:
     environment:
       GOOGLE_FORMS_MCP_PATH: /opt/google-forms-mcp/build/index.js
       GOOGLE_OAUTH_TOKEN_PATH: /data/google-oauth.json
+      PG_CONN_STR: ${PG_CONN_STR:-postgresql://postgres:postgres@postgres:5432/august26th}
+      FORM_RESPONSE_PG_CONN_STR: ${FORM_RESPONSE_PG_CONN_STR:-}
     ports:
       - "2024:2024"
     dns:
@@ -28,6 +51,9 @@ services:
       timeout: 3s
       retries: 12
       start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   webui:
     build:
@@ -42,6 +68,7 @@ services:
       GOOGLE_OAUTH_TOKEN_PATH: /data/google-oauth.json
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      PG_CONN_STR: ${PG_CONN_STR:-postgresql://postgres:postgres@postgres:5432/august26th}
     ports:
       - "3000:3000"
     dns:
@@ -56,3 +83,4 @@ services:
 volumes:
   google_oauth_data:
   langgraph_runtime_data:
+  postgres_data:

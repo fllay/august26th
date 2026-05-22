@@ -11,6 +11,7 @@ dependencies = [
     "mcp-google-sheets",
     "olefile>=0.47",
     "Pillow>=10.4.0",
+    "psycopg[binary]>=3.2.0",
     "pypdf>=5.0.0",
     "python-dotenv>=1.0.1",
 ]
