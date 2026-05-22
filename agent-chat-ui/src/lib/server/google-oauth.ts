@@ -10,6 +10,9 @@ const DEFAULT_TOKEN_PATH = path.resolve(
 export const GOOGLE_OAUTH_SESSION_COOKIE_NAME = "google_oauth_session";
 export const GOOGLE_OAUTH_STATE_COOKIE_NAME = "google_oauth_state";
 const SCOPES = [
+  "openid",
+  "https://www.googleapis.com/auth/userinfo.email",
+  "https://www.googleapis.com/auth/userinfo.profile",
   "https://www.googleapis.com/auth/forms.body",
   "https://www.googleapis.com/auth/forms.responses.readonly",
   "https://www.googleapis.com/auth/spreadsheets",
@@ -20,6 +23,17 @@ const SCOPES = [
 ];
 
 const GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token";
+const GOOGLE_USERINFO_URI = "https://www.googleapis.com/oauth2/v3/userinfo";
+
+export type StoredGoogleProfile = {
+  sub?: string;
+  name?: string;
+  given_name?: string;
+  family_name?: string;
+  picture?: string;
+  email?: string;
+  email_verified?: boolean;
+};
 
 export type StoredGoogleToken = {
   token?: string;
@@ -32,6 +46,7 @@ export type StoredGoogleToken = {
   token_type?: string;
   expiry?: string;
   created_at: string;
+  profile?: StoredGoogleProfile;
 };
 
 function sanitizeSessionKey(value: string): string | null {
@@ -224,6 +239,10 @@ export async function exchangeCodeForToken(
   const expiry = data.expires_in
     ? new Date(Date.now() + data.expires_in * 1000).toISOString()
     : undefined;
+  const profile =
+    data.access_token
+      ? await fetchGoogleUserProfile(data.access_token).catch(() => undefined)
+      : undefined;
 
   return {
     token: data.access_token,
@@ -236,7 +255,23 @@ export async function exchangeCodeForToken(
     token_type: data.token_type,
     expiry,
     created_at: new Date().toISOString(),
+    profile,
   };
+}
+
+async function fetchGoogleUserProfile(
+  accessToken: string,
+): Promise<StoredGoogleProfile> {
+  const response = await fetch(GOOGLE_USERINFO_URI, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error("Google user profile fetch failed.");
+  }
+  return (await response.json()) as StoredGoogleProfile;
 }
 
 export async function saveGoogleOauthToken(token: StoredGoogleToken) {

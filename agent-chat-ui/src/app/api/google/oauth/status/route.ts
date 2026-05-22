@@ -14,5 +14,6 @@ export async function GET() {
     connectedAt: token?.created_at ?? null,
     scope: token?.scope ?? null,
     sessionKey,
+    profile: token?.profile ?? null,
   });
 }

@@ -25,6 +25,10 @@ After consent succeeds, the refresh token is stored in shared app storage and
 the backend will use it for Google Forms MCP calls. A manual
 `GOOGLE_REFRESH_TOKEN` is still supported, but it is now optional.
 
+The OAuth flow also stores the connected Google account's basic profile
+(name, email, avatar URL) for the active browser session so the web UI can show
+which account is currently connected.
+
 The app now derives the OAuth callback URL automatically from the incoming
 request host. If users open the UI from a different host or IP, add that exact
 `/api/google/oauth/callback` URL to the Google OAuth client as well.
