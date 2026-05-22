@@ -733,7 +733,7 @@ export function Thread() {
           }
         >
           {!chatStarted && (
-            <div className="absolute top-0 left-0 z-10 flex w-full items-center justify-between gap-3 p-2 pl-4">
+            <div className="absolute top-0 left-0 z-10 flex w-full items-center gap-3 px-4 py-2">
               <div>
                 {(!chatHistoryOpen || !isLargeScreen) && (
                   <Button
@@ -749,11 +749,13 @@ export function Thread() {
                 </Button>
                   )}
               </div>
-              <GoogleOauthButton />
+              <div className="absolute top-2 right-4">
+                <GoogleOauthButton />
+              </div>
             </div>
           )}
           {chatStarted && (
-            <div className="relative z-10 flex items-center justify-between gap-3 p-2">
+            <div className="relative z-10 flex items-center justify-between gap-3 p-2 pr-16">
               <div className="relative flex items-center justify-start gap-2">
                 <div className="absolute left-0 z-10">
                   {(!chatHistoryOpen || !isLargeScreen) && (
@@ -788,17 +790,19 @@ export function Thread() {
                 </motion.button>
               </div>
 
-              <div className="flex items-center gap-4">
-                <GoogleOauthButton />
+              <div className="flex items-center gap-2">
                 <TooltipIconButton
-                  size="lg"
-                  className="p-4"
+                  className="size-9 p-0"
                   tooltip="New thread"
                   variant="ghost"
                   onClick={() => setThreadId(null)}
                 >
                   <SquarePen className="size-5" />
                 </TooltipIconButton>
+              </div>
+
+              <div className="absolute top-2 right-4">
+                <GoogleOauthButton />
               </div>
 
               <div className="from-background to-background/0 absolute inset-x-0 top-full h-5 bg-gradient-to-b" />

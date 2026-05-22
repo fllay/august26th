@@ -9437,27 +9437,17 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
                         "ฟอร์มและสเปรดชีตถูกสร้างแล้ว แต่การเชื่อมสเปรดชีตอัตโนมัติยังไม่สำเร็จ "
                         "ให้ใช้ลิงก์ที่ส่งกลับไว้ก่อน แล้วค่อยลองเชื่อมใหม่อีกครั้ง"
                     )
-                elif postprocess_status == "formatted":
-                    localized_next_step = (
-                        "ฟอร์มนี้ถูกเชื่อมกับ Google Spreadsheet และจัดรูปแบบชีตวิเคราะห์เบื้องต้นแล้ว "
-                        "ส่งลิงก์สเปรดชีตกลับมาได้ทุกเมื่อหากต้องการให้ฉันวิเคราะห์หรือจัดรูปแบบใหม่"
-                    )
                 else:
-                    localized_next_step = (
-                        "ฟอร์มนี้ถูกเชื่อมกับ Google Spreadsheet เรียบร้อยแล้ว "
-                        "เมื่อมีคำตอบเข้ามาแล้ว ส่งลิงก์สเปรดชีตกลับมาได้ทุกเมื่อเพื่อให้ฉันวิเคราะห์หรือจัดรูปแบบใหม่"
-                    )
+                    localized_next_step = ""
             elif not link_ok:
                 localized_next_step = (
                     "The form and spreadsheet were created, but automatic linking did not complete. "
                     "Use the returned links for now, then retry linking after the Apps Script runtime is corrected."
                 )
-            elif postprocess_status == "formatted":
-                localized_next_step = (
-                    "The form is linked and the first-pass analysis sheets are already in place. "
-                    "Send the spreadsheet link back any time you want the agent to inspect or reformat the data."
-                )
-            response_lines.extend(["", localized_next_step])
+            else:
+                localized_next_step = ""
+            if localized_next_step:
+                response_lines.extend(["", localized_next_step])
 
         return AIMessage(content="\n".join(response_lines).strip())
     except Exception as exc:

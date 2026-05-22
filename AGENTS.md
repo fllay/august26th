@@ -40,6 +40,8 @@ These instructions apply to this repository unless a more specific `AGENTS.md` e
 - The chart panel should follow the user's language, not just the spreadsheet contents. Pass the inferred user language through the spreadsheet-analysis payload and localize chart headings, counts, and fallback narratives from that payload. When generating fallback chart narratives, rank series by actual value rather than trusting input order.
 - Do not force an auto-generated fallback sentence under every chart. If a chart does not have a trustworthy explicit summary from the backend, omit the narrative line rather than showing brittle derived prose in the UI.
 - The spreadsheet-analysis chart UI should use an explicit multi-color palette for bars and pie slices instead of relying only on theme chart variables, so each category remains visually distinct even when the active theme compresses the default chart colors.
+- In the thread header, keep the connected Google avatar pinned as the rightmost control and size it on the same icon-button grid as the neighboring header actions so it aligns cleanly with tools like "New thread".
+- Keep the connected Google avatar anchored to a fixed top-right header position across thread states. Other header actions may appear or disappear to its left, but they should not shift the avatar's screen position.
 - The overall chat dashboard should always prefer at least one genuinely aggregate chart when possible. If score or segment charts are unavailable, fall back to an overall agreement-profile chart across questions rather than dropping to zero charts or reviving low-value per-question title charts.
 - Shared user-account Google OAuth is stored in the shared token file configured by `GOOGLE_OAUTH_TOKEN_PATH`; backend Workspace credentials prefer that token file over `GOOGLE_REFRESH_TOKEN`, but service-account credentials still take precedence if `SERVICE_ACCOUNT_PATH` is configured.
 - Google Form ownership always follows the credential principal that actually executes the Forms API `forms.create` call. If a user on the server is not the owner of the created form, check auth-source precedence first: `SERVICE_ACCOUNT_PATH` overrides user OAuth, then the active OAuth token file, then `GOOGLE_REFRESH_TOKEN`.
@@ -145,4 +147,5 @@ These instructions apply to this repository unless a more specific `AGENTS.md` e
 
 - Before finishing a task, summarize changed files and any verification performed.
 - If assumptions were made, record stable ones in this file only when they are likely to remain useful.
+- In successful form-creation replies, do not append extra generic handoff text telling the user to send the spreadsheet back later. Keep the result focused on the created links and concrete status lines; reserve next-step guidance for actual failure or recovery cases.
 

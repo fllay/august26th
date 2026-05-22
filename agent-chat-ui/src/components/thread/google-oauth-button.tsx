@@ -142,12 +142,12 @@ export function GoogleOauthButton() {
     const profileEmail = status.profile?.email?.trim() || "";
     const avatarFallback = (profileName[0] || "G").toUpperCase();
     return (
-      <div ref={containerRef} className="relative">
+      <div ref={containerRef} className="relative shrink-0">
         <Button
           type="button"
           variant="ghost"
           size="icon"
-          className="relative size-10 rounded-full p-0"
+          className="relative size-9 rounded-full p-0"
           onClick={() => setMenuOpen((open) => !open)}
           disabled={disconnecting}
           title={profileEmail || profileName}
@@ -167,7 +167,7 @@ export function GoogleOauthButton() {
                 />
                 <AvatarFallback>{avatarFallback}</AvatarFallback>
               </Avatar>
-              <span className="absolute right-0 bottom-0 size-3 rounded-full border-2 border-background bg-emerald-500" />
+              <span className="absolute right-0.5 bottom-0.5 size-2.5 rounded-full border-2 border-background bg-emerald-500" />
             </>
           )}
         </Button>
