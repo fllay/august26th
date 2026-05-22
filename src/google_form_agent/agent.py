@@ -3870,10 +3870,12 @@ def _sanitize_sheet_title(title: str, fallback: str) -> str:
 def _looks_like_generated_analysis_sheet(title: str) -> bool:
     lowered = str(title or "").casefold()
     markers = (
+        "processed responses",
+        "analysis ready",
         "response details",
         "question summary",
-        "analysis ready",
         "analysis summary",
+        "คำตอบที่จัดรูปแบบ",
         "รายละเอียดคำตอบ",
         "สรุปคำตอบ",
         "สรุปรายข้อ",
@@ -5232,6 +5234,73 @@ def _load_processed_sheet_table(
     return headers, rows
 
 
+def _resolve_existing_postprocess_payload(
+    service: Any,
+    spreadsheet_id: str,
+) -> dict[str, Any] | None:
+    """Reuse existing post-process tabs when they already exist for this workbook."""
+    metadata = (
+        service.spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            fields="properties.title,sheets.properties(sheetId,title,index,gridProperties)",
+        )
+        .execute()
+    )
+    spreadsheet_title = str(metadata.get("properties", {}).get("title", "") or "")
+    sheets = metadata.get("sheets", []) or []
+    source_sheet = _pick_postprocess_source_sheet(sheets)
+    if source_sheet is None:
+        return None
+
+    source_title = str(source_sheet.get("properties", {}).get("title", "") or "").strip()
+    if not source_title:
+        return None
+
+    processed_sheet_name, _detail_sheet_name, summary_sheet_name = _derive_postprocess_sheet_names(
+        source_title,
+        [],
+        "",
+    )
+    existing_titles = {
+        str(sheet.get("properties", {}).get("title", "") or "").strip()
+        for sheet in sheets
+        if isinstance(sheet, dict)
+    }
+    if processed_sheet_name not in existing_titles or summary_sheet_name not in existing_titles:
+        return None
+
+    processed_headers, processed_rows = _load_processed_sheet_table(
+        service,
+        spreadsheet_id,
+        processed_sheet_name,
+    )
+    summary_rows = _load_summary_rows_from_sheet(
+        service,
+        spreadsheet_id,
+        summary_sheet_name,
+    )
+    return {
+        "spreadsheetId": spreadsheet_id,
+        "spreadsheetTitle": spreadsheet_title,
+        "sourceSheet": source_title,
+        "outputSheet": processed_sheet_name,
+        "detailSheet": "",
+        "summarySheet": summary_sheet_name,
+        "headerRowIndex": 1 if processed_headers else 0,
+        "columnCount": len(processed_headers),
+        "rowCountWritten": len(processed_rows),
+        "detailColumnCount": 0,
+        "detailRowCountWritten": 0,
+        "questionSummaryRowCount": len(summary_rows),
+        "rawHeaders": [],
+        "processedHeaders": processed_headers,
+        "analysisHeaders": [],
+        "note": "Reused existing processed-analysis tabs.",
+        "reusedExistingPostprocess": True,
+    }
+
+
 def _fallback_chart_type_for_question(points: list[dict[str, Any]]) -> str:
     unique_answers = len(points)
     if unique_answers <= 1:
@@ -6462,29 +6531,32 @@ def maybe_complete_spreadsheet_analysis_request(messages: list[AnyMessage]) -> A
     target = targets[0]
 
     try:
-        formatted = format_response_sheet_for_analysis.invoke({"spreadsheet_target": target})
-        payload = json.loads(formatted) if isinstance(formatted, str) else formatted
-        if not isinstance(payload, dict):
-            return None
-
-        spreadsheet_id = str(payload.get("spreadsheetId", "") or "").strip()
-        spreadsheet_title = str(payload.get("spreadsheetTitle", "") or "").strip()
-        processed_sheet_name = str(payload.get("outputSheet", "") or "").strip()
-        summary_sheet_name = str(payload.get("summarySheet", "") or "").strip()
-        row_count_written = int(payload.get("rowCountWritten", 0) or 0)
-        summary_row_count = int(payload.get("questionSummaryRowCount", 0) or 0)
-        spreadsheet_url = (
-            f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
-            if spreadsheet_id
-            else ""
-        )
-
         credentials = _load_google_workspace_credentials()
         service = build_google_api(
             "sheets",
             "v4",
             credentials=credentials,
             cache_discovery=False,
+        )
+        spreadsheet_id = extract_spreadsheet_id(target)
+        payload = _resolve_existing_postprocess_payload(service, spreadsheet_id)
+        if payload is None:
+            formatted = format_response_sheet_for_analysis.invoke({"spreadsheet_target": target})
+            payload = json.loads(formatted) if isinstance(formatted, str) else formatted
+            if not isinstance(payload, dict):
+                return None
+
+        spreadsheet_id = str(payload.get("spreadsheetId", "") or spreadsheet_id).strip()
+        spreadsheet_title = str(payload.get("spreadsheetTitle", "") or "").strip()
+        processed_sheet_name = str(payload.get("outputSheet", "") or "").strip()
+        summary_sheet_name = str(payload.get("summarySheet", "") or "").strip()
+        row_count_written = int(payload.get("rowCountWritten", 0) or 0)
+        summary_row_count = int(payload.get("questionSummaryRowCount", 0) or 0)
+        reused_existing_postprocess = bool(payload.get("reusedExistingPostprocess"))
+        spreadsheet_url = (
+            f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+            if spreadsheet_id
+            else ""
         )
         summary_rows = (
             _load_summary_rows_from_sheet(service, spreadsheet_id, summary_sheet_name)
@@ -6537,6 +6609,7 @@ def maybe_complete_spreadsheet_analysis_request(messages: list[AnyMessage]) -> A
                 f"- สเปรดชีต: {spreadsheet_title or spreadsheet_id}",
                 f"- ชีตคำตอบที่จัดรูปแบบ: {processed_sheet_name}",
                 f"- ชีตสรุปคำตอบรายข้อ: {summary_sheet_name}",
+                f"- โหมดการเตรียมข้อมูล: {'ใช้ชีตที่จัดรูปแบบเดิม' if reused_existing_postprocess else 'สร้างชีตจัดรูปแบบครั้งแรก'}",
                 f"- จำนวนแถวคำตอบที่ใช้วิเคราะห์: {row_count_written}",
                 f"- จำนวนคำถามที่มีคำตอบ: {unique_questions}",
                 f"- จำนวนรายการสรุปคำตอบ: {summary_row_count}",
@@ -6561,6 +6634,7 @@ def maybe_complete_spreadsheet_analysis_request(messages: list[AnyMessage]) -> A
                 f"- Spreadsheet: {spreadsheet_title or spreadsheet_id}",
                 f"- Processed responses sheet: {processed_sheet_name}",
                 f"- Question summary sheet: {summary_sheet_name}",
+                f"- Post-process mode: {'reused existing tabs' if reused_existing_postprocess else 'created tabs for first-time analysis'}",
                 f"- Response rows analyzed: {row_count_written}",
                 f"- Questions with responses: {unique_questions}",
                 f"- Summary rows: {summary_row_count}",
