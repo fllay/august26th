@@ -442,16 +442,19 @@ def looks_like_database_request(text: str) -> bool:
     lowered = str(text or "").strip().casefold()
     if not lowered:
         return False
-    database_keywords = (
+    if _extract_requested_form_id(lowered):
+        return True
+    strong_keywords = (
         "postgres",
         "postgresql",
         "database",
         "sql",
-        "db",
         "ฐานข้อมูล",
         "โพสต์เกรส",
     )
-    return any(keyword in lowered for keyword in database_keywords)
+    if any(keyword in lowered for keyword in strong_keywords):
+        return True
+    return re.search(r"(?<![a-z0-9_])db(?![a-z0-9_])", lowered) is not None
 
 
 def _markdown_table_cell(value: Any) -> str:
@@ -481,10 +484,272 @@ def _format_markdown_table(
     return "\n".join(lines).strip()
 
 
+def _extract_requested_form_id(text: str) -> str:
+    """Extract an explicit form_id reference from free-form user text."""
+    raw_text = str(text or "")
+    match = re.search(
+        r"\bform(?:\s*[_-]?\s*id)?\s*[:=]\s*([A-Za-z0-9_-]{10,})\b",
+        raw_text,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return match.group(1).strip()
+    url_match = re.search(
+        r"https://docs\.google\.com/forms/d/([A-Za-z0-9_-]{10,})/(?:edit|viewform)\b",
+        raw_text,
+        flags=re.IGNORECASE,
+    )
+    if url_match:
+        return url_match.group(1).strip()
+
+    lowered = raw_text.casefold()
+    if any(
+        marker in lowered
+        for marker in (
+            "form id",
+            "formid",
+            "ฟอร์มนี้",
+            "แบบฟอร์มนี้",
+            "แบบทดสอบนี้",
+            "analyze form",
+            "วิเคราะห์ฟอร์ม",
+            "วิเคราะห์แบบฟอร์ม",
+        )
+    ):
+        bare_id_match = re.search(r"\b([A-Za-z0-9_-]{20,})\b", raw_text)
+        if bare_id_match:
+            return bare_id_match.group(1).strip()
+    return ""
+
+
+def _extract_form_id_from_message_text(text: str) -> str:
+    """Extract a form id from prior thread text such as a creation result message."""
+    explicit = _extract_requested_form_id(text)
+    if explicit:
+        return explicit
+
+    line_match = re.search(
+        r"(?:Form ID|รหัสฟอร์ม)\s*:\s*([A-Za-z0-9_-]{10,})",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    )
+    if line_match:
+        return line_match.group(1).strip()
+
+    edit_url_match = re.search(
+        r"https://docs\.google\.com/forms/d/([A-Za-z0-9_-]{10,})/edit\b",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    )
+    if edit_url_match:
+        return edit_url_match.group(1).strip()
+    return ""
+
+
+def _extract_recent_thread_form_id(messages: list[AnyMessage], before_index: int) -> str:
+    """Return the most recent created-form id mentioned earlier in the same thread."""
+    for index in range(before_index - 1, -1, -1):
+        message = messages[index]
+        if message.type not in {"ai", "human"}:
+            continue
+        form_id = _extract_form_id_from_message_text(content_to_text(message.content))
+        if form_id:
+            return form_id
+    return ""
+
+
+def _load_agent_form_catalog() -> list[dict[str, Any]]:
+    """Load agent-managed form metadata from Postgres."""
+    payload = json.loads(
+        query_form_response_database.invoke(
+            {
+                "sql": (
+                    "SELECT form_id, spreadsheet_id, form_title, form_url, spreadsheet_url, updated_at "
+                    "FROM agent_forms ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST"
+                ),
+                "row_limit": 500,
+            }
+        )
+    )
+    rows = payload.get("rows", [])
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _choose_database_analysis_form(
+    request_text: str,
+    catalog_rows: list[dict[str, Any]],
+    *,
+    preferred_form_id: str = "",
+) -> dict[str, Any] | None:
+    """Resolve which stored form the SQL-backed analysis should target."""
+    if not catalog_rows:
+        return None
+
+    normalized_preferred_form_id = str(preferred_form_id or "").strip()
+    if normalized_preferred_form_id:
+        for row in catalog_rows:
+            if str(row.get("form_id", "") or "").strip() == normalized_preferred_form_id:
+                return row
+
+    explicit_form_id = _extract_requested_form_id(request_text)
+    if explicit_form_id:
+        for row in catalog_rows:
+            if str(row.get("form_id", "") or "").strip() == explicit_form_id:
+                return row
+
+    lowered = str(request_text or "").strip().casefold()
+    for row in catalog_rows:
+        title = str(row.get("form_title", "") or "").strip()
+        if title and title.casefold() in lowered:
+            return row
+
+    return catalog_rows[0]
+
+
+def _quote_sql_string_literal(value: str) -> str:
+    """Quote a string value for internal read-only SQL composition."""
+    return "'" + str(value or "").replace("'", "''") + "'"
+
+
+def _build_postgres_form_analysis_snapshot(
+    form_row: dict[str, Any],
+    *,
+    analysis_request: str,
+    user_language: str,
+) -> tuple[dict[str, Any], int, int]:
+    """Build chart-ready analysis payload from SQL-backed form response data."""
+    form_id = str(form_row.get("form_id", "") or "").strip()
+    spreadsheet_id = str(form_row.get("spreadsheet_id", "") or "").strip()
+    form_title = str(form_row.get("form_title", "") or form_id).strip() or form_id
+    spreadsheet_url = str(form_row.get("spreadsheet_url", "") or "").strip()
+    quoted_form_id = _quote_sql_string_literal(form_id)
+
+    responses_payload = json.loads(
+        query_form_response_database.invoke(
+            {
+                "sql": (
+                    "SELECT response_id, created_time, respondent_email "
+                    f"FROM form_responses WHERE form_id = {quoted_form_id} "
+                    "ORDER BY created_time ASC NULLS LAST, response_id ASC"
+                ),
+                "row_limit": 10000,
+            }
+        )
+    )
+    answers_payload = json.loads(
+        query_form_response_database.invoke(
+            {
+                "sql": (
+                    "SELECT response_id, question_title, answer_text "
+                    f"FROM form_response_answers WHERE form_id = {quoted_form_id} "
+                    "ORDER BY response_id ASC, question_title ASC"
+                ),
+                "row_limit": 50000,
+            }
+        )
+    )
+
+    response_rows = [
+        row for row in responses_payload.get("rows", []) if isinstance(row, dict)
+    ]
+    answer_rows = [
+        row for row in answers_payload.get("rows", []) if isinstance(row, dict)
+    ]
+
+    question_titles: list[str] = []
+    for row in answer_rows:
+        question_title = str(row.get("question_title", "") or "").strip()
+        if question_title and question_title not in question_titles:
+            question_titles.append(question_title)
+
+    answer_matrix: dict[str, dict[str, str]] = {}
+    question_counts: dict[str, dict[str, int]] = {}
+    response_ids_with_answers: set[str] = set()
+    for row in answer_rows:
+        response_id = str(row.get("response_id", "") or "").strip()
+        question_title = str(row.get("question_title", "") or "").strip()
+        answer_text = str(row.get("answer_text", "") or "").strip()
+        if not response_id or not question_title:
+            continue
+        response_ids_with_answers.add(response_id)
+        answer_matrix.setdefault(response_id, {})[question_title] = answer_text
+        normalized_answer = answer_text or "-"
+        question_counts.setdefault(question_title, {})
+        question_counts[question_title][normalized_answer] = (
+            question_counts[question_title].get(normalized_answer, 0) + 1
+        )
+
+    processed_headers = ["Response ID", "Submitted At", "Respondent Email", *question_titles]
+    processed_rows: list[list[str]] = []
+    for response in response_rows:
+        response_id = str(response.get("response_id", "") or "").strip()
+        answer_lookup = answer_matrix.get(response_id, {})
+        processed_rows.append(
+            [
+                response_id,
+                str(response.get("created_time", "") or "").strip(),
+                str(response.get("respondent_email", "") or "").strip(),
+                *[str(answer_lookup.get(question_title, "") or "").strip() for question_title in question_titles],
+            ]
+        )
+
+    summary_rows: list[list[str]] = []
+    for question_title in question_titles:
+        counts = question_counts.get(question_title, {})
+        total = sum(counts.values())
+        if total <= 0:
+            continue
+        ordered_answers = sorted(
+            counts.items(),
+            key=lambda item: (-int(item[1]), str(item[0]).casefold()),
+        )
+        for answer_text, count in ordered_answers:
+            percent = round((count / total) * 100, 2)
+            summary_rows.append(
+                [
+                    question_title,
+                    answer_text,
+                    str(count),
+                    f"{percent:.2f}",
+                ]
+            )
+
+    visual_payload = _build_spreadsheet_visual_payload(
+        spreadsheet_id=spreadsheet_id or form_id,
+        spreadsheet_title=form_title,
+        spreadsheet_url=spreadsheet_url,
+        processed_sheet_name="SQL Responses",
+        summary_sheet_name="SQL Summary",
+        row_count_written=len(processed_rows),
+        summary_rows=summary_rows,
+        analysis_request=analysis_request,
+        processed_headers=processed_headers,
+        processed_rows=processed_rows,
+        user_language=user_language,
+    )
+    return visual_payload, len(response_ids_with_answers), len(question_titles)
+
+
 def looks_like_form_creation_request(text: str) -> bool:
     """Return whether the user is probably asking to create or modify a form."""
     lowered = text.lower()
     if "spreadsheet" in lowered and "analy" in lowered:
+        return False
+    if _extract_requested_form_id(text) and looks_like_spreadsheet_analysis_request(text):
+        return False
+    if looks_like_spreadsheet_analysis_request(text) and any(
+        marker in lowered
+        for marker in (
+            "this form",
+            "previous form",
+            "last form",
+            "form นี้",
+            "ฟอร์มนี้",
+            "ฟอร์มก่อนหน้า",
+            "แบบฟอร์มนี้",
+            "แบบทดสอบนี้",
+        )
+    ):
         return False
 
     creation_keywords = (
@@ -7595,7 +7860,19 @@ def maybe_complete_database_request(messages: list[AnyMessage]) -> AIMessage | N
 
     user_language = infer_user_language(latest_human_content)
     lowered = latest_human_content.casefold()
-    if not looks_like_database_request(lowered):
+    explicit_form_id = _extract_requested_form_id(latest_human_content)
+    recent_thread_form_id = _extract_recent_thread_form_id(messages, latest_human_index)
+    thread_form_analysis_request = (
+        bool(recent_thread_form_id)
+        and looks_like_spreadsheet_analysis_request(latest_human_content)
+    )
+    if not looks_like_database_request(lowered) and not thread_form_analysis_request:
+        return None
+    if (
+        looks_like_form_creation_request(latest_human_content)
+        and not explicit_form_id
+        and not thread_form_analysis_request
+    ):
         return None
 
     schema_markers = (
@@ -7634,6 +7911,22 @@ def maybe_complete_database_request(messages: list[AnyMessage]) -> AIMessage | N
         "คำตอบล่าสุด",
         "คำตอบทั้งหมด",
         "แสดงคำตอบ",
+    )
+    analysis_markers = (
+        "analy",
+        "analysis",
+        "summary",
+        "summarize",
+        "insight",
+        "dashboard",
+        "chart",
+        "graph",
+        "วิเคราะห์",
+        "สรุป",
+        "อินไซต์",
+        "แดชบอร์ด",
+        "กราฟ",
+        "ชาร์ต",
     )
 
     try:
@@ -7719,6 +8012,54 @@ def maybe_complete_database_request(messages: list[AnyMessage]) -> AIMessage | N
                     )
                 )
             return AIMessage(content="\n".join(lines).strip())
+
+        if any(marker in lowered for marker in analysis_markers):
+            catalog_rows = _load_agent_form_catalog()
+            form_row = _choose_database_analysis_form(
+                latest_human_content,
+                catalog_rows,
+                preferred_form_id=recent_thread_form_id,
+            )
+            if not form_row:
+                if user_language == "th":
+                    return AIMessage(content="ยังไม่พบฟอร์มที่เก็บไว้ใน Postgres สำหรับการวิเคราะห์")
+                return AIMessage(content="No stored Postgres form was found for analysis.")
+
+            visual_payload, response_count, answered_question_count = _build_postgres_form_analysis_snapshot(
+                form_row,
+                analysis_request=latest_human_content,
+                user_language=user_language,
+            )
+            chart_count = len(visual_payload.get("charts", []) or [])
+            form_title = str(form_row.get("form_title", "") or form_row.get("form_id", "")).strip()
+            form_id = str(form_row.get("form_id", "") or "").strip()
+            if user_language == "th":
+                response_text = "\n".join(
+                    [
+                        "ฉันวิเคราะห์ข้อมูลคำตอบจาก Postgres และเตรียมกราฟสรุปไว้แล้ว",
+                        "",
+                        f"- ฟอร์ม: {form_title}",
+                        f"- Form ID: {form_id}",
+                        f"- จำนวนแถวคำตอบที่ใช้วิเคราะห์: {response_count}",
+                        f"- จำนวนคำถามที่มีคำตอบ: {answered_question_count}",
+                        f"- จำนวนกราฟที่แสดงในแชต: {chart_count}",
+                    ]
+                ).strip()
+            else:
+                response_text = "\n".join(
+                    [
+                        "I analyzed the stored Postgres form responses and prepared summary charts.",
+                        "",
+                        f"- Form: {form_title}",
+                        f"- Form ID: {form_id}",
+                        f"- Response rows analyzed: {response_count}",
+                        f"- Questions with answers: {answered_question_count}",
+                        f"- Charts shown in chat: {chart_count}",
+                    ]
+                ).strip()
+            return AIMessage(
+                content=_append_spreadsheet_visual_payload(response_text, visual_payload)
+            )
 
         if any(marker in lowered for marker in latest_response_markers):
             payload = json.loads(
