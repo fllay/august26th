@@ -435,18 +435,20 @@ const defaultComponents: any = {
     />
   ),
   table: ({ className, ...props }: { className?: string }) => (
-    <table
-      className={cn(
-        "my-5 w-full border-separate border-spacing-0 overflow-y-auto",
-        className,
-      )}
-      {...props}
-    />
+    <div className="markdown-table-wrapper my-5 flex w-full justify-center overflow-x-auto">
+      <table
+        className={cn(
+          "mx-auto w-fit max-w-full border-separate border-spacing-0",
+          className,
+        )}
+        {...props}
+      />
+    </div>
   ),
   th: ({ className, ...props }: { className?: string }) => (
     <th
       className={cn(
-        "bg-muted px-4 py-2 text-left font-bold first:rounded-tl-lg last:rounded-tr-lg [&[align=center]]:text-center [&[align=right]]:text-right",
+        "bg-muted max-w-64 px-4 py-2 text-left align-top font-bold whitespace-normal break-words first:rounded-tl-lg last:rounded-tr-lg [&[align=center]]:text-center [&[align=right]]:text-right",
         className,
       )}
       {...props}
@@ -455,7 +457,7 @@ const defaultComponents: any = {
   td: ({ className, ...props }: { className?: string }) => (
     <td
       className={cn(
-        "border-b border-l px-4 py-2 text-left last:border-r [&[align=center]]:text-center [&[align=right]]:text-right",
+        "max-w-72 border-b border-l px-4 py-2 text-left align-top whitespace-normal break-all last:border-r [&[align=center]]:text-center [&[align=right]]:text-right",
         className,
       )}
       {...props}

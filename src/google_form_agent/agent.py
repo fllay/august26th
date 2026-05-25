@@ -20,7 +20,7 @@ from urllib import request as urllib_request
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from xml.etree import ElementTree
 from PIL import Image
 
@@ -452,6 +452,33 @@ def looks_like_database_request(text: str) -> bool:
         "โพสต์เกรส",
     )
     return any(keyword in lowered for keyword in database_keywords)
+
+
+def _markdown_table_cell(value: Any) -> str:
+    if value is None:
+        return "-"
+    text = str(value).strip()
+    if not text:
+        return "-"
+    return text.replace("|", "\\|").replace("\r", " ").replace("\n", "<br />")
+
+
+def _format_markdown_table(
+    headers: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+) -> str:
+    if not headers:
+        return ""
+
+    lines = [
+        "| " + " | ".join(_markdown_table_cell(header) for header in headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append(
+            "| " + " | ".join(_markdown_table_cell(cell) for cell in row) + " |"
+        )
+    return "\n".join(lines).strip()
 
 
 def looks_like_form_creation_request(text: str) -> bool:
@@ -7650,23 +7677,47 @@ def maybe_complete_database_request(messages: list[AnyMessage]) -> AIMessage | N
                 if not rows:
                     lines.append("ไม่พบข้อมูลฟอร์ม")
                 else:
+                    table_rows: list[list[Any]] = []
                     for row in rows:
                         if not isinstance(row, dict):
                             continue
-                        lines.append(
-                            f"- {row.get('form_title') or row.get('form_id')} | form_id={row.get('form_id')} | spreadsheet_id={row.get('spreadsheet_id') or '-'}"
+                        table_rows.append(
+                            [
+                                row.get("form_title") or row.get("form_id"),
+                                row.get("form_id"),
+                                row.get("spreadsheet_id"),
+                                row.get("updated_at"),
+                            ]
                         )
+                    lines.append(
+                        _format_markdown_table(
+                            ["ชื่อฟอร์ม", "Form ID", "Spreadsheet ID", "อัปเดตล่าสุด"],
+                            table_rows,
+                        )
+                    )
                 return AIMessage(content="\n".join(lines).strip())
             lines = ["Forms stored in Postgres:", ""]
             if not rows:
                 lines.append("No forms found.")
             else:
+                table_rows = []
                 for row in rows:
                     if not isinstance(row, dict):
                         continue
-                    lines.append(
-                        f"- {row.get('form_title') or row.get('form_id')} | form_id={row.get('form_id')} | spreadsheet_id={row.get('spreadsheet_id') or '-'}"
+                    table_rows.append(
+                        [
+                            row.get("form_title") or row.get("form_id"),
+                            row.get("form_id"),
+                            row.get("spreadsheet_id"),
+                            row.get("updated_at"),
+                        ]
                     )
+                lines.append(
+                    _format_markdown_table(
+                        ["Form title", "Form ID", "Spreadsheet ID", "Updated at"],
+                        table_rows,
+                    )
+                )
             return AIMessage(content="\n".join(lines).strip())
 
         if any(marker in lowered for marker in latest_response_markers):
@@ -7687,23 +7738,47 @@ def maybe_complete_database_request(messages: list[AnyMessage]) -> AIMessage | N
                 if not rows:
                     lines.append("ไม่พบข้อมูลคำตอบ")
                 else:
+                    table_rows = []
                     for row in rows:
                         if not isinstance(row, dict):
                             continue
-                        lines.append(
-                            f"- form_id={row.get('form_id')} | response_id={row.get('response_id')} | created_time={row.get('created_time') or '-'} | respondent_email={row.get('respondent_email') or '-'}"
+                        table_rows.append(
+                            [
+                                row.get("form_id"),
+                                row.get("response_id"),
+                                row.get("created_time"),
+                                row.get("respondent_email"),
+                            ]
                         )
+                    lines.append(
+                        _format_markdown_table(
+                            ["Form ID", "Response ID", "เวลาส่งคำตอบ", "อีเมลผู้ตอบ"],
+                            table_rows,
+                        )
+                    )
                 return AIMessage(content="\n".join(lines).strip())
             lines = ["Latest responses stored in Postgres:", ""]
             if not rows:
                 lines.append("No responses found.")
             else:
+                table_rows = []
                 for row in rows:
                     if not isinstance(row, dict):
                         continue
-                    lines.append(
-                        f"- form_id={row.get('form_id')} | response_id={row.get('response_id')} | created_time={row.get('created_time') or '-'} | respondent_email={row.get('respondent_email') or '-'}"
+                    table_rows.append(
+                        [
+                            row.get("form_id"),
+                            row.get("response_id"),
+                            row.get("created_time"),
+                            row.get("respondent_email"),
+                        ]
                     )
+                lines.append(
+                    _format_markdown_table(
+                        ["Form ID", "Response ID", "Created time", "Respondent email"],
+                        table_rows,
+                    )
+                )
             return AIMessage(content="\n".join(lines).strip())
     except Exception as exc:
         raise RuntimeError(
