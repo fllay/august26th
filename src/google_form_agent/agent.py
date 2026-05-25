@@ -213,6 +213,12 @@ Work deliberately:
     reading the spreadsheet structure.
 - Report the spreadsheet/tab used, the row scope, the key findings, and any
     chart or summary tab created.
+- For Postgres response-store questions:
+  - Use inspect_form_response_database before writing SQL if the user asks
+    about the database schema or available tables.
+  - Use query_form_response_database for read-only queries against the
+    response-store tables when the user asks for stored form/response data.
+  - Do not invent database contents. Read from Postgres with tools.
 - Reply in the same language as the user's most recent message whenever practical.
 """
 
@@ -429,6 +435,23 @@ def looks_like_spreadsheet_analysis_request(text: str) -> bool:
         "เปรียบเทียบ",
     )
     return any(keyword in lowered for keyword in analysis_keywords)
+
+
+def looks_like_database_request(text: str) -> bool:
+    """Return whether the user is probably asking about the Postgres response store."""
+    lowered = str(text or "").strip().casefold()
+    if not lowered:
+        return False
+    database_keywords = (
+        "postgres",
+        "postgresql",
+        "database",
+        "sql",
+        "db",
+        "ฐานข้อมูล",
+        "โพสต์เกรส",
+    )
+    return any(keyword in lowered for keyword in database_keywords)
 
 
 def looks_like_form_creation_request(text: str) -> bool:
@@ -1386,6 +1409,163 @@ def _open_form_response_db() -> Any:
 
 def _describe_form_response_store() -> str:
     return "postgres"
+
+
+def _serialize_pg_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return base64.b64encode(value).decode("ascii")
+    return value
+
+
+def _response_store_schema_payload() -> dict[str, Any]:
+    return {
+        "database": _describe_form_response_store(),
+        "tables": [
+            {
+                "name": "agent_forms",
+                "description": "Forms created and managed by the agent.",
+                "columns": [
+                    "form_id",
+                    "spreadsheet_id",
+                    "form_title",
+                    "form_url",
+                    "responder_url",
+                    "spreadsheet_url",
+                    "google_oauth_session_key",
+                    "created_at",
+                    "updated_at",
+                ],
+            },
+            {
+                "name": "form_responses",
+                "description": "One row per Google Form response synced from the Forms API.",
+                "columns": [
+                    "form_id",
+                    "response_id",
+                    "created_time",
+                    "last_submitted_time",
+                    "respondent_email",
+                    "response_json",
+                    "synced_at",
+                ],
+            },
+            {
+                "name": "form_response_answers",
+                "description": "Flattened answer rows per response and question.",
+                "columns": [
+                    "form_id",
+                    "response_id",
+                    "question_id",
+                    "question_title",
+                    "answer_text",
+                ],
+            },
+        ],
+        "notes": [
+            "Use agent_forms to find forms and linked spreadsheets.",
+            "Use form_responses for response-level timestamps and raw response_json.",
+            "Use form_response_answers for question/answer level analysis.",
+            "respondent_email is only populated when the synced response payload contains it.",
+        ],
+    }
+
+
+_FORBIDDEN_SQL_TOKENS = (
+    "insert",
+    "update",
+    "delete",
+    "alter",
+    "drop",
+    "create",
+    "truncate",
+    "grant",
+    "revoke",
+    "copy",
+    "comment",
+    "vacuum",
+    "reindex",
+    "refresh",
+    "analyze",
+    "merge",
+    "call",
+    "execute",
+    "prepare",
+    "deallocate",
+    "begin",
+    "commit",
+    "rollback",
+    "savepoint",
+    "lock",
+    "set ",
+    "reset ",
+    "show ",
+    "listen",
+    "notify",
+    "unlisten",
+    "pg_sleep",
+)
+
+
+def _validate_readonly_response_store_sql(sql: str) -> str:
+    normalized = str(sql or "").strip()
+    if not normalized:
+        raise RuntimeError("sql is required.")
+
+    stripped = normalized.rstrip().rstrip(";").strip()
+    lowered = stripped.casefold()
+    if not (lowered.startswith("select ") or lowered.startswith("with ")):
+        raise RuntimeError("Only read-only SELECT or WITH queries are allowed.")
+
+    if ";" in stripped:
+        raise RuntimeError("Only a single SQL statement is allowed.")
+
+    for token in _FORBIDDEN_SQL_TOKENS:
+        escaped = re.escape(token.strip())
+        if " " in token or token.endswith(" "):
+            pattern = rf"(?<![a-z0-9_]){escaped}(?![a-z0-9_])"
+        else:
+            pattern = rf"\b{escaped}\b"
+        if re.search(pattern, lowered):
+            raise RuntimeError(f"Forbidden SQL token detected: {token.strip()}")
+
+    return stripped
+
+
+def _execute_readonly_response_store_query(sql: str, row_limit: int = 200) -> dict[str, Any]:
+    normalized_sql = _validate_readonly_response_store_sql(sql)
+    normalized_limit = max(1, min(int(row_limit), 500))
+
+    with _open_form_response_db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SET TRANSACTION READ ONLY")
+            cursor.execute("SET LOCAL statement_timeout = 5000")
+            cursor.execute(normalized_sql)
+            rows = cursor.fetchmany(normalized_limit + 1)
+            columns = [desc.name for desc in (cursor.description or [])]
+
+    truncated = len(rows) > normalized_limit
+    if truncated:
+        rows = rows[:normalized_limit]
+
+    serialized_rows = [
+        {
+            column: _serialize_pg_value(value)
+            for column, value in zip(columns, row, strict=False)
+        }
+        for row in rows
+    ]
+
+    return {
+        "database": _describe_form_response_store(),
+        "sql": normalized_sql,
+        "rowCount": len(serialized_rows),
+        "truncated": truncated,
+        "rowLimit": normalized_limit,
+        "columns": columns,
+        "rows": serialized_rows,
+    }
 
 
 def _upsert_agent_form_record(
@@ -7196,6 +7376,173 @@ def maybe_complete_spreadsheet_analysis_request(messages: list[AnyMessage]) -> A
         ) from exc
 
 
+def maybe_complete_database_request(messages: list[AnyMessage]) -> AIMessage | None:
+    """Directly answer obvious Postgres response-store requests with read-only SQL."""
+    latest_human_index = -1
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].type == "human":
+            latest_human_index = index
+            break
+
+    if latest_human_index == -1:
+        return None
+
+    latest_human_content = content_to_text(messages[latest_human_index].content).strip()
+    if not latest_human_content:
+        return None
+
+    user_language = infer_user_language(latest_human_content)
+    lowered = latest_human_content.casefold()
+    if not looks_like_database_request(lowered):
+        return None
+
+    schema_markers = (
+        "schema",
+        "table",
+        "tables",
+        "column",
+        "columns",
+        "structure",
+        "available",
+        "what tables",
+        "describe database",
+        "โครงสร้าง",
+        "ตาราง",
+        "คอลัมน์",
+        "มีอะไรบ้าง",
+    )
+    list_form_markers = (
+        "list all forms",
+        "list forms",
+        "show forms",
+        "all forms",
+        "stored forms",
+        "forms stored",
+        "รายการฟอร์ม",
+        "ฟอร์มทั้งหมด",
+        "แสดงฟอร์ม",
+        "ลิสต์ฟอร์ม",
+    )
+    latest_response_markers = (
+        "latest responses",
+        "recent responses",
+        "last responses",
+        "show responses",
+        "responses",
+        "คำตอบล่าสุด",
+        "คำตอบทั้งหมด",
+        "แสดงคำตอบ",
+    )
+
+    try:
+        if any(marker in lowered for marker in schema_markers):
+            payload = json.loads(inspect_form_response_database.invoke({}))
+            if user_language == "th":
+                lines = [
+                    "โครงสร้างฐานข้อมูล Postgres สำหรับฟอร์มที่เอเจนต์จัดการ:",
+                    "",
+                ]
+                for table in payload.get("tables", []):
+                    if not isinstance(table, dict):
+                        continue
+                    lines.append(f"- {table.get('name', '')}: {table.get('description', '')}")
+                return AIMessage(content="\n".join(lines).strip())
+            lines = [
+                "Postgres response-store schema:",
+                "",
+            ]
+            for table in payload.get("tables", []):
+                if not isinstance(table, dict):
+                    continue
+                lines.append(f"- {table.get('name', '')}: {table.get('description', '')}")
+            return AIMessage(content="\n".join(lines).strip())
+
+        if any(marker in lowered for marker in list_form_markers):
+            payload = json.loads(
+                query_form_response_database.invoke(
+                    {
+                        "sql": (
+                            "SELECT form_id, form_title, spreadsheet_id, form_url, spreadsheet_url, updated_at "
+                            "FROM agent_forms ORDER BY updated_at DESC"
+                        ),
+                        "row_limit": 200,
+                    }
+                )
+            )
+            rows = payload.get("rows", [])
+            if user_language == "th":
+                lines = ["รายการฟอร์มที่เก็บใน Postgres:", ""]
+                if not rows:
+                    lines.append("ไม่พบข้อมูลฟอร์ม")
+                else:
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        lines.append(
+                            f"- {row.get('form_title') or row.get('form_id')} | form_id={row.get('form_id')} | spreadsheet_id={row.get('spreadsheet_id') or '-'}"
+                        )
+                return AIMessage(content="\n".join(lines).strip())
+            lines = ["Forms stored in Postgres:", ""]
+            if not rows:
+                lines.append("No forms found.")
+            else:
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    lines.append(
+                        f"- {row.get('form_title') or row.get('form_id')} | form_id={row.get('form_id')} | spreadsheet_id={row.get('spreadsheet_id') or '-'}"
+                    )
+            return AIMessage(content="\n".join(lines).strip())
+
+        if any(marker in lowered for marker in latest_response_markers):
+            payload = json.loads(
+                query_form_response_database.invoke(
+                    {
+                        "sql": (
+                            "SELECT form_id, response_id, created_time, respondent_email "
+                            "FROM form_responses ORDER BY created_time DESC NULLS LAST"
+                        ),
+                        "row_limit": 50,
+                    }
+                )
+            )
+            rows = payload.get("rows", [])
+            if user_language == "th":
+                lines = ["คำตอบล่าสุดที่เก็บใน Postgres:", ""]
+                if not rows:
+                    lines.append("ไม่พบข้อมูลคำตอบ")
+                else:
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        lines.append(
+                            f"- form_id={row.get('form_id')} | response_id={row.get('response_id')} | created_time={row.get('created_time') or '-'} | respondent_email={row.get('respondent_email') or '-'}"
+                        )
+                return AIMessage(content="\n".join(lines).strip())
+            lines = ["Latest responses stored in Postgres:", ""]
+            if not rows:
+                lines.append("No responses found.")
+            else:
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    lines.append(
+                        f"- form_id={row.get('form_id')} | response_id={row.get('response_id')} | created_time={row.get('created_time') or '-'} | respondent_email={row.get('respondent_email') or '-'}"
+                    )
+            return AIMessage(content="\n".join(lines).strip())
+    except Exception as exc:
+        raise RuntimeError(
+            (
+                "ฉันตรวจพบว่านี่เป็นคำขออ่านข้อมูลจาก Postgres แต่การดึงข้อมูลล้มเหลว "
+                if user_language == "th"
+                else "I recognized this as a Postgres data request, but reading the database failed. "
+            )
+            + f"Details: {exc}"
+        ) from exc
+
+    return None
+
+
 @tool
 def list_google_forms(query: str = "", limit: int = 20) -> str:
     """List the user's Google Forms."""
@@ -7234,6 +7581,26 @@ def list_google_forms(query: str = "", limit: int = 20) -> str:
             "count": len(forms),
             "forms": forms,
         },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@tool
+def inspect_form_response_database() -> str:
+    """Describe the Postgres response-store schema used for agent-managed Google Forms."""
+    return json.dumps(
+        _response_store_schema_payload(),
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@tool
+def query_form_response_database(sql: str, row_limit: int = 200) -> str:
+    """Run a bounded read-only Postgres query against the form response store."""
+    return json.dumps(
+        _execute_readonly_response_store_query(sql, row_limit=row_limit),
         ensure_ascii=False,
         indent=2,
     )
@@ -9491,6 +9858,14 @@ class LocalLLMMessageFormatMiddleware(AgentMiddleware):
             )
             if direct_sheet_response is not None:
                 return direct_sheet_response
+            direct_database_response = await asyncio.to_thread(
+                run_with_google_oauth_session,
+                google_oauth_session_key,
+                maybe_complete_database_request,
+                messages,
+            )
+            if direct_database_response is not None:
+                return direct_database_response
             direct_analysis_response = await asyncio.to_thread(
                 run_with_google_oauth_session,
                 google_oauth_session_key,
@@ -9665,6 +10040,8 @@ async def build_agent() -> Any:
     tools = [
         create_form_with_response_sheet,
         list_google_forms,
+        inspect_form_response_database,
+        query_form_response_database,
         format_response_sheet_for_analysis,
         inspect_spreadsheet_for_analysis,
         *filtered_mcp_tools,
