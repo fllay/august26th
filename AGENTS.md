@@ -96,6 +96,9 @@ These instructions apply to this repository unless a more specific `AGENTS.md` e
   - uploaded files may define the quiz/test questions and answer key, but should not invent extra participant fields
   - exact-source mode should prefer the uploaded source's real question count over any default generated count
   - do not synthesize a form description from inferred topic, quiz type, or question count; only use an explicit description if the user actually provided one
+  - generated form titles should normalize duplicated test/survey prefixes and should not keep respondent-field phrases such as `โดยมีชื่อ หน่วยงาน เบอร์โทร อีเมล` in the final title
+  - apply final title cleanup to the completed generated title itself, not just the inferred topic, so duplicated prefixes and respondent-field suffixes are removed even when they survive earlier parsing
+  - if the user did not provide an explicit `Title: ...`, let the agent choose the actual form title from the brief and extracted question context, with the old heuristic title extractor kept only as fallback
 - The form formatter currently produces a small set of post-processed tabs:
   - a cleaned wide `Processed Responses`-style sheet that adds helper columns such as `Response ID`, answered-question count, and completion rate before the metadata/question columns
   - a `Question Summary` sheet with grouped counts/percentages

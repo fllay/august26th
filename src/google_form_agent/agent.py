@@ -500,6 +500,73 @@ def _trim_form_topic_tail(text: str) -> str:
     return cleaned
 
 
+def _strip_leading_title_variant(text: str, variants: tuple[str, ...]) -> str:
+    cleaned = str(text or "").strip()
+    lowered = cleaned.casefold()
+    for variant in variants:
+        normalized_variant = variant.casefold()
+        if lowered.startswith(normalized_variant):
+            return cleaned[len(variant):].strip(" -:|,")
+    return cleaned
+
+
+def _normalize_generated_form_title(title: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(title or "")).strip().strip(" .,:;-")
+    if not cleaned:
+        return "Generated Google Form"
+
+    # Remove respondent-field suffixes that belong in questions, not in the title.
+    cleaned = re.split(
+        r"\s+โดยมี(?:ชื่อ|ชื่อ-นามสกุล|หน่วยงาน|เบอร์โทร|เบอร์โทรศัพท์|อีเมล)\b",
+        cleaned,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip(" .,:;-")
+    cleaned = re.split(
+        r"\s+(?:with|including|having)\s+(?:name|full name|department|organization|phone|email)\b",
+        cleaned,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip(" .,:;-")
+
+    duplicate_prefix_pairs = (
+        ("แบบทดสอบก่อนการอบรม", "แบบทดสอบก่อนอบรม"),
+        ("แบบทดสอบก่อนการอบรม", "แบบทดสอบก่อนการอบรม"),
+        ("แบบทดสอบหลังการอบรม", "แบบทดสอบหลังอบรม"),
+        ("แบบทดสอบหลังการอบรม", "แบบทดสอบหลังการอบรม"),
+        ("แบบประเมิน", "แบบประเมิน"),
+        ("Pre-test Form", "Pre-test"),
+        ("Post-test Form", "Post-test"),
+        ("Feedback Form", "Feedback"),
+    )
+    lowered = cleaned.casefold()
+    for primary, duplicate in duplicate_prefix_pairs:
+        primary_folded = primary.casefold()
+        duplicate_folded = duplicate.casefold()
+        doubled = f"{primary_folded} {duplicate_folded}"
+        if lowered.startswith(doubled):
+            cleaned = f"{primary} {cleaned[len(primary) + 1 + len(duplicate):].strip()}".strip()
+            lowered = cleaned.casefold()
+            break
+
+    return re.sub(r"\s+", " ", cleaned).strip(" .,:;-") or "Generated Google Form"
+
+
+def _extract_explicit_form_title(text: str) -> str:
+    lines = [line.rstrip() for line in str(text or "").splitlines()]
+    for index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if line.lower() == "title:" and index + 1 < len(lines):
+            candidate = lines[index + 1].strip()
+            if candidate:
+                return _normalize_generated_form_title(candidate)
+        if line.lower().startswith("title:"):
+            candidate = line.split(":", 1)[1].strip()
+            if candidate:
+                return _normalize_generated_form_title(candidate)
+    return ""
+
+
 def extract_form_topic(text: str) -> str:
     """Extract the main subject/topic of the requested form when possible."""
     lowered = text.lower()
@@ -632,29 +699,137 @@ def infer_form_is_quiz(text: str, questions: list[dict[str, Any]] | None = None)
 
 def extract_form_title(text: str) -> str:
     """Extract a form title from common prompt patterns."""
-    lines = [line.rstrip() for line in text.splitlines()]
-    for index, raw_line in enumerate(lines):
-        line = raw_line.strip()
-        if line.lower() == "title:" and index + 1 < len(lines):
-            candidate = lines[index + 1].strip()
-            if candidate:
-                return candidate
-        if line.lower().startswith("title:"):
-            candidate = line.split(":", 1)[1].strip()
-            if candidate:
-                return candidate
+    explicit_title = _extract_explicit_form_title(text)
+    if explicit_title:
+        return explicit_title
 
     topic = extract_form_topic(text)
     lowered = text.casefold()
     if any(keyword in lowered for keyword in ("pre-test", "pretest", "แบบทดสอบก่อน", "แบบทดสอบ")):
-        return f"แบบทดสอบก่อนการอบรม {topic}".strip() if ("thai" in lowered or "ภาษาไทย" in lowered or re.search(r"[\u0E00-\u0E7F]", text)) else f"Pre-test Form - {topic}".strip(" -")
+        if "thai" in lowered or "ภาษาไทย" in lowered or re.search(r"[\u0E00-\u0E7F]", text):
+            normalized_topic = _strip_leading_title_variant(
+                topic,
+                (
+                    "แบบทดสอบก่อนการอบรม",
+                    "แบบทดสอบก่อนอบรม",
+                    "แบบทดสอบก่อนเรียน",
+                    "ข้อสอบก่อนการอบรม",
+                    "ข้อสอบก่อนอบรม",
+                ),
+            )
+            return _normalize_generated_form_title(f"แบบทดสอบก่อนการอบรม {normalized_topic}".strip())
+        normalized_topic = _strip_leading_title_variant(
+            topic,
+            ("Pre-test Form", "Pre-test", "Pretest Form", "Pretest", "Test"),
+        )
+        return _normalize_generated_form_title(f"Pre-test Form - {normalized_topic}".strip(" -"))
     if any(keyword in lowered for keyword in ("post-test", "posttest", "แบบทดสอบหลัง")):
-        return f"แบบทดสอบหลังการอบรม {topic}".strip() if ("thai" in lowered or "ภาษาไทย" in lowered or re.search(r"[\u0E00-\u0E7F]", text)) else f"Post-test Form - {topic}".strip(" -")
+        if "thai" in lowered or "ภาษาไทย" in lowered or re.search(r"[\u0E00-\u0E7F]", text):
+            normalized_topic = _strip_leading_title_variant(
+                topic,
+                (
+                    "แบบทดสอบหลังการอบรม",
+                    "แบบทดสอบหลังอบรม",
+                    "แบบทดสอบหลังเรียน",
+                    "ข้อสอบหลังการอบรม",
+                    "ข้อสอบหลังอบรม",
+                ),
+            )
+            return _normalize_generated_form_title(f"แบบทดสอบหลังการอบรม {normalized_topic}".strip())
+        normalized_topic = _strip_leading_title_variant(
+            topic,
+            ("Post-test Form", "Post-test", "Posttest Form", "Posttest", "Test"),
+        )
+        return _normalize_generated_form_title(f"Post-test Form - {normalized_topic}".strip(" -"))
     if any(keyword in lowered for keyword in ("feedback", "survey", "satisfaction", "แบบประเมิน", "ความพึงพอใจ")):
-        return f"แบบประเมิน {topic}".strip() if ("thai" in lowered or "ภาษาไทย" in lowered or re.search(r"[\u0E00-\u0E7F]", text)) else f"Feedback Form - {topic}".strip(" -")
+        if "thai" in lowered or "ภาษาไทย" in lowered or re.search(r"[\u0E00-\u0E7F]", text):
+            normalized_topic = _strip_leading_title_variant(
+                topic,
+                ("แบบประเมิน", "แบบสอบถาม", "แบบสำรวจ"),
+            )
+            return _normalize_generated_form_title(f"แบบประเมิน {normalized_topic}".strip())
+        normalized_topic = _strip_leading_title_variant(
+            topic,
+            ("Feedback Form", "Feedback", "Survey Form", "Survey"),
+        )
+        return _normalize_generated_form_title(f"Feedback Form - {normalized_topic}".strip(" -"))
     if topic:
-        return topic
-    return "Generated Google Form"
+        return _normalize_generated_form_title(topic)
+    return _normalize_generated_form_title("Generated Google Form")
+
+
+def _choose_form_title_with_agent(
+    source_text: str,
+    *,
+    user_language: str,
+    respondent_questions: list[dict[str, Any]] | None = None,
+    source_questions: list[dict[str, Any]] | None = None,
+) -> str:
+    explicit_title = _extract_explicit_form_title(source_text)
+    if explicit_title:
+        return explicit_title
+
+    heuristic_title = extract_form_title(source_text)
+    normalized_brief = str(source_text or "").strip()
+    if not normalized_brief:
+        return heuristic_title
+
+    respondent_titles = [
+        str(question.get("title", "") or "").strip()
+        for question in (respondent_questions or [])
+        if str(question.get("title", "") or "").strip()
+    ]
+    source_question_titles = [
+        str(question.get("title", "") or "").strip()
+        for question in (source_questions or [])[:8]
+        if str(question.get("title", "") or "").strip()
+    ]
+
+    prompt_language = "Thai" if user_language == "th" else "English"
+    model = build_chat_model()
+    response = model.invoke(
+        [
+            SystemMessage(
+                content=(
+                    "You choose concise, user-facing Google Form titles. "
+                    "Return only the final title text. "
+                    "Do not include quotes, bullets, labels, or explanations. "
+                    "Do not include respondent-information field names such as name, department, phone, or email in the title. "
+                    "Do not duplicate prefixes like pre-test, post-test, feedback, or survey. "
+                    "Keep the title clear and natural."
+                )
+            ),
+            HumanMessage(
+                content=(
+                    f"User language: {prompt_language}\n"
+                    f"Original request:\n{normalized_brief}\n\n"
+                    f"Heuristic fallback title:\n{heuristic_title}\n\n"
+                    + (
+                        "Respondent information fields already handled separately:\n"
+                        + "\n".join(f"- {title}" for title in respondent_titles)
+                        + "\n\n"
+                        if respondent_titles
+                        else ""
+                    )
+                    + (
+                        "Question titles from the source content:\n"
+                        + "\n".join(f"- {title}" for title in source_question_titles)
+                        + "\n\n"
+                        if source_question_titles
+                        else ""
+                    )
+                    + (
+                        "Choose the best actual form title in Thai."
+                        if user_language == "th"
+                        else "Choose the best actual form title in English."
+                    )
+                )
+            ),
+        ]
+    )
+    candidate = content_to_text(response.content).strip().splitlines()[0].strip("`\"' ")
+    normalized_candidate = _normalize_generated_form_title(candidate)
+    return normalized_candidate or heuristic_title
 
 
 def extract_form_description(text: str) -> str:
@@ -9590,12 +9765,20 @@ def maybe_complete_form_creation_request(messages: list[AnyMessage]) -> AIMessag
         file_questions,
     )
 
-    title = extract_form_title(parsing_source).strip() or "Generated Google Form"
-    description = extract_form_description(parsing_source).strip()
     respondent_prompt_source = latest_user_instruction or latest_human_content
     respondent_questions = extract_requested_respondent_questions(respondent_prompt_source)
     if not respondent_questions:
         respondent_questions = extract_inline_respondent_questions(respondent_prompt_source)
+    try:
+        title = _choose_form_title_with_agent(
+            parsing_source,
+            user_language=user_language,
+            respondent_questions=respondent_questions,
+            source_questions=file_questions,
+        ).strip() or "Generated Google Form"
+    except Exception:
+        title = extract_form_title(parsing_source).strip() or "Generated Google Form"
+    description = extract_form_description(parsing_source).strip()
     expected_question_count = 0 if exact_source_mode else infer_default_question_count(parsing_source)
     section_structure = extract_requested_section_structure(parsing_source)
     if not section_structure:
