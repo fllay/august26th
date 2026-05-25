@@ -134,9 +134,6 @@ export function Thread() {
   const [input, setInput] = useState("");
   const [userId, setUserId] = useState("");
   const userIdRef = useRef("");
-  const [feedbackById, setFeedbackById] = useState<Record<string, number>>({});
-  const feedbackLoadingRef = useRef(false);
-  const feedbackMissingKeyRef = useRef("");
   const {
     contentBlocks,
     setContentBlocks,
@@ -338,88 +335,6 @@ export function Thread() {
   useEffect(() => {
     void resolveUserId();
   }, [resolveUserId]);
-
-  const fetchFeedback = useCallback(async (fillIds?: string[]) => {
-    if (!threadId || isLoading) return;
-    if (feedbackLoadingRef.current) return;
-    feedbackLoadingRef.current = true;
-    try {
-      const res = await fetch(
-        `/api/feedback?sessionId=${encodeURIComponent(threadId)}`,
-      );
-      if (!res.ok) {
-        throw new Error(`Feedback fetch failed: ${res.status}`);
-      }
-      const data = (await res.json()) as { feedback?: Record<string, number> };
-      const next = { ...(data.feedback ?? {}) };
-      if (fillIds && fillIds.length > 0) {
-        for (const id of fillIds) {
-          if (!(id in next)) {
-            next[id] = 0;
-          }
-        }
-      }
-      setFeedbackById(next);
-    } catch (error) {
-      console.error(error);
-    } finally {
-      feedbackLoadingRef.current = false;
-    }
-  }, [threadId, isLoading]);
-
-  useEffect(() => {
-    if (!threadId) {
-      setFeedbackById({});
-      return;
-    }
-    fetchFeedback();
-  }, [threadId, fetchFeedback]);
-
-  useEffect(() => {
-    if (!threadId || isLoading) return;
-    const aiIds = messages
-      .filter((m) => m.type === "ai" && m.id)
-      .map((m) => m.id as string);
-    const missingIds = aiIds.filter((id) => !(id in feedbackById));
-    if (missingIds.length === 0) {
-      feedbackMissingKeyRef.current = "";
-      return;
-    }
-    const missingKey = [...missingIds].sort().join(",");
-    if (feedbackMissingKeyRef.current === missingKey) return;
-    feedbackMissingKeyRef.current = missingKey;
-    fetchFeedback(missingIds);
-  }, [messages, threadId, isLoading, feedbackById, fetchFeedback]);
-
-  const updateFeedback = useCallback(
-    async (messageId: string, rating: number) => {
-      if (!threadId) return;
-      const previous = feedbackById[messageId] ?? 0;
-      setFeedbackById((prev) => ({ ...prev, [messageId]: rating }));
-      try {
-        const res = await fetch("/api/feedback", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            sessionId: threadId,
-            messageId,
-            feedback: rating,
-          }),
-        });
-        if (!res.ok) {
-          throw new Error(`Feedback update failed: ${res.status}`);
-        }
-        await fetchFeedback();
-      } catch (error) {
-        console.error(error);
-        setFeedbackById((prev) => ({ ...prev, [messageId]: previous }));
-        toast.error("Failed to update feedback.", {
-          duration: 4000,
-        });
-      }
-    },
-    [threadId, feedbackById, fetchFeedback],
-  );
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -835,8 +750,6 @@ export function Thread() {
                           isLoading={isLoading}
                           threadMessages={displayMessages}
                           handleRegenerate={handleRegenerate}
-                          feedbackById={feedbackById}
-                          onFeedbackChange={updateFeedback}
                         />
                       ),
                     )}

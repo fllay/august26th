@@ -17,7 +17,6 @@ import { Fragment } from "react/jsx-runtime";
 import { useEffect, useMemo, useState } from "react";
 import { useQueryState, parseAsBoolean } from "nuqs";
 import { useArtifact } from "../artifact";
-import { ThumbsDown, ThumbsUp } from "lucide-react";
 import {
   SpreadsheetAnalysisVisual,
   type SpreadsheetAnalysisVisualPayload,
@@ -214,15 +213,11 @@ export function AssistantMessage({
   message,
   isLoading,
   handleRegenerate,
-  feedbackById,
-  onFeedbackChange,
   threadMessages: threadMessagesOverride,
 }: {
   message: Message | undefined;
   isLoading: boolean;
   handleRegenerate: (parentCheckpoint: Checkpoint | null | undefined) => void;
-  feedbackById: Record<string, number>;
-  onFeedbackChange?: (messageId: string, rating: number) => void;
   threadMessages?: Message[];
 }) {
   const content = message?.content ?? [];
@@ -269,19 +264,6 @@ export function AssistantMessage({
   const isToolResult = message?.type === "tool";
   const isToolCallMessage =
     message?.type === "ai" && (hasToolCalls || hasAnthropicToolCalls);
-  const feedbackMessageId = message?.id ?? meta?.messageId ?? "";
-  const rawFeedback =
-    feedbackMessageId && feedbackById[feedbackMessageId] !== undefined
-      ? feedbackById[feedbackMessageId]
-      : 0;
-  const normalizedFeedback =
-    rawFeedback === -1 || rawFeedback === 1 ? rawFeedback : 0;
-
-  const handleFeedback = (rating: number) => {
-    if (!feedbackMessageId || !onFeedbackChange) return;
-    const next = normalizedFeedback === rating ? 0 : rating;
-    onFeedbackChange(feedbackMessageId, next);
-  };
   const messageIndex = useMemo(() => {
     if (!message?.id) return -1;
     return threadMessages.findIndex((m) => m.id === message.id);
@@ -582,34 +564,6 @@ export function AssistantMessage({
                 isAiMessage={true}
                 handleRegenerate={() => handleRegenerate(parentCheckpoint)}
               />
-              {message?.type === "ai" && (
-                <div className="flex items-center gap-1">
-                  <button
-                    type="button"
-                    aria-pressed={normalizedFeedback === 1}
-                    className={cn(
-                      "rounded-md p-1 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-900",
-                      normalizedFeedback === 1 &&
-                        "bg-emerald-600 text-white hover:text-white",
-                    )}
-                    onClick={() => handleFeedback(1)}
-                  >
-                    <ThumbsUp className="size-4" />
-                  </button>
-                  <button
-                    type="button"
-                    aria-pressed={normalizedFeedback === -1}
-                    className={cn(
-                      "rounded-md p-1 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-900",
-                      normalizedFeedback === -1 &&
-                        "bg-rose-600 text-white hover:text-white",
-                    )}
-                    onClick={() => handleFeedback(-1)}
-                  >
-                    <ThumbsDown className="size-4" />
-                  </button>
-                </div>
-              )}
             </div>
           </>
         )}
