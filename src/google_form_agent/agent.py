@@ -2248,9 +2248,14 @@ def _plan_form_scoped_database_query(text: str) -> dict[str, Any] | None:
         return {
             "kind": "response-rows",
         }
+    if _looks_like_score_statistics_request(text):
+        return {
+            "kind": "score-stats",
+        }
     if _looks_like_score_ranking_request(text) and _looks_like_respondent_identity_request(text):
         return {
             "kind": "top-scorer",
+            "direction": _infer_score_ranking_direction(text),
         }
     return None
 
@@ -2309,6 +2314,114 @@ def _looks_like_respondent_identity_request(text: str) -> bool:
         "ใคร",
     )
     return any(marker in lowered for marker in identity_markers)
+
+
+def _looks_like_score_statistics_request(text: str) -> bool:
+    """Return whether the user is asking for score statistics such as mean or median."""
+    lowered = str(text or "").casefold()
+    if not lowered:
+        return False
+    stats_markers = (
+        "median",
+        "mean",
+        "average",
+        "avg",
+        "statistics",
+        "stats",
+        "basic stat",
+        "summary stat",
+        "ค่ากลาง",
+        "ค่าเฉลี่ย",
+        "มัธยฐาน",
+        "สถิติ",
+        "สถิติพื้นฐาน",
+        "ค่าเฉลี่ยคะแนน",
+    )
+    return any(marker in lowered for marker in stats_markers)
+
+
+def _infer_requested_score_statistics(text: str) -> list[str]:
+    """Infer which score statistics the user explicitly asked for."""
+    lowered = str(text or "").casefold()
+    if not lowered:
+        return ["median_score"]
+
+    requested: list[str] = []
+
+    median_markers = ("median", "ค่ากลาง", "มัธยฐาน", "median_score")
+    average_markers = ("average", "avg", "mean", "ค่าเฉลี่ย", "avg_score", "mean_score")
+    min_markers = ("minimum", "min", "lowest", "ต่ำสุด", "น้อยที่สุด", "min_score")
+    max_markers = ("maximum", "max", "highest", "สูงสุด", "มากที่สุด", "max_score")
+    count_markers = ("count", "จำนวน", "กี่", "response count", "response_count")
+    broad_summary_markers = (
+        "basic stat",
+        "summary stat",
+        "statistics",
+        "stats",
+        "สถิติ",
+        "สถิติพื้นฐาน",
+        "summary",
+    )
+
+    if any(marker in lowered for marker in median_markers):
+        requested.append("median_score")
+    if any(marker in lowered for marker in average_markers):
+        requested.append("avg_score")
+    if any(marker in lowered for marker in min_markers):
+        requested.append("min_score")
+    if any(marker in lowered for marker in max_markers):
+        requested.append("max_score")
+    if any(marker in lowered for marker in count_markers):
+        requested.append("response_count")
+
+    if requested:
+        ordered_unique: list[str] = []
+        seen: set[str] = set()
+        for item in requested:
+            if item in seen:
+                continue
+            seen.add(item)
+            ordered_unique.append(item)
+        return ordered_unique
+
+    if any(marker in lowered for marker in broad_summary_markers):
+        return ["response_count", "min_score", "max_score", "avg_score", "median_score"]
+
+    return ["median_score"]
+
+
+def _infer_score_ranking_direction(text: str) -> str:
+    """Infer whether a score-ranking request asks for the highest or lowest score."""
+    lowered = str(text or "").casefold()
+    if not lowered:
+        return "desc"
+    lowest_markers = (
+        "lowest",
+        "least",
+        "worst",
+        "bottom",
+        "คะแนนน้อยที่สุด",
+        "คะแนนต่ำสุด",
+        "น้อยที่สุด",
+        "ต่ำสุด",
+        "ได้น้อยที่สุด",
+    )
+    highest_markers = (
+        "highest",
+        "most",
+        "best",
+        "top",
+        "คะแนนมากที่สุด",
+        "คะแนนสูงสุด",
+        "มากที่สุด",
+        "สูงสุด",
+        "ได้มากที่สุด",
+    )
+    if any(marker in lowered for marker in lowest_markers):
+        return "asc"
+    if any(marker in lowered for marker in highest_markers):
+        return "desc"
+    return "desc"
 
 
 def _payload_is_effectively_blank(payload: dict[str, Any]) -> bool:
@@ -2591,13 +2704,20 @@ def _load_form_structure_context(form_id: str) -> dict[str, Any]:
     }
 
 
-def _build_top_scorer_fallback_sql(form_id: str, *, prefer_identity: bool) -> str:
-    """Build deterministic SQL for top scorer lookup using stored response JSON grades."""
+def _build_top_scorer_fallback_sql(
+    form_id: str,
+    *,
+    prefer_identity: bool,
+    direction: str = "desc",
+) -> str:
+    """Build deterministic SQL for top or bottom scorer lookup using stored response JSON grades."""
     identity_titles = _find_likely_identity_question_titles(form_id)
     identity_alias = "name" if prefer_identity else "respondent"
     identity_clause = "ranked.response_id"
     identity_join = ""
     identity_order_clause = "ranked.response_id ASC"
+    normalized_direction = "asc" if str(direction).casefold() == "asc" else "desc"
+    score_order = "ASC" if normalized_direction == "asc" else "DESC"
     if prefer_identity and identity_titles:
         quoted_titles = ", ".join(_quote_sql_string_literal(title) for title in identity_titles[:8])
         valid_identity_sql = (
@@ -2645,14 +2765,52 @@ def _build_top_scorer_fallback_sql(form_id: str, *, prefer_identity: bool) -> st
         " SELECT response_id, respondent_email, total_score "
         " FROM scores "
         " WHERE total_score IS NOT NULL "
-        " ORDER BY total_score DESC, response_id ASC "
+        f" ORDER BY total_score {score_order}, response_id ASC "
         " LIMIT 50"
         ") "
         f"SELECT {identity_clause} AS {identity_alias}, ranked.total_score "
         "FROM ranked "
         f"{identity_join} "
-        f"ORDER BY ranked.total_score DESC, {identity_order_clause} "
+        f"ORDER BY ranked.total_score {score_order}, {identity_order_clause} "
         "LIMIT 1"
+    )
+
+
+def _build_score_statistics_sql(form_id: str, requested_stats: list[str] | None = None) -> str:
+    """Build deterministic SQL for requested score statistics on one stored form."""
+    normalized_requested = list(requested_stats or [])
+    allowed_columns = {
+        "response_count": "COUNT(*) AS response_count",
+        "min_score": "MIN(total_score) AS min_score",
+        "max_score": "MAX(total_score) AS max_score",
+        "avg_score": "ROUND(AVG(total_score), 2) AS avg_score",
+        "median_score": "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY total_score) AS median_score",
+    }
+    select_parts = [
+        allowed_columns[column_name]
+        for column_name in normalized_requested
+        if column_name in allowed_columns
+    ]
+    if not select_parts:
+        select_parts = [allowed_columns["median_score"]]
+    return (
+        "WITH scores AS ("
+        " SELECT "
+        "   COALESCE("
+        "     NULLIF(fr.response_json->>'totalScore', '')::numeric, "
+        "     ("
+        "       SELECT SUM((answer.answer_obj->'grade'->>'score')::numeric) "
+        "       FROM jsonb_each(fr.response_json->'answers') AS answer(question_id, answer_obj) "
+        "       WHERE answer.answer_obj->'grade'->>'score' IS NOT NULL"
+        "     )"
+        "   ) AS total_score "
+        " FROM form_responses fr "
+        f" WHERE fr.form_id = {_quote_sql_string_literal(form_id)} "
+        ") "
+        "SELECT "
+        f"  {', '.join(select_parts)} "
+        "FROM scores "
+        "WHERE total_score IS NOT NULL"
     )
 
 
@@ -2881,6 +3039,7 @@ def _run_nl_to_sql_response_store_query(
     normalized_target_form_id = str(target_form_id or "").strip()
     score_ranking_request = _looks_like_score_ranking_request(request_text)
     respondent_identity_request = _looks_like_respondent_identity_request(request_text)
+    score_ranking_direction = _infer_score_ranking_direction(request_text)
     sql = _generate_readonly_response_store_sql_from_nl(
         request_text,
         target_form_id=normalized_target_form_id,
@@ -2903,6 +3062,7 @@ def _run_nl_to_sql_response_store_query(
                     fallback_sql = _build_top_scorer_fallback_sql(
                         normalized_target_form_id,
                         prefer_identity=respondent_identity_request,
+                        direction=score_ranking_direction,
                     )
                     fallback_payload = _execute_readonly_response_store_query(
                         fallback_sql,
@@ -2930,6 +3090,7 @@ def _run_nl_to_sql_response_store_query(
                 fallback_sql = _build_top_scorer_fallback_sql(
                     normalized_target_form_id,
                     prefer_identity=True,
+                    direction=score_ranking_direction,
                 )
                 fallback_payload = _execute_readonly_response_store_query(
                     fallback_sql,
@@ -2971,6 +3132,7 @@ def _run_nl_to_sql_response_store_query(
                 fallback_sql = _build_top_scorer_fallback_sql(
                     normalized_target_form_id,
                     prefer_identity=respondent_identity_request,
+                    direction=score_ranking_direction,
                 )
                 fallback_payload = _execute_readonly_response_store_query(
                     fallback_sql,
@@ -2985,6 +3147,7 @@ def _run_nl_to_sql_response_store_query(
                 fallback_sql = _build_top_scorer_fallback_sql(
                     normalized_target_form_id,
                     prefer_identity=respondent_identity_request,
+                    direction=score_ranking_direction,
                 )
                 fallback_payload = _execute_readonly_response_store_query(
                     fallback_sql,
@@ -9140,6 +9303,43 @@ def maybe_complete_database_request(messages: list[AnyMessage]) -> AIMessage | N
                 lines.extend(["", "No stored responses found."])
             return AIMessage(content="\n".join(lines).strip())
 
+        if form_scoped_query_plan and form_scoped_query_plan.get("kind") == "score-stats":
+            catalog_rows = _load_agent_form_catalog()
+            form_row = _choose_database_analysis_form(
+                latest_human_content,
+                catalog_rows,
+                preferred_form_id=target_form_id,
+            )
+            if (
+                explicit_form_id
+                and (
+                    not form_row
+                    or str(form_row.get("form_id", "") or "").strip() != explicit_form_id
+                )
+            ):
+                _sync_form_id_into_response_store(explicit_form_id)
+                catalog_rows = _load_agent_form_catalog()
+                form_row = _choose_database_analysis_form(
+                    latest_human_content,
+                    catalog_rows,
+                    preferred_form_id=explicit_form_id,
+                )
+            if not form_row:
+                if user_language == "th":
+                    return AIMessage(content="ยังไม่พบข้อมูลฟอร์มนี้ใน Postgres")
+                return AIMessage(content="This form is not stored in Postgres yet.")
+
+            form_id = str(form_row.get("form_id", "") or "").strip()
+            requested_stats = _infer_requested_score_statistics(latest_human_content)
+            stats_sql = _build_score_statistics_sql(form_id, requested_stats)
+            payload = _execute_readonly_response_store_query(stats_sql, row_limit=5)
+            table = _format_query_payload_as_markdown_table(payload)
+            if table:
+                return AIMessage(content=table)
+            if user_language == "th":
+                return AIMessage(content="ไม่พบข้อมูล")
+            return AIMessage(content="No rows found.")
+
         if form_scoped_query_plan and form_scoped_query_plan.get("kind") == "top-scorer":
             catalog_rows = _load_agent_form_catalog()
             form_row = _choose_database_analysis_form(
@@ -9167,7 +9367,11 @@ def maybe_complete_database_request(messages: list[AnyMessage]) -> AIMessage | N
                 return AIMessage(content="This form is not stored in Postgres yet.")
 
             form_id = str(form_row.get("form_id", "") or "").strip()
-            fallback_sql = _build_top_scorer_fallback_sql(form_id, prefer_identity=True)
+            fallback_sql = _build_top_scorer_fallback_sql(
+                form_id,
+                prefer_identity=True,
+                direction=str(form_scoped_query_plan.get("direction", "desc")),
+            )
             payload = _execute_readonly_response_store_query(fallback_sql, row_limit=20)
             payload = _rename_identity_column(payload, "name")
             table = _format_query_payload_as_markdown_table(payload)
