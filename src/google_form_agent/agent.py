@@ -70,9 +70,13 @@ GOOGLE_OAUTH_SESSION_KEY = contextvars.ContextVar[str | None](
     "google_oauth_session_key",
     default=None,
 )
+BUILT_AGENT: Any | None = None
+BUILT_AGENT_LOCK: asyncio.Lock | None = None
 FORM_RESPONSE_SYNC_WORKER_STARTED = False
 FORM_RESPONSE_SYNC_WORKER_LOCK = threading.Lock()
 GOOGLE_SHEETS_MCP_DISABLED_UNTIL_RESTART = False
+FORM_RESPONSE_SCHEMA_INITIALIZED = False
+FORM_RESPONSE_SCHEMA_LOCK = threading.Lock()
 DEFAULT_RESPONDENT_INFO_QUESTIONS = [
     {"title": "ชื่อ-นามสกุล", "type": "text", "required": True},
     {"title": "หน่วยงาน/สถานศึกษา", "type": "text", "required": True},
@@ -505,18 +509,29 @@ def _extract_requested_form_id(text: str) -> str:
         return url_match.group(1).strip()
 
     lowered = raw_text.casefold()
+    contextual_form_markers = (
+        "form id",
+        "formid",
+        "from form",
+        "this form",
+        "previous form",
+        "last form",
+        "ฟอร์มนี้",
+        "จากฟอร์ม",
+        "จากแบบฟอร์ม",
+        "จากแบบทดสอบ",
+        "แบบฟอร์มนี้",
+        "แบบทดสอบนี้",
+        "analyze form",
+        "query form",
+        "ask form",
+        "วิเคราะห์ฟอร์ม",
+        "วิเคราะห์แบบฟอร์ม",
+        "ดูฟอร์ม",
+        "ดูข้อมูลฟอร์ม",
+    )
     if any(
-        marker in lowered
-        for marker in (
-            "form id",
-            "formid",
-            "ฟอร์มนี้",
-            "แบบฟอร์มนี้",
-            "แบบทดสอบนี้",
-            "analyze form",
-            "วิเคราะห์ฟอร์ม",
-            "วิเคราะห์แบบฟอร์ม",
-        )
+        marker in lowered for marker in contextual_form_markers
     ):
         bare_id_match = re.search(r"\b([A-Za-z0-9_-]{20,})\b", raw_text)
         if bare_id_match:
@@ -804,8 +819,28 @@ def looks_like_form_creation_request(text: str) -> bool:
     lowered = text.lower()
     if "spreadsheet" in lowered and "analy" in lowered:
         return False
-    if _extract_requested_form_id(text) and looks_like_spreadsheet_analysis_request(text):
+    explicit_form_id = _extract_requested_form_id(text)
+    explicit_creation_markers = (
+        "create form",
+        "create a form",
+        "create google form",
+        "make form",
+        "build form",
+        "generate form",
+        "new form",
+        "สร้างฟอร์ม",
+        "สร้างแบบฟอร์ม",
+        "สร้างแบบทดสอบ",
+        "สร้าง google form",
+        "ทำฟอร์ม",
+        "ทำแบบฟอร์ม",
+        "ทำแบบทดสอบ",
+    )
+    if explicit_form_id and looks_like_spreadsheet_analysis_request(text):
         return False
+    if explicit_form_id:
+        if not any(marker in lowered for marker in explicit_creation_markers):
+            return False
     if looks_like_spreadsheet_analysis_request(text) and any(
         marker in lowered
         for marker in (
@@ -837,7 +872,15 @@ def looks_like_form_creation_request(text: str) -> bool:
         "ฟอร์ม",
         "คำถาม",
     )
-    return any(keyword in lowered for keyword in creation_keywords)
+    if not any(keyword in lowered for keyword in creation_keywords):
+        return False
+
+    if re.search(r"\b[A-Za-z0-9_-]{20,}\b", text or "") and not any(
+        marker in lowered for marker in explicit_creation_markers
+    ):
+        return False
+
+    return True
 
 
 def _trim_form_topic_tail(text: str) -> str:
@@ -1933,13 +1976,18 @@ def _initialize_form_response_pg_schema(connection: Any) -> None:
 
 
 def _open_form_response_db() -> Any:
+    global FORM_RESPONSE_SCHEMA_INITIALIZED
     conn_str = _get_form_response_pg_connection_string()
     if not conn_str:
         raise RuntimeError(
             "Postgres response store is not configured. Set FORM_RESPONSE_PG_CONN_STR or PG_CONN_STR."
         )
     connection = pg_connect(conn_str)
-    _initialize_form_response_pg_schema(connection)
+    if not FORM_RESPONSE_SCHEMA_INITIALIZED:
+        with FORM_RESPONSE_SCHEMA_LOCK:
+            if not FORM_RESPONSE_SCHEMA_INITIALIZED:
+                _initialize_form_response_pg_schema(connection)
+                FORM_RESPONSE_SCHEMA_INITIALIZED = True
     return connection
 
 
@@ -2004,6 +2052,12 @@ def _response_store_schema_payload() -> dict[str, Any]:
             "Use form_responses for response-level timestamps and raw response_json.",
             "Use form_response_answers for question/answer level analysis.",
             "respondent_email is only populated when the synced response payload contains it.",
+            "Google Forms quiz grading data, when present, stays inside form_responses.response_json.",
+            "If response_json.totalScore exists, prefer it as the response-level score source.",
+            "response_json.answers is a JSON object keyed by question id, not a JSON array.",
+            "To iterate answers from response_json, prefer jsonb_each(response_json->'answers') and treat the value as the answer object.",
+            "For score questions, prefer extracting numeric grade values from response_json.answers[question_id].grade.score instead of casting form_response_answers.answer_text.",
+            "form_response_answers.answer_text can contain names, free text, labels, or option text and is not guaranteed to be numeric.",
         ],
     }
 
@@ -2069,6 +2123,718 @@ def _validate_readonly_response_store_sql(sql: str) -> str:
     return stripped
 
 
+def _extract_embedded_readonly_sql(text: str) -> str:
+    """Extract a single read-only SQL statement from free-form user text when present."""
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        return ""
+
+    fenced_match = re.search(
+        r"```(?:sql)?\s*(select\b.*?|with\b.*?)```",
+        raw_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if fenced_match:
+        candidate = fenced_match.group(1).strip()
+        try:
+            return _validate_readonly_response_store_sql(candidate)
+        except Exception:
+            return ""
+
+    inline_match = re.search(
+        r"(?is)\b(select\b.*|with\b.*)$",
+        raw_text,
+    )
+    if inline_match:
+        candidate = inline_match.group(1).strip()
+        try:
+            return _validate_readonly_response_store_sql(candidate)
+        except Exception:
+            return ""
+    return ""
+
+
+def _format_query_payload_as_markdown_table(payload: dict[str, Any]) -> str:
+    """Render a readonly SQL payload as a markdown table when possible."""
+    columns = [
+        str(column).strip()
+        for column in payload.get("columns", [])
+        if str(column).strip()
+    ]
+    rows = payload.get("rows", [])
+    if not columns or not rows:
+        return ""
+
+    table_rows: list[list[Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        table_rows.append([row.get(column) for column in columns])
+    if not table_rows:
+        return ""
+    return _format_markdown_table(columns, table_rows)
+
+
+def _looks_like_form_response_query_request(text: str) -> bool:
+    """Return whether the user is asking to inspect response rows for a specific form."""
+    lowered = str(text or "").casefold()
+    if not lowered:
+        return False
+    exact_markers = (
+        "query",
+        "show data",
+        "show response",
+        "show responses",
+        "show answer",
+        "show answers",
+        "list response",
+        "list responses",
+        "list answer",
+        "list answers",
+        "response data",
+        "answer data",
+        "raw data",
+        "ดูข้อมูล",
+        "แสดงข้อมูล",
+        "ดึงข้อมูล",
+        "ดูคำตอบ",
+        "แสดงคำตอบ",
+        "ข้อมูลคำตอบ",
+        "คำตอบของฟอร์ม",
+    )
+    if any(marker in lowered for marker in exact_markers):
+        return True
+
+    action_markers = (
+        "show",
+        "list",
+        "query",
+        "fetch",
+        "get",
+        "inspect",
+        "ดู",
+        "แสดง",
+        "ดึง",
+        "ขอ",
+    )
+    data_markers = (
+        "response",
+        "responses",
+        "answer",
+        "answers",
+        "row",
+        "rows",
+        "record",
+        "records",
+        "data",
+        "raw",
+        "result",
+        "results",
+        "คำตอบ",
+        "ข้อมูล",
+        "รายการ",
+        "แถว",
+        "ระเบียน",
+        "ผลลัพธ์",
+    )
+    return any(marker in lowered for marker in action_markers) and any(
+        marker in lowered for marker in data_markers
+    )
+
+
+def _plan_form_scoped_database_query(text: str) -> dict[str, Any] | None:
+    """Choose a deterministic local SQL query pattern for a target form when trivial."""
+    if _looks_like_form_response_query_request(text):
+        return {
+            "kind": "response-rows",
+        }
+    if _looks_like_score_ranking_request(text) and _looks_like_respondent_identity_request(text):
+        return {
+            "kind": "top-scorer",
+        }
+    return None
+
+
+def _looks_like_score_ranking_request(text: str) -> bool:
+    """Return whether the user is asking about scores, top/bottom ranks, or scorers."""
+    lowered = str(text or "").casefold()
+    if not lowered:
+        return False
+    score_markers = (
+        "score",
+        "scores",
+        "highest",
+        "lowest",
+        "top scorer",
+        "best score",
+        "worst score",
+        "คะแนน",
+        "คะแนนมากที่สุด",
+        "คะแนนน้อยที่สุด",
+        "ได้คะแนน",
+        "คะแนนสูงสุด",
+        "คะแนนต่ำสุด",
+    )
+    ranking_markers = (
+        "top",
+        "best",
+        "worst",
+        "most",
+        "least",
+        "มากที่สุด",
+        "น้อยที่สุด",
+        "สูงสุด",
+        "ต่ำสุด",
+        "อันดับ",
+    )
+    return any(marker in lowered for marker in score_markers) or (
+        any(marker in lowered for marker in ranking_markers)
+        and any(marker in lowered for marker in ("score", "scores", "คะแนน"))
+    )
+
+
+def _looks_like_respondent_identity_request(text: str) -> bool:
+    """Return whether the user is asking for who/respondent/person identity, not just score rows."""
+    lowered = str(text or "").casefold()
+    if not lowered:
+        return False
+    identity_markers = (
+        "who",
+        "person",
+        "respondent",
+        "name",
+        "ชื่อ",
+        "คน",
+        "ผู้ตอบ",
+        "ใคร",
+    )
+    return any(marker in lowered for marker in identity_markers)
+
+
+def _payload_is_effectively_blank(payload: dict[str, Any]) -> bool:
+    """Return whether a SQL payload has rows but no meaningful scalar values."""
+    rows = payload.get("rows", [])
+    if not isinstance(rows, list) or not rows:
+        return False
+    meaningful = False
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for value in row.values():
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text and text != "-":
+                meaningful = True
+                break
+        if meaningful:
+            break
+    return not meaningful
+
+
+def _payload_has_low_quality_identity(payload: dict[str, Any]) -> bool:
+    """Return whether the leading identity-like value is too weak to trust as a person label."""
+    rows = payload.get("rows", [])
+    columns = [str(column).strip().casefold() for column in payload.get("columns", [])]
+    if not isinstance(rows, list) or not rows or not columns:
+        return False
+
+    identity_keys = [
+        column
+        for column in columns
+        if column in {"respondent", "name", "respondent_email"} or "name" in column
+    ]
+    if not identity_keys:
+        return False
+
+    first_row = rows[0]
+    if not isinstance(first_row, dict):
+        return False
+
+    value = None
+    for original_key, normalized_key in zip(payload.get("columns", []), columns, strict=False):
+        if normalized_key in identity_keys:
+            value = first_row.get(original_key)
+            break
+    if value is None:
+        return True
+
+    text = str(value).strip()
+    if not text:
+        return True
+    if re.fullmatch(r"[A-Za-z]", text):
+        return True
+    if re.fullmatch(r"[-_?]+", text):
+        return True
+    return False
+
+
+def _payload_has_missing_score(payload: dict[str, Any]) -> bool:
+    """Return whether a score-ranking payload is missing a usable score value."""
+    rows = payload.get("rows", [])
+    columns = [str(column).strip().casefold() for column in payload.get("columns", [])]
+    if not isinstance(rows, list) or not rows or not columns:
+        return False
+
+    score_keys = [
+        column
+        for column in columns
+        if column in {"total_score", "score"} or "score" in column or "คะแนน" in column
+    ]
+    if not score_keys:
+        return True
+
+    first_row = rows[0]
+    if not isinstance(first_row, dict):
+        return True
+
+    value = None
+    for original_key, normalized_key in zip(payload.get("columns", []), columns, strict=False):
+        if normalized_key in score_keys:
+            value = first_row.get(original_key)
+            break
+    if value is None:
+        return True
+
+    text = str(value).strip()
+    if not text or text == "-":
+        return True
+    return False
+
+
+def _rename_identity_column(payload: dict[str, Any], new_name: str) -> dict[str, Any]:
+    """Rename respondent-like output columns for cleaner chat rendering."""
+    columns = payload.get("columns", [])
+    rows = payload.get("rows", [])
+    if not isinstance(columns, list) or not isinstance(rows, list):
+        return payload
+
+    renamed_columns = list(columns)
+    source_column = None
+    for index, column in enumerate(columns):
+        normalized = str(column).strip().casefold()
+        if normalized in {"respondent", "respondent_email"}:
+            renamed_columns[index] = new_name
+            source_column = column
+            break
+    if source_column is None:
+        return payload
+
+    renamed_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            renamed_rows.append(row)
+            continue
+        updated = dict(row)
+        updated[new_name] = updated.pop(source_column, None)
+        renamed_rows.append(updated)
+
+    updated_payload = dict(payload)
+    updated_payload["columns"] = renamed_columns
+    updated_payload["rows"] = renamed_rows
+    return updated_payload
+
+
+def _normalize_identity_title(text: str) -> str:
+    """Normalize a question title for identity-field matching."""
+    normalized = str(text or "").casefold()
+    normalized = re.sub(r"[\s_\-/\\|():]+", "", normalized)
+    return normalized
+
+
+def _find_likely_identity_question_titles(form_id: str) -> list[str]:
+    """Return likely respondent-identity question titles for a form, ordered by usefulness."""
+    payload = _execute_readonly_response_store_query(
+        (
+            "SELECT question_title, COUNT(*) AS usage_count "
+            "FROM form_response_answers "
+            f"WHERE form_id = {_quote_sql_string_literal(form_id)} "
+            "GROUP BY question_title "
+            "ORDER BY usage_count DESC, question_title ASC"
+        ),
+        row_limit=500,
+    )
+    rows = payload.get("rows", [])
+    scored: list[tuple[int, str]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("question_title", "") or "").strip()
+        if not title:
+            continue
+        lowered = title.casefold()
+        normalized_title = _normalize_identity_title(title)
+        score = 0
+        if "ชื่อนามสกุล" in normalized_title or "fullname" in normalized_title:
+            score += 100
+        if normalized_title == "ชื่อ" or "firstname" in normalized_title or "lastname" in normalized_title:
+            score += 70
+        elif "ชื่อ" in title:
+            score += 60
+        if "email" in lowered or "อีเมล" in title:
+            score += 40
+        if "หน่วยงาน" in title or "organization" in lowered or "department" in lowered:
+            score += 15
+        if "phone" in lowered or "โทร" in title:
+            score -= 20
+        if "score" in lowered or "คะแนน" in title:
+            score -= 20
+        if score > 0:
+            scored.append((score, title))
+    scored.sort(key=lambda item: (-item[0], item[1].casefold()))
+    if not scored:
+        return []
+
+    highest_score = scored[0][0]
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for _score, title in scored:
+        if _score < highest_score:
+            break
+        key = title.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(title)
+    return ordered
+
+
+def _load_form_structure_context(form_id: str) -> dict[str, Any]:
+    """Inspect stored structure for one form so NL-to-SQL can use actual question ids and titles."""
+    normalized_form_id = str(form_id or "").strip()
+    if not normalized_form_id:
+        return {}
+
+    title_payload = _execute_readonly_response_store_query(
+        (
+            "SELECT question_id, question_title, COUNT(*) AS usage_count "
+            "FROM form_response_answers "
+            f"WHERE form_id = {_quote_sql_string_literal(normalized_form_id)} "
+            "GROUP BY question_id, question_title "
+            "ORDER BY usage_count DESC, question_title ASC"
+        ),
+        row_limit=500,
+    )
+    sample_payload = _execute_readonly_response_store_query(
+        (
+            "SELECT response_json "
+            "FROM form_responses "
+            f"WHERE form_id = {_quote_sql_string_literal(normalized_form_id)} "
+            "AND response_json IS NOT NULL "
+            "ORDER BY created_time DESC NULLS LAST, response_id DESC "
+            "LIMIT 1"
+        ),
+        row_limit=1,
+    )
+
+    question_map: list[dict[str, Any]] = []
+    for row in title_payload.get("rows", []):
+        if not isinstance(row, dict):
+            continue
+        question_id = str(row.get("question_id", "") or "").strip()
+        question_title = str(row.get("question_title", "") or "").strip()
+        if not question_id or not question_title:
+            continue
+        question_map.append(
+            {
+                "question_id": question_id,
+                "question_title": question_title,
+                "usage_count": row.get("usage_count"),
+            }
+        )
+
+    sample_response_json = None
+    sample_answer_keys: list[str] = []
+    sample_grade_keys: list[str] = []
+    sample_text_answer_keys: list[str] = []
+    sample_answer_shapes: list[dict[str, Any]] = []
+    rows = sample_payload.get("rows", [])
+    if rows and isinstance(rows[0], dict):
+        raw_response_json = rows[0].get("response_json")
+        if isinstance(raw_response_json, dict):
+            sample_response_json = raw_response_json
+            answers = raw_response_json.get("answers")
+            if isinstance(answers, dict):
+                sample_answer_keys = list(answers.keys())[:20]
+                for question_id, answer_obj in list(answers.items())[:5]:
+                    if not isinstance(answer_obj, dict):
+                        continue
+                    grade = answer_obj.get("grade")
+                    text_answers = answer_obj.get("textAnswers")
+                    if isinstance(grade, dict):
+                        for key in grade.keys():
+                            key_text = str(key).strip()
+                            if key_text and key_text not in sample_grade_keys:
+                                sample_grade_keys.append(key_text)
+                    if isinstance(text_answers, dict):
+                        for key in text_answers.keys():
+                            key_text = str(key).strip()
+                            if key_text and key_text not in sample_text_answer_keys:
+                                sample_text_answer_keys.append(key_text)
+                    sample_answer_shapes.append(
+                        {
+                            "question_id": str(question_id),
+                            "keys": sorted(str(key) for key in answer_obj.keys()),
+                            "grade_keys": sorted(str(key) for key in grade.keys()) if isinstance(grade, dict) else [],
+                            "text_answers_keys": sorted(str(key) for key in text_answers.keys()) if isinstance(text_answers, dict) else [],
+                        }
+                    )
+
+    return {
+        "form_id": normalized_form_id,
+        "question_map": question_map,
+        "likely_identity_titles": _find_likely_identity_question_titles(normalized_form_id),
+        "sample_answer_keys": sample_answer_keys,
+        "sample_grade_keys": sample_grade_keys,
+        "sample_text_answer_keys": sample_text_answer_keys,
+        "sample_answer_shapes": sample_answer_shapes,
+    }
+
+
+def _build_top_scorer_fallback_sql(form_id: str, *, prefer_identity: bool) -> str:
+    """Build deterministic SQL for top scorer lookup using stored response JSON grades."""
+    identity_titles = _find_likely_identity_question_titles(form_id)
+    identity_alias = "name" if prefer_identity else "respondent"
+    identity_clause = "ranked.response_id"
+    identity_join = ""
+    identity_order_clause = "ranked.response_id ASC"
+    if prefer_identity and identity_titles:
+        quoted_titles = ", ".join(_quote_sql_string_literal(title) for title in identity_titles[:8])
+        valid_identity_sql = (
+            "NULLIF(BTRIM(fra.answer_text), '') IS NOT NULL "
+            "AND LENGTH(BTRIM(fra.answer_text)) > 1 "
+            "AND lower(BTRIM(fra.answer_text)) NOT IN ('a', 'test', 'na', 'n/a', 'none', 'null', '-', '?') "
+            "AND BTRIM(fra.answer_text) !~ '^[A-Za-z]$'"
+        )
+        identity_join = (
+            " LEFT JOIN ("
+            "   SELECT DISTINCT ON (fra.response_id) fra.response_id, fra.answer_text AS fallback_name "
+            "   FROM form_response_answers fra "
+            f"   WHERE fra.form_id = {_quote_sql_string_literal(form_id)} "
+            f"     AND fra.question_title IN ({quoted_titles}) "
+            f"     AND {valid_identity_sql} "
+            "   ORDER BY fra.response_id, CASE "
+            "     WHEN regexp_replace(lower(fra.question_title), '[[:space:]_\\-/\\\\|():]+', '', 'g') IN ('ชื่อนามสกุล', 'fullname') THEN 0 "
+            "     WHEN regexp_replace(lower(fra.question_title), '[[:space:]_\\-/\\\\|():]+', '', 'g') IN ('ชื่อ', 'firstname', 'lastname') THEN 1 "
+            "     WHEN lower(fra.question_title) LIKE '%email%' OR fra.question_title LIKE '%อีเมล%' THEN 2 "
+            "     ELSE 3 "
+            "   END, fra.question_title ASC"
+            " ) ident ON ident.response_id = ranked.response_id"
+        )
+        identity_clause = "COALESCE(ident.fallback_name, NULLIF(ranked.respondent_email, ''), ranked.response_id)"
+        identity_order_clause = (
+            "CASE WHEN ident.fallback_name IS NULL AND NULLIF(ranked.respondent_email, '') IS NULL THEN 1 ELSE 0 END, "
+            "COALESCE(ident.fallback_name, NULLIF(ranked.respondent_email, ''), ranked.response_id) ASC"
+        )
+
+    return (
+        "WITH scores AS ("
+        " SELECT fr.response_id, "
+        "        fr.respondent_email, "
+        "        COALESCE("
+        "          NULLIF(fr.response_json->>'totalScore', '')::numeric, "
+        "          ("
+        "            SELECT SUM((answer.answer_obj->'grade'->>'score')::numeric) "
+            "            FROM jsonb_each(fr.response_json->'answers') AS answer(question_id, answer_obj) "
+        "            WHERE answer.answer_obj->'grade'->>'score' IS NOT NULL"
+        "          )"
+        "        ) AS total_score "
+        " FROM form_responses fr "
+        f" WHERE fr.form_id = {_quote_sql_string_literal(form_id)} "
+        "), ranked AS ("
+        " SELECT response_id, respondent_email, total_score "
+        " FROM scores "
+        " WHERE total_score IS NOT NULL "
+        " ORDER BY total_score DESC, response_id ASC "
+        " LIMIT 50"
+        ") "
+        f"SELECT {identity_clause} AS {identity_alias}, ranked.total_score "
+        "FROM ranked "
+        f"{identity_join} "
+        f"ORDER BY ranked.total_score DESC, {identity_order_clause} "
+        "LIMIT 1"
+    )
+
+
+def _generate_readonly_response_store_sql_from_nl(
+    request_text: str,
+    *,
+    target_form_id: str = "",
+    user_language: str = "en",
+) -> str:
+    """Use the configured chat model to translate a natural-language DB request into read-only SQL."""
+    normalized_request = str(request_text or "").strip()
+    if not normalized_request:
+        raise RuntimeError("request_text is required")
+
+    schema_payload = _response_store_schema_payload()
+    form_context_payload = (
+        _load_form_structure_context(target_form_id.strip())
+        if target_form_id.strip()
+        else {}
+    )
+    guidance_lines = [
+        "You translate a natural-language request into one PostgreSQL read-only query.",
+        "Return only SQL.",
+        "Use only SELECT or WITH.",
+        "Never write INSERT, UPDATE, DELETE, ALTER, DROP, CREATE, TRUNCATE, COPY, CALL, EXECUTE, or transaction control.",
+        "Use only the tables and columns listed in the schema.",
+        "Prefer concise queries that answer the user's question directly.",
+        "If the request clearly targets one form and a target form id is provided, use it in the WHERE clause.",
+        "Do not include markdown fences, commentary, labels, or explanations.",
+        "Do not cast form_response_answers.answer_text to numeric unless the SQL first proves the values are numeric.",
+        "If the request is about quiz scores, totals, highest score, lowest score, top scorer, or score ranking, prefer form_responses.response_json and extract score values from response_json.answers JSON.",
+        "response_json.answers is an object keyed by question id, not an array. Do not use jsonb_array_elements on response_json.answers.",
+        "When iterating response_json.answers, prefer jsonb_each(response_json->'answers') AS answer(question_id, answer_obj).",
+        "When aggregating quiz scores, sum numeric values from answer_obj->'grade'->>'score' per response.",
+        "If form-specific structure context is provided, use the actual question titles and question ids from that context instead of guessing labels like Name or Email.",
+    ]
+    if user_language == "th":
+        guidance_lines.append(
+            "คำขอของผู้ใช้อาจเป็นภาษาไทย แต่ให้ตอบกลับเป็น SQL อย่างเดียว"
+        )
+
+    prompt_parts = [
+        f"Schema:\n{json.dumps(schema_payload, ensure_ascii=False, indent=2)}",
+    ]
+    if target_form_id.strip():
+        prompt_parts.append(f"Preferred target form_id: {target_form_id.strip()}")
+    if form_context_payload:
+        prompt_parts.append(
+            "Form structure context:\n"
+            f"{json.dumps(form_context_payload, ensure_ascii=False, indent=2)}"
+        )
+    prompt_parts.append(f"User request:\n{normalized_request}")
+
+    model = build_chat_model()
+    response = model.invoke(
+        [
+            SystemMessage(content="\n".join(guidance_lines)),
+            HumanMessage(content="\n\n".join(prompt_parts)),
+        ]
+    )
+    sql = content_to_text(getattr(response, "content", response)).strip()
+    sql = re.sub(r"^```(?:sql)?\s*|\s*```$", "", sql, flags=re.IGNORECASE | re.DOTALL).strip()
+    return _validate_readonly_response_store_sql(sql)
+
+
+def _generate_readonly_response_store_sql_retry_on_error(
+    request_text: str,
+    *,
+    target_form_id: str = "",
+    user_language: str = "en",
+    failed_sql: str,
+    error_text: str,
+) -> str:
+    """Regenerate SQL after a database execution error using the failure details as constraints."""
+    normalized_request = str(request_text or "").strip()
+    schema_payload = _response_store_schema_payload()
+    form_context_payload = (
+        _load_form_structure_context(target_form_id.strip())
+        if target_form_id.strip()
+        else {}
+    )
+    prompt_parts = [
+        f"Schema:\n{json.dumps(schema_payload, ensure_ascii=False, indent=2)}",
+    ]
+    if target_form_id.strip():
+        prompt_parts.append(f"Preferred target form_id: {target_form_id.strip()}")
+    if form_context_payload:
+        prompt_parts.append(
+            "Form structure context:\n"
+            f"{json.dumps(form_context_payload, ensure_ascii=False, indent=2)}"
+        )
+    prompt_parts.extend(
+        [
+            f"User request:\n{normalized_request}",
+            f"Previous SQL that failed:\n{failed_sql}",
+            f"Database error:\n{error_text}",
+        ]
+    )
+
+    guidance_lines = [
+        "The previous PostgreSQL query failed.",
+        "Generate one corrected read-only PostgreSQL query.",
+        "Return only SQL.",
+        "Use only SELECT or WITH.",
+        "Do not repeat the same mistake.",
+        "If the error shows invalid numeric casting, avoid casting free-text answer columns and prefer numeric grade data from response_json.answers[*].grade.score.",
+        "If the error says it cannot extract elements from an object, treat response_json.answers as a JSON object and iterate it with jsonb_each, not jsonb_array_elements.",
+        "Do not include markdown fences, commentary, labels, or explanations.",
+    ]
+    if user_language == "th":
+        guidance_lines.append("คำขอของผู้ใช้อาจเป็นภาษาไทย แต่ให้ตอบกลับเป็น SQL อย่างเดียว")
+
+    model = build_chat_model()
+    response = model.invoke(
+        [
+            SystemMessage(content="\n".join(guidance_lines)),
+            HumanMessage(content="\n\n".join(prompt_parts)),
+        ]
+    )
+    sql = content_to_text(getattr(response, "content", response)).strip()
+    sql = re.sub(r"^```(?:sql)?\s*|\s*```$", "", sql, flags=re.IGNORECASE | re.DOTALL).strip()
+    return _validate_readonly_response_store_sql(sql)
+
+
+def _generate_readonly_response_store_sql_retry_on_blank_result(
+    request_text: str,
+    *,
+    target_form_id: str = "",
+    user_language: str = "en",
+    failed_sql: str,
+) -> str:
+    """Regenerate SQL when the first result shape is syntactically valid but semantically blank."""
+    normalized_request = str(request_text or "").strip()
+    schema_payload = _response_store_schema_payload()
+    form_context_payload = (
+        _load_form_structure_context(target_form_id.strip())
+        if target_form_id.strip()
+        else {}
+    )
+    prompt_parts = [
+        f"Schema:\n{json.dumps(schema_payload, ensure_ascii=False, indent=2)}",
+    ]
+    if target_form_id.strip():
+        prompt_parts.append(f"Preferred target form_id: {target_form_id.strip()}")
+    if form_context_payload:
+        prompt_parts.append(
+            "Form structure context:\n"
+            f"{json.dumps(form_context_payload, ensure_ascii=False, indent=2)}"
+        )
+    prompt_parts.extend(
+        [
+            f"User request:\n{normalized_request}",
+            f"Previous SQL that returned blank/null results:\n{failed_sql}",
+            "The previous query returned rows but the important answer fields were blank or null.",
+        ]
+    )
+
+    guidance_lines = [
+        "Generate one corrected read-only PostgreSQL query.",
+        "Return only SQL.",
+        "Use only SELECT or WITH.",
+        "For score-ranking questions, exclude rows where score is null.",
+        "If the user is asking for a person or respondent, return a non-empty respondent identifier.",
+        "Prefer COALESCE(NULLIF(fr.respondent_email, ''), fallback_name, fr.response_id) for respondent identity when email may be empty.",
+        "A fallback_name can come from form_response_answers for likely identity questions such as titles containing name, email, ชื่อ, อีเมล, or หน่วยงาน when available.",
+        "Do not include markdown fences, commentary, labels, or explanations.",
+    ]
+    if user_language == "th":
+        guidance_lines.append("คำขอของผู้ใช้อาจเป็นภาษาไทย แต่ให้ตอบกลับเป็น SQL อย่างเดียว")
+
+    model = build_chat_model()
+    response = model.invoke(
+        [
+            SystemMessage(content="\n".join(guidance_lines)),
+            HumanMessage(content="\n\n".join(prompt_parts)),
+        ]
+    )
+    sql = content_to_text(getattr(response, "content", response)).strip()
+    sql = re.sub(r"^```(?:sql)?\s*|\s*```$", "", sql, flags=re.IGNORECASE | re.DOTALL).strip()
+    return _validate_readonly_response_store_sql(sql)
+
+
 def _execute_readonly_response_store_query(sql: str, row_limit: int = 200) -> dict[str, Any]:
     normalized_sql = _validate_readonly_response_store_sql(sql)
     normalized_limit = max(1, min(int(row_limit), 500))
@@ -2102,6 +2868,132 @@ def _execute_readonly_response_store_query(sql: str, row_limit: int = 200) -> di
         "columns": columns,
         "rows": serialized_rows,
     }
+
+
+def _run_nl_to_sql_response_store_query(
+    request_text: str,
+    *,
+    target_form_id: str = "",
+    user_language: str = "en",
+    row_limit: int = 200,
+) -> tuple[str, dict[str, Any]]:
+    """Generate and execute read-only SQL, retrying once with error-aware guidance when useful."""
+    normalized_target_form_id = str(target_form_id or "").strip()
+    score_ranking_request = _looks_like_score_ranking_request(request_text)
+    respondent_identity_request = _looks_like_respondent_identity_request(request_text)
+    sql = _generate_readonly_response_store_sql_from_nl(
+        request_text,
+        target_form_id=normalized_target_form_id,
+        user_language=user_language,
+    )
+    try:
+        payload = _execute_readonly_response_store_query(sql, row_limit=row_limit)
+        if score_ranking_request:
+            if _payload_is_effectively_blank(payload) or _payload_has_missing_score(payload):
+                retry_sql = _generate_readonly_response_store_sql_retry_on_blank_result(
+                    request_text,
+                    target_form_id=normalized_target_form_id,
+                    user_language=user_language,
+                    failed_sql=sql,
+                )
+                retry_payload = _execute_readonly_response_store_query(retry_sql, row_limit=row_limit)
+                if not _payload_is_effectively_blank(retry_payload) and not _payload_has_missing_score(retry_payload):
+                    return retry_sql, retry_payload
+                if normalized_target_form_id:
+                    fallback_sql = _build_top_scorer_fallback_sql(
+                        normalized_target_form_id,
+                        prefer_identity=respondent_identity_request,
+                    )
+                    fallback_payload = _execute_readonly_response_store_query(
+                        fallback_sql,
+                        row_limit=row_limit,
+                    )
+                    if respondent_identity_request:
+                        fallback_payload = _rename_identity_column(fallback_payload, "name")
+                    return fallback_sql, fallback_payload
+            elif (
+                normalized_target_form_id
+                and (
+                    (
+                        respondent_identity_request
+                        and all(
+                            "respondent" not in str(column).casefold()
+                            and "email" not in str(column).casefold()
+                            and "name" not in str(column).casefold()
+                            for column in payload.get("columns", [])
+                        )
+                    )
+                    or _payload_has_low_quality_identity(payload)
+                    or _payload_has_missing_score(payload)
+                )
+            ):
+                fallback_sql = _build_top_scorer_fallback_sql(
+                    normalized_target_form_id,
+                    prefer_identity=True,
+                )
+                fallback_payload = _execute_readonly_response_store_query(
+                    fallback_sql,
+                    row_limit=row_limit,
+                )
+                fallback_payload = _rename_identity_column(fallback_payload, "name")
+                return fallback_sql, fallback_payload
+        if respondent_identity_request:
+            payload = _rename_identity_column(payload, "name")
+        return sql, payload
+    except Exception as exc:
+        error_text = str(exc)
+        likely_cast_error = any(
+            marker in error_text.casefold()
+            for marker in (
+                "invalid input syntax for type integer",
+                "invalid input syntax for type numeric",
+                "cannot cast",
+                "operator does not exist",
+                "cannot extract elements from an object",
+            )
+        )
+        if not likely_cast_error:
+            raise
+        retry_sql = _generate_readonly_response_store_sql_retry_on_error(
+            request_text,
+            target_form_id=normalized_target_form_id,
+            user_language=user_language,
+            failed_sql=sql,
+            error_text=error_text,
+        )
+        try:
+            payload = _execute_readonly_response_store_query(retry_sql, row_limit=row_limit)
+            if (
+                score_ranking_request
+                and normalized_target_form_id
+                and (_payload_is_effectively_blank(payload) or _payload_has_missing_score(payload))
+            ):
+                fallback_sql = _build_top_scorer_fallback_sql(
+                    normalized_target_form_id,
+                    prefer_identity=respondent_identity_request,
+                )
+                fallback_payload = _execute_readonly_response_store_query(
+                    fallback_sql,
+                    row_limit=row_limit,
+                )
+                if respondent_identity_request:
+                    fallback_payload = _rename_identity_column(fallback_payload, "name")
+                return fallback_sql, fallback_payload
+            return retry_sql, payload
+        except Exception:
+            if score_ranking_request and normalized_target_form_id:
+                fallback_sql = _build_top_scorer_fallback_sql(
+                    normalized_target_form_id,
+                    prefer_identity=respondent_identity_request,
+                )
+                fallback_payload = _execute_readonly_response_store_query(
+                    fallback_sql,
+                    row_limit=row_limit,
+                )
+                if respondent_identity_request:
+                    fallback_payload = _rename_identity_column(fallback_payload, "name")
+                return fallback_sql, fallback_payload
+            raise
 
 
 def _upsert_agent_form_record(
@@ -7931,16 +8823,32 @@ def maybe_complete_database_request(messages: list[AnyMessage]) -> AIMessage | N
     lowered = latest_human_content.casefold()
     explicit_form_id = _extract_requested_form_id(latest_human_content)
     recent_thread_form_id = _extract_recent_thread_form_id(messages, latest_human_index)
+    target_form_id = explicit_form_id or recent_thread_form_id
+    embedded_sql = _extract_embedded_readonly_sql(latest_human_content)
+    form_scoped_query_plan = (
+        _plan_form_scoped_database_query(latest_human_content)
+        if target_form_id
+        else None
+    )
     thread_form_analysis_request = (
         bool(recent_thread_form_id)
         and looks_like_spreadsheet_analysis_request(latest_human_content)
     )
-    if not looks_like_database_request(lowered) and not thread_form_analysis_request:
+    if (
+        not looks_like_database_request(lowered)
+        and not thread_form_analysis_request
+        and not embedded_sql
+        and not form_scoped_query_plan
+        and not target_form_id
+    ):
         return None
     if (
         looks_like_form_creation_request(latest_human_content)
         and not explicit_form_id
         and not thread_form_analysis_request
+        and not embedded_sql
+        and not form_scoped_query_plan
+        and not target_form_id
     ):
         return None
 
@@ -7999,6 +8907,36 @@ def maybe_complete_database_request(messages: list[AnyMessage]) -> AIMessage | N
     )
 
     try:
+        if embedded_sql:
+            payload = _execute_readonly_response_store_query(embedded_sql, row_limit=200)
+            row_count = int(payload.get("rowCount", 0) or 0)
+            table = _format_query_payload_as_markdown_table(payload)
+            if user_language == "th":
+                lines = [
+                    "ผลลัพธ์จากคำสั่ง SQL แบบอ่านอย่างเดียว:",
+                    "",
+                    f"- จำนวนแถวที่ส่งกลับ: {row_count}",
+                ]
+                if payload.get("truncated"):
+                    lines.append("- ผลลัพธ์ถูกตัดตาม row limit")
+                if table:
+                    lines.extend(["", table])
+                elif row_count == 0:
+                    lines.extend(["", "ไม่พบข้อมูล"])
+                return AIMessage(content="\n".join(lines).strip())
+            lines = [
+                "Read-only SQL query result:",
+                "",
+                f"- Rows returned: {row_count}",
+            ]
+            if payload.get("truncated"):
+                lines.append("- Result truncated by row limit")
+            if table:
+                lines.extend(["", table])
+            elif row_count == 0:
+                lines.extend(["", "No rows found."])
+            return AIMessage(content="\n".join(lines).strip())
+
         if any(marker in lowered for marker in schema_markers):
             payload = json.loads(inspect_form_response_database.invoke({}))
             if user_language == "th":
@@ -8130,6 +9068,115 @@ def maybe_complete_database_request(messages: list[AnyMessage]) -> AIMessage | N
                 content=_append_spreadsheet_visual_payload(response_text, visual_payload)
             )
 
+        if form_scoped_query_plan and form_scoped_query_plan.get("kind") == "response-rows":
+            catalog_rows = _load_agent_form_catalog()
+            form_row = _choose_database_analysis_form(
+                latest_human_content,
+                catalog_rows,
+                preferred_form_id=target_form_id,
+            )
+            if (
+                explicit_form_id
+                and (
+                    not form_row
+                    or str(form_row.get("form_id", "") or "").strip() != explicit_form_id
+                )
+            ):
+                _sync_form_id_into_response_store(explicit_form_id)
+                catalog_rows = _load_agent_form_catalog()
+                form_row = _choose_database_analysis_form(
+                    latest_human_content,
+                    catalog_rows,
+                    preferred_form_id=explicit_form_id,
+                )
+            if not form_row:
+                if user_language == "th":
+                    return AIMessage(content="ยังไม่พบข้อมูลฟอร์มนี้ใน Postgres")
+                return AIMessage(content="This form is not stored in Postgres yet.")
+
+            form_id = str(form_row.get("form_id", "") or "").strip()
+            payload = _execute_readonly_response_store_query(
+                (
+                    "SELECT r.response_id, r.created_time, r.respondent_email, "
+                    "a.question_title, a.answer_text "
+                    "FROM form_responses r "
+                    "LEFT JOIN form_response_answers a "
+                    "ON a.form_id = r.form_id AND a.response_id = r.response_id "
+                    f"WHERE r.form_id = {_quote_sql_string_literal(form_id)} "
+                    "ORDER BY r.created_time DESC NULLS LAST, r.response_id DESC, a.question_title ASC"
+                ),
+                row_limit=120,
+            )
+            row_count = int(payload.get("rowCount", 0) or 0)
+            table = _format_query_payload_as_markdown_table(payload)
+            form_title = str(form_row.get("form_title", "") or form_id).strip()
+            if user_language == "th":
+                lines = [
+                    "ฉันดึงข้อมูลคำตอบของฟอร์มนี้จาก Postgres แล้ว",
+                    "",
+                    f"- ฟอร์ม: {form_title}",
+                    f"- Form ID: {form_id}",
+                    f"- จำนวนแถวที่ส่งกลับ: {row_count}",
+                ]
+                if payload.get("truncated"):
+                    lines.append("- ผลลัพธ์ถูกตัดตาม row limit")
+                if table:
+                    lines.extend(["", table])
+                elif row_count == 0:
+                    lines.extend(["", "ยังไม่มีข้อมูลคำตอบ"])
+                return AIMessage(content="\n".join(lines).strip())
+            lines = [
+                "I fetched this form's stored responses from Postgres.",
+                "",
+                f"- Form: {form_title}",
+                f"- Form ID: {form_id}",
+                f"- Rows returned: {row_count}",
+            ]
+            if payload.get("truncated"):
+                lines.append("- Result truncated by row limit")
+            if table:
+                lines.extend(["", table])
+            elif row_count == 0:
+                lines.extend(["", "No stored responses found."])
+            return AIMessage(content="\n".join(lines).strip())
+
+        if form_scoped_query_plan and form_scoped_query_plan.get("kind") == "top-scorer":
+            catalog_rows = _load_agent_form_catalog()
+            form_row = _choose_database_analysis_form(
+                latest_human_content,
+                catalog_rows,
+                preferred_form_id=target_form_id,
+            )
+            if (
+                explicit_form_id
+                and (
+                    not form_row
+                    or str(form_row.get("form_id", "") or "").strip() != explicit_form_id
+                )
+            ):
+                _sync_form_id_into_response_store(explicit_form_id)
+                catalog_rows = _load_agent_form_catalog()
+                form_row = _choose_database_analysis_form(
+                    latest_human_content,
+                    catalog_rows,
+                    preferred_form_id=explicit_form_id,
+                )
+            if not form_row:
+                if user_language == "th":
+                    return AIMessage(content="ยังไม่พบข้อมูลฟอร์มนี้ใน Postgres")
+                return AIMessage(content="This form is not stored in Postgres yet.")
+
+            form_id = str(form_row.get("form_id", "") or "").strip()
+            fallback_sql = _build_top_scorer_fallback_sql(form_id, prefer_identity=True)
+            payload = _execute_readonly_response_store_query(fallback_sql, row_limit=20)
+            payload = _rename_identity_column(payload, "name")
+            table = _format_query_payload_as_markdown_table(payload)
+            if table:
+                return AIMessage(content=table)
+            if user_language == "th":
+                return AIMessage(content="ไม่พบข้อมูล")
+            return AIMessage(content="No rows found.")
+
         if any(marker in lowered for marker in latest_response_markers):
             payload = json.loads(
                 query_form_response_database.invoke(
@@ -8187,9 +9234,23 @@ def maybe_complete_database_request(messages: list[AnyMessage]) -> AIMessage | N
                     _format_markdown_table(
                         ["Form ID", "Response ID", "Created time", "Respondent email"],
                         table_rows,
-                    )
                 )
+            )
             return AIMessage(content="\n".join(lines).strip())
+
+        if looks_like_database_request(lowered) or target_form_id:
+            sql, payload = _run_nl_to_sql_response_store_query(
+                latest_human_content,
+                target_form_id=target_form_id,
+                user_language=user_language,
+                row_limit=200,
+            )
+            table = _format_query_payload_as_markdown_table(payload)
+            if table:
+                return AIMessage(content=table)
+            if user_language == "th":
+                return AIMessage(content="ไม่พบข้อมูล")
+            return AIMessage(content="No rows found.")
     except Exception as exc:
         raise RuntimeError(
             (
@@ -10876,49 +11937,59 @@ def build_mcp_client(*, include_google_sheets: bool = True) -> MultiServerMCPCli
 
 async def build_agent() -> Any:
     """Create the Deep Agent with Google Forms MCP tools."""
-    global GOOGLE_SHEETS_MCP_DISABLED_UNTIL_RESTART
-    _ensure_form_response_sync_worker_started()
-    model = build_chat_model()
-    include_google_sheets = (
-        is_env_truthy("ENABLE_GOOGLE_SHEETS_MCP")
-        and not GOOGLE_SHEETS_MCP_DISABLED_UNTIL_RESTART
-    )
-    client = await asyncio.to_thread(
-        build_mcp_client,
-        include_google_sheets=include_google_sheets,
-    )
-    try:
-        mcp_tools = await client.get_tools()
-    except Exception:
-        if not include_google_sheets:
-            raise
-        GOOGLE_SHEETS_MCP_DISABLED_UNTIL_RESTART = True
+    global BUILT_AGENT, BUILT_AGENT_LOCK, GOOGLE_SHEETS_MCP_DISABLED_UNTIL_RESTART
+    if BUILT_AGENT is not None:
+        return BUILT_AGENT
+    if BUILT_AGENT_LOCK is None:
+        BUILT_AGENT_LOCK = asyncio.Lock()
+
+    async with BUILT_AGENT_LOCK:
+        if BUILT_AGENT is not None:
+            return BUILT_AGENT
+
+        _ensure_form_response_sync_worker_started()
+        model = build_chat_model()
+        include_google_sheets = (
+            is_env_truthy("ENABLE_GOOGLE_SHEETS_MCP")
+            and not GOOGLE_SHEETS_MCP_DISABLED_UNTIL_RESTART
+        )
         client = await asyncio.to_thread(
             build_mcp_client,
-            include_google_sheets=False,
+            include_google_sheets=include_google_sheets,
         )
-        mcp_tools = await client.get_tools()
-    filtered_mcp_tools = [
-        tool
-        for tool in mcp_tools
-        if "create_form" not in str(getattr(tool, "name", "") or "").lower()
-    ]
-    tools = [
-        create_form_with_response_sheet,
-        list_google_forms,
-        inspect_form_response_database,
-        query_form_response_database,
-        format_response_sheet_for_analysis,
-        inspect_spreadsheet_for_analysis,
-        *filtered_mcp_tools,
-    ]
+        try:
+            mcp_tools = await client.get_tools()
+        except Exception:
+            if not include_google_sheets:
+                raise
+            GOOGLE_SHEETS_MCP_DISABLED_UNTIL_RESTART = True
+            client = await asyncio.to_thread(
+                build_mcp_client,
+                include_google_sheets=False,
+            )
+            mcp_tools = await client.get_tools()
+        filtered_mcp_tools = [
+            tool
+            for tool in mcp_tools
+            if "create_form" not in str(getattr(tool, "name", "") or "").lower()
+        ]
+        tools = [
+            create_form_with_response_sheet,
+            list_google_forms,
+            inspect_form_response_database,
+            query_form_response_database,
+            format_response_sheet_for_analysis,
+            inspect_spreadsheet_for_analysis,
+            *filtered_mcp_tools,
+        ]
 
-    return create_deep_agent(
-        model=model,
-        tools=tools,
-        middleware=[LocalLLMMessageFormatMiddleware()],
-        backend=FilesystemBackend(root_dir=str(PROJECT_ROOT), virtual_mode=False),
-        skills=[SKILLS_DIR.as_posix()],
-        system_prompt=SYSTEM_PROMPT,
-    )
+        BUILT_AGENT = create_deep_agent(
+            model=model,
+            tools=tools,
+            middleware=[LocalLLMMessageFormatMiddleware()],
+            backend=FilesystemBackend(root_dir=str(PROJECT_ROOT), virtual_mode=False),
+            skills=[SKILLS_DIR.as_posix()],
+            system_prompt=SYSTEM_PROMPT,
+        )
+        return BUILT_AGENT
 
