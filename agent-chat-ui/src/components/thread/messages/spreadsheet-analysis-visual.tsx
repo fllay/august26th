@@ -37,6 +37,7 @@ type SpreadsheetInsight = {
 export type SpreadsheetAnalysisVisualPayload = {
   version: number;
   kind: "spreadsheet-analysis-visual";
+  displayMode?: "default" | "single-chart";
   userLanguage?: "th" | "en";
   spreadsheetId: string;
   spreadsheetTitle: string;
@@ -80,6 +81,25 @@ function isThaiPayload(payload: SpreadsheetAnalysisVisualPayload): boolean {
   return payload.userLanguage === "th";
 }
 
+function isSingleExplicitChartPayload(
+  payload: SpreadsheetAnalysisVisualPayload,
+): boolean {
+  if (payload.displayMode === "single-chart") return true;
+  if ((payload.insights?.length ?? 0) > 0) return false;
+  if (payload.charts.length !== 1) return false;
+
+  const brief = String(payload.analysisRequest ?? "").toLowerCase();
+  return (
+    brief.includes("distribution graph") ||
+    brief.includes("distribution chart") ||
+    brief.includes("score distribution") ||
+    brief.includes("histogram") ||
+    brief.includes("การกระจายคะแนน") ||
+    brief.includes("กราฟการกระจาย") ||
+    brief.includes("กราฟกระจาย")
+  );
+}
+
 export function SpreadsheetAnalysisVisual({
   payload,
 }: {
@@ -87,10 +107,18 @@ export function SpreadsheetAnalysisVisual({
 }) {
   if (!payload.charts.length && !payload.insights?.length) return null;
   const preferThai = isThaiPayload(payload);
+  const singleChartMode =
+    payload.charts.length === 1 || isSingleExplicitChartPayload(payload);
 
   return (
-    <section className="mt-3 w-full min-w-0 rounded-lg border border-border bg-muted/20">
-      <div className="border-b border-border px-4 py-3">
+    <section
+      className={
+        singleChartMode
+          ? "mt-3 w-full min-w-0"
+          : "mt-3 w-full min-w-0 rounded-lg border border-border bg-muted/20"
+      }
+    >
+      {!singleChartMode ? <div className="border-b border-border px-4 py-3">
         <div className="text-sm font-medium">
           {preferThai ? "กราฟวิเคราะห์สเปรดชีต" : "Spreadsheet graphs"}
         </div>
@@ -99,8 +127,8 @@ export function SpreadsheetAnalysisVisual({
             ? `${payload.questionCount} คำถามที่มีคำตอบ, ${payload.rowCountWritten} แถวที่ใช้วิเคราะห์`
             : `${payload.questionCount} questions with responses, ${payload.rowCountWritten} analyzed rows`}
         </div>
-      </div>
-      <div className="space-y-4 p-4">
+      </div> : null}
+      <div className={singleChartMode ? "space-y-4" : "space-y-4 p-4"}>
         {payload.insights?.length ? (
           <section className="min-w-0 rounded-md border border-border bg-background px-3 py-3">
             <div className="mb-3 text-sm font-medium">
@@ -205,25 +233,26 @@ export function SpreadsheetAnalysisVisual({
                       ) : (
                         <BarChart
                           data={chartData}
-                          layout="vertical"
                           margin={{ top: 8, right: 24, left: 24, bottom: 8 }}
                         >
-                          <CartesianGrid
-                            horizontal={false}
-                            strokeDasharray="3 3"
-                          />
-                          <XAxis type="number" allowDecimals={false} />
-                          <YAxis
+                          <CartesianGrid vertical={false} strokeDasharray="3 3" />
+                          <XAxis
                             type="category"
                             dataKey="label"
-                            width={220}
-                            tick={{ fontSize: 12 }}
                             interval={0}
+                            tick={{ fontSize: 12 }}
+                            angle={chartData.length > 8 ? -25 : 0}
+                            textAnchor={chartData.length > 8 ? "end" : "middle"}
+                            height={chartData.length > 8 ? 84 : 48}
+                          />
+                          <YAxis
+                            type="number"
+                            allowDecimals={false}
                           />
                           <Tooltip formatter={formatTooltipValue} />
                           <Bar
                             dataKey="value"
-                            radius={[0, 4, 4, 0]}
+                            radius={[4, 4, 0, 0]}
                             shape={(props: any) => (
                               <Rectangle
                                 {...props}

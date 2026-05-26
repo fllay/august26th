@@ -195,4 +195,14 @@ These instructions apply to this repository unless a more specific `AGENTS.md` e
 - Score-ranking direction must propagate through deterministic fallback queries. For prompts asking for the lowest or least score, order candidate `total_score` ascending in both the direct form-scoped shortcut and retry/fallback paths; do not always default to descending top-scorer behavior.
 - For form-scoped follow-up prompts asking for score statistics such as median, mean, average, or `ค่ากลาง`, use a deterministic Postgres score-stats query over the same resolved `form_id`. Do not rely on the model to infer basic statistics from the previous table output.
 - For deterministic score-stats replies, project only the metrics the user explicitly asked for. Example: `ค่ากลางของคะแนน` should return only `median_score`, not a full summary row with min/max/avg/count unless those were requested.
+- SQL-backed form analysis payloads must include a score column derived from `form_responses.response_json->>'totalScore'` so score-distribution charts can be built from Postgres data. If the user explicitly asks for a score distribution graph, return that chart directly instead of appending the generic mixed dashboard charts.
+- For explicit single-chart requests such as a score distribution graph, keep the chat response minimal. Do not prepend the generic analysis summary bullets or deep-insight cards, and do not truncate the score distribution series to a fixed top-N bucket list.
 
+
+- The chat UI spreadsheet-analysis visual supports displayMode: single-chart to suppress the outer spreadsheet-analysis header/frame for explicit single-chart requests. Use it when the user asks for one specific graph instead of a dashboard.
+
+- The chat UI should infer single-chart rendering from the visual payload shape when possible, not only from an explicit backend flag. If there is exactly one chart, no insights, and the analysis request clearly asks for a distribution graph, suppress the spreadsheet-analysis frame/header.
+
+- In the chat UI, any spreadsheet-analysis visual payload with exactly one chart should render in single-chart mode, even if the backend flag or request-text heuristic is missing. This prevents the outer spreadsheet-analysis header from appearing around a single requested graph.
+
+- Spreadsheet-analysis bar charts in the chat UI now render as vertical columns, not horizontal bars. Use category labels on the X axis, numeric counts on the Y axis, and rotate dense labels when needed so score distributions read top-to-bottom.

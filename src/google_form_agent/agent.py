@@ -712,7 +712,8 @@ def _build_postgres_form_analysis_snapshot(
         query_form_response_database.invoke(
             {
                 "sql": (
-                    "SELECT response_id, created_time, respondent_email "
+                    "SELECT response_id, created_time, respondent_email, "
+                    "COALESCE(response_json->>'totalScore', '') AS total_score "
                     f"FROM form_responses WHERE form_id = {quoted_form_id} "
                     "ORDER BY created_time ASC NULLS LAST, response_id ASC"
                 ),
@@ -763,7 +764,7 @@ def _build_postgres_form_analysis_snapshot(
             question_counts[question_title].get(normalized_answer, 0) + 1
         )
 
-    processed_headers = ["Response ID", "Submitted At", "Respondent Email", *question_titles]
+    processed_headers = ["Response ID", "Submitted At", "Respondent Email", "Total Score", *question_titles]
     processed_rows: list[list[str]] = []
     for response in response_rows:
         response_id = str(response.get("response_id", "") or "").strip()
@@ -773,6 +774,7 @@ def _build_postgres_form_analysis_snapshot(
                 response_id,
                 str(response.get("created_time", "") or "").strip(),
                 str(response.get("respondent_email", "") or "").strip(),
+                str(response.get("total_score", "") or "").strip(),
                 *[str(answer_lookup.get(question_title, "") or "").strip() for question_title in question_titles],
             ]
         )
@@ -7675,6 +7677,34 @@ def _request_prefers_raw_question_charts(analysis_request: str) -> bool:
     )
 
 
+def _request_explicitly_asks_for_score_distribution_chart(analysis_request: str) -> bool:
+    """Return whether the user explicitly asked for a score distribution style chart."""
+    lowered = str(analysis_request or "").strip().casefold()
+    if not lowered:
+        return False
+    distribution_markers = (
+        "distribution graph",
+        "distribution chart",
+        "score distribution",
+        "histogram",
+        "bell curve",
+        "การกระจายคะแนน",
+        "กราฟการกระจาย",
+        "กราฟกระจาย",
+        "distribution",
+    )
+    score_markers = (
+        "score",
+        "scores",
+        "คะแนน",
+    )
+    if any(marker in lowered for marker in ("distribution graph", "distribution chart", "score distribution", "histogram", "การกระจายคะแนน")):
+        return True
+    return any(marker in lowered for marker in distribution_markers) and any(
+        marker in lowered for marker in score_markers
+    )
+
+
 def _compute_answer_distribution_entropy(points: list[dict[str, Any]]) -> float:
     total = sum(max(int(point.get("value", 0) or 0), 0) for point in points)
     if total <= 0:
@@ -8417,7 +8447,7 @@ def _build_score_distribution_topic(
     sorted_points = sorted(
         counts.items(),
         key=lambda item: float(item[0]),
-    )[:12]
+    )
     return {
         "id": "derived-score-distribution",
         "title": title,
@@ -8686,35 +8716,42 @@ def _build_spreadsheet_visual_payload(
         charts.append(chart)
         existing_titles.add(str(chart.get("title", "") or "").strip())
 
+    explicit_score_distribution_request = _request_explicitly_asks_for_score_distribution_chart(
+        analysis_request
+    )
     score_chart = _build_score_distribution_topic(
         processed_headers,
         processed_rows,
         existing_titles,
         prefer_thai=prefer_thai,
     )
-    if score_chart and len(charts) < 3:
+    if explicit_score_distribution_request and score_chart:
+        charts = [score_chart]
+        existing_titles = {str(score_chart.get("title", "") or "").strip()}
+    elif score_chart and len(charts) < 3:
         charts.append(score_chart)
         existing_titles.add(str(score_chart.get("title", "") or "").strip())
 
-    overall_agreement_chart = _build_overall_question_agreement_topic(
-        grouped_questions,
-        existing_titles,
-        prefer_thai=prefer_thai,
-    )
-    if overall_agreement_chart and len(charts) < 3:
-        charts.append(overall_agreement_chart)
-        existing_titles.add(str(overall_agreement_chart.get("title", "") or "").strip())
+    if not explicit_score_distribution_request:
+        overall_agreement_chart = _build_overall_question_agreement_topic(
+            grouped_questions,
+            existing_titles,
+            prefer_thai=prefer_thai,
+        )
+        if overall_agreement_chart and len(charts) < 3:
+            charts.append(overall_agreement_chart)
+            existing_titles.add(str(overall_agreement_chart.get("title", "") or "").strip())
 
-    segment_chart = _build_segment_composition_topic(
-        processed_headers,
-        processed_rows,
-        existing_titles,
-        prefer_thai=prefer_thai,
-    )
-    if segment_chart and len(charts) < 3:
-        charts.append(segment_chart)
+        segment_chart = _build_segment_composition_topic(
+            processed_headers,
+            processed_rows,
+            existing_titles,
+            prefer_thai=prefer_thai,
+        )
+        if segment_chart and len(charts) < 3:
+            charts.append(segment_chart)
 
-    insights = _build_deep_analysis_insights(
+    insights = [] if explicit_score_distribution_request else _build_deep_analysis_insights(
         grouped_questions,
         processed_headers,
         processed_rows,
@@ -8724,6 +8761,7 @@ def _build_spreadsheet_visual_payload(
     return {
         "version": 1,
         "kind": "spreadsheet-analysis-visual",
+        "displayMode": "single-chart" if explicit_score_distribution_request else "default",
         "userLanguage": "th" if user_language == "th" else "en",
         "spreadsheetId": spreadsheet_id,
         "spreadsheetTitle": spreadsheet_title,
@@ -8872,6 +8910,9 @@ def maybe_complete_spreadsheet_analysis_request(messages: list[AnyMessage]) -> A
             processed_rows=processed_rows,
             user_language=user_language,
         )
+        explicit_score_distribution_request = _request_explicitly_asks_for_score_distribution_chart(
+            stripped_request or latest_human_content
+        )
 
         unique_questions = int(visual_payload.get("questionCount", 0) or 0)
         chart_count = len(visual_payload.get("charts", []))
@@ -8893,7 +8934,13 @@ def maybe_complete_spreadsheet_analysis_request(messages: list[AnyMessage]) -> A
                 f"{top_chart['title']}: {top_point['label']} ({top_point['value']})"
             )
 
-        if user_language == "th":
+        if explicit_score_distribution_request:
+            response_lines = (
+                ["กราฟการกระจายคะแนนรวม:"]
+                if user_language == "th"
+                else ["Overall score distribution graph:"]
+            )
+        elif user_language == "th":
             response_lines = [
                 "ฉันวิเคราะห์สเปรดชีตและเตรียมกราฟสรุปให้แล้ว",
                 "",
@@ -8918,6 +8965,12 @@ def maybe_complete_spreadsheet_analysis_request(messages: list[AnyMessage]) -> A
                 response_lines.append(f"- ประเด็นเด่น: {top_insight}")
             if spreadsheet_url:
                 response_lines.extend(["", f"ลิงก์สเปรดชีต: {spreadsheet_url}"])
+            response_lines.extend(
+                [
+                    "",
+                    "กราฟในแชตอ้างอิงจากชีตสรุปคำตอบรายข้อ และยังใช้ลิงก์สเปรดชีตเดิมสำหรับวิเคราะห์ต่อได้",
+                ]
+            )
         else:
             response_lines = [
                 "I analyzed the spreadsheet and prepared chart views for the results.",
@@ -8943,17 +8996,12 @@ def maybe_complete_spreadsheet_analysis_request(messages: list[AnyMessage]) -> A
                 response_lines.append(f"- Top finding: {top_insight}")
             if spreadsheet_url:
                 response_lines.extend(["", f"Spreadsheet link: {spreadsheet_url}"])
-
-        response_lines.extend(
-            [
-                "",
-                (
-                    "กราฟในแชตอ้างอิงจากชีตสรุปคำตอบรายข้อ และยังใช้ลิงก์สเปรดชีตเดิมสำหรับวิเคราะห์ต่อได้"
-                    if user_language == "th"
-                    else "The charts in chat are based on the question summary sheet, and you can keep using the same spreadsheet link for deeper analysis."
-                ),
-            ]
-        )
+            response_lines.extend(
+                [
+                    "",
+                    "The charts in chat are based on the question summary sheet, and you can keep using the same spreadsheet link for deeper analysis.",
+                ]
+            )
         response_text = "\n".join(response_lines).strip()
         return AIMessage(content=_append_spreadsheet_visual_payload(response_text, visual_payload))
     except Exception as exc:
@@ -9203,7 +9251,16 @@ def maybe_complete_database_request(messages: list[AnyMessage]) -> AIMessage | N
             chart_count = len(visual_payload.get("charts", []) or [])
             form_title = str(form_row.get("form_title", "") or form_row.get("form_id", "")).strip()
             form_id = str(form_row.get("form_id", "") or "").strip()
-            if user_language == "th":
+            explicit_score_distribution_request = _request_explicitly_asks_for_score_distribution_chart(
+                latest_human_content
+            )
+            if explicit_score_distribution_request:
+                response_text = (
+                    "กราฟการกระจายคะแนนรวม:"
+                    if user_language == "th"
+                    else "Overall score distribution graph:"
+                )
+            elif user_language == "th":
                 response_text = "\n".join(
                     [
                         "ฉันวิเคราะห์ข้อมูลคำตอบจาก Postgres และเตรียมกราฟสรุปไว้แล้ว",
