@@ -47,6 +47,7 @@ SKILLS_DIR = PROJECT_ROOT / "skills"
 DEFAULT_GOOGLE_OAUTH_TOKEN_PATH = PROJECT_ROOT / ".data" / "google-oauth.json"
 FORM_SHEET_LINKS_PATH = PROJECT_ROOT / ".data" / "form-sheet-links.json"
 GOOGLE_APPS_SCRIPT_CONFIG_PATH = PROJECT_ROOT / ".data" / "google-apps-script.json"
+GOOGLE_SHEETS_MCP_CREDENTIALS_PATH = PROJECT_ROOT / ".data" / "google-sheets-mcp-credentials.json"
 GOOGLE_SHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
@@ -71,6 +72,7 @@ GOOGLE_OAUTH_SESSION_KEY = contextvars.ContextVar[str | None](
 )
 FORM_RESPONSE_SYNC_WORKER_STARTED = False
 FORM_RESPONSE_SYNC_WORKER_LOCK = threading.Lock()
+GOOGLE_SHEETS_MCP_DISABLED_UNTIL_RESTART = False
 DEFAULT_RESPONDENT_INFO_QUESTIONS = [
     {"title": "ชื่อ-นามสกุล", "type": "text", "required": True},
     {"title": "หน่วยงาน/สถานศึกษา", "type": "text", "required": True},
@@ -558,6 +560,39 @@ def _extract_recent_thread_form_id(messages: list[AnyMessage], before_index: int
     return ""
 
 
+def looks_like_form_database_link_request(text: str) -> bool:
+    """Return whether the user is explicitly asking to sync/link a form into SQL."""
+    lowered = str(text or "").casefold()
+    link_markers = (
+        "link form",
+        "link this form",
+        "sync form",
+        "sync this form",
+        "store this form",
+        "save this form",
+        "add this form",
+        "เชื่อมฟอร์ม",
+        "เชื่อมแบบฟอร์ม",
+        "เชื่อมแบบทดสอบ",
+        "ซิงก์ฟอร์ม",
+        "ซิงก์แบบฟอร์ม",
+        "บันทึกฟอร์ม",
+        "เก็บฟอร์ม",
+        "เพิ่มฟอร์ม",
+    )
+    has_database_signal = any(
+        marker in lowered
+        for marker in (
+            "postgres",
+            "database",
+            "sql",
+            "ฐานข้อมูล",
+            "โพสต์เกรส",
+        )
+    ) or bool(re.search(r"\bdb\b", lowered))
+    return has_database_signal and any(marker in lowered for marker in link_markers)
+
+
 def _load_agent_form_catalog() -> list[dict[str, Any]]:
     """Load agent-managed form metadata from Postgres."""
     payload = json.loads(
@@ -609,6 +644,40 @@ def _choose_database_analysis_form(
 def _quote_sql_string_literal(value: str) -> str:
     """Quote a string value for internal read-only SQL composition."""
     return "'" + str(value or "").replace("'", "''") + "'"
+
+
+def _get_form_sheet_link_details(form_id: str) -> dict[str, Any]:
+    """Return locally tracked link metadata for a form id when available."""
+    details = _load_form_sheet_links().get(str(form_id or "").strip(), {})
+    return dict(details) if isinstance(details, dict) else {}
+
+
+def _sync_form_id_into_response_store(form_id: str) -> dict[str, Any]:
+    """Sync a target form into the SQL response store using known metadata when available."""
+    normalized_form_id = str(form_id or "").strip()
+    if not normalized_form_id:
+        return {
+            "ok": False,
+            "status": "missing-form-id",
+            "error": "form_id is required",
+            "store": _describe_form_response_store(),
+        }
+
+    details = _get_form_sheet_link_details(normalized_form_id)
+    session_key = _resolve_agent_form_session_key(normalized_form_id, details)
+    token_session = GOOGLE_OAUTH_SESSION_KEY.set(session_key)
+    try:
+        return _best_effort_sync_agent_form_responses(
+            normalized_form_id,
+            spreadsheet_id=str(details.get("spreadsheetId", "") or ""),
+            form_title=str(details.get("spreadsheetTitle", "") or ""),
+            form_url=str(details.get("formUrl", "") or ""),
+            responder_url=str(details.get("responseUrl", "") or ""),
+            spreadsheet_url=str(details.get("spreadsheetUrl", "") or ""),
+            google_oauth_session_key=session_key or "",
+        )
+    finally:
+        GOOGLE_OAUTH_SESSION_KEY.reset(token_session)
 
 
 def _build_postgres_form_analysis_snapshot(
@@ -8134,6 +8203,115 @@ def maybe_complete_database_request(messages: list[AnyMessage]) -> AIMessage | N
     return None
 
 
+def maybe_complete_form_database_link_request(messages: list[AnyMessage]) -> AIMessage | None:
+    """Link a target form into the SQL response store when the user asks explicitly."""
+    latest_human_index = -1
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].type == "human":
+            latest_human_index = index
+            break
+
+    if latest_human_index == -1:
+        return None
+
+    latest_human_content = content_to_text(messages[latest_human_index].content).strip()
+    if not latest_human_content:
+        return None
+
+    if not looks_like_form_database_link_request(latest_human_content):
+        return None
+
+    user_language = infer_user_language(latest_human_content)
+    explicit_form_id = _extract_requested_form_id(latest_human_content)
+    recent_thread_form_id = _extract_recent_thread_form_id(messages, latest_human_index)
+    target_form_id = explicit_form_id or recent_thread_form_id
+    if not target_form_id:
+        if user_language == "th":
+            return AIMessage(
+                content=(
+                    "ฉันยังหา Form ID ที่จะเชื่อมเข้าฐานข้อมูลไม่พบ "
+                    "ให้ส่ง Form ID โดยตรง หรือขอเชื่อมฟอร์มที่เพิ่งสร้างในเธรดนี้อีกครั้ง"
+                )
+            )
+        return AIMessage(
+            content=(
+                "I could not determine which form to link into the database. "
+                "Provide the Form ID directly, or ask to link the form that was just created in this thread."
+            )
+        )
+
+    try:
+        result = _sync_form_id_into_response_store(target_form_id)
+        if not result.get("ok"):
+            raise RuntimeError(str(result.get("error", "Unknown sync error")))
+
+        catalog_rows = _load_agent_form_catalog()
+        form_row = _choose_database_analysis_form(
+            target_form_id,
+            catalog_rows,
+            preferred_form_id=target_form_id,
+        ) or {}
+        form_title = str(form_row.get("form_title", "") or target_form_id).strip()
+        spreadsheet_id = str(form_row.get("spreadsheet_id", "") or "").strip()
+        existing_details = _get_form_sheet_link_details(target_form_id)
+        _upsert_form_sheet_link(
+            target_form_id,
+            {
+                "formId": target_form_id,
+                "formTitle": form_title,
+                "formUrl": str(form_row.get("form_url", "") or "").strip(),
+                "spreadsheetId": spreadsheet_id,
+                "spreadsheetUrl": str(form_row.get("spreadsheet_url", "") or "").strip(),
+                "googleOauthSessionKey": GOOGLE_OAUTH_SESSION_KEY.get() or "",
+                "linkedAt": str(existing_details.get("linkedAt", "") or "")
+                or datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        response_count = int(result.get("responseCount", 0) or 0)
+        answer_count = int(result.get("answerCount", 0) or 0)
+        store_label = str(result.get("store", "") or "SQL store").strip()
+        synced_at = str(result.get("syncedAt", "") or "").strip()
+
+        if user_language == "th":
+            lines = [
+                "ฉันเชื่อมฟอร์มนี้เข้ากับฐานข้อมูลคำตอบเรียบร้อยแล้ว",
+                "",
+                f"- ฟอร์ม: {form_title}",
+                f"- Form ID: {target_form_id}",
+                f"- ฐานข้อมูล: {store_label}",
+                f"- จำนวนคำตอบที่ซิงก์: {response_count}",
+                f"- จำนวนรายการคำตอบรายข้อ: {answer_count}",
+            ]
+            if spreadsheet_id:
+                lines.append(f"- Spreadsheet ID: {spreadsheet_id}")
+            if synced_at:
+                lines.append(f"- ซิงก์ล่าสุด: {synced_at}")
+        else:
+            lines = [
+                "I linked this form into the response database.",
+                "",
+                f"- Form: {form_title}",
+                f"- Form ID: {target_form_id}",
+                f"- Store: {store_label}",
+                f"- Responses synced: {response_count}",
+                f"- Answer rows synced: {answer_count}",
+            ]
+            if spreadsheet_id:
+                lines.append(f"- Spreadsheet ID: {spreadsheet_id}")
+            if synced_at:
+                lines.append(f"- Synced at: {synced_at}")
+        return AIMessage(content="\n".join(lines).strip())
+    except Exception as exc:
+        raise RuntimeError(
+            (
+                "ฉันตรวจพบว่านี่เป็นคำขอเชื่อมฟอร์มเข้าฐานข้อมูล แต่การซิงก์ข้อมูลล้มเหลว "
+                if user_language == "th"
+                else "I recognized this as a request to link a form into the database, but the sync failed. "
+            )
+            + f"Details: {exc}"
+        ) from exc
+
+
 @tool
 def list_google_forms(query: str = "", limit: int = 20) -> str:
     """List the user's Google Forms."""
@@ -8403,6 +8581,20 @@ def _discover_single_google_oauth_session_token(base_path: Path) -> Path | None:
     return None
 
 
+def get_google_oauth_token_path_for_mcp() -> Path:
+    """Prefer the active or lone session-scoped OAuth token for MCP bootstraps."""
+    session_key = GOOGLE_OAUTH_SESSION_KEY.get()
+    if session_key:
+        return _derive_google_oauth_token_path_for_session(session_key)
+
+    configured = os.getenv("GOOGLE_OAUTH_TOKEN_PATH")
+    base_path = Path(configured).expanduser() if configured else DEFAULT_GOOGLE_OAUTH_TOKEN_PATH
+    discovered = _discover_single_google_oauth_session_token(base_path)
+    if discovered is not None:
+        return discovered
+    return base_path
+
+
 def get_google_oauth_token_path(*, discover_single_session: bool = False) -> Path:
     """Return the OAuth token file path used by the web UI and backend."""
     session_key = GOOGLE_OAUTH_SESSION_KEY.get()
@@ -8419,15 +8611,8 @@ def get_google_oauth_token_path(*, discover_single_session: bool = False) -> Pat
     return token_path
 
 
-def load_google_refresh_token(*, discover_single_session: bool = True) -> str | None:
-    """Load the Google refresh token from env first, then shared OAuth storage."""
-    env_token = os.getenv("GOOGLE_REFRESH_TOKEN")
-    if env_token:
-        return env_token
-
-    token_path = get_google_oauth_token_path(
-        discover_single_session=discover_single_session
-    )
+def _load_google_refresh_token_from_file(token_path: Path) -> str | None:
+    """Read a refresh token directly from an authorized-user token file."""
     if not token_path.exists():
         return None
 
@@ -8440,6 +8625,18 @@ def load_google_refresh_token(*, discover_single_session: bool = True) -> str | 
     if isinstance(refresh_token, str) and refresh_token.strip():
         return refresh_token.strip()
     return None
+
+
+def load_google_refresh_token(*, discover_single_session: bool = True) -> str | None:
+    """Load the Google refresh token from env first, then shared OAuth storage."""
+    env_token = os.getenv("GOOGLE_REFRESH_TOKEN")
+    if env_token:
+        return env_token
+
+    token_path = get_google_oauth_token_path(
+        discover_single_session=discover_single_session
+    )
+    return _load_google_refresh_token_from_file(token_path)
 
 
 def load_shared_google_oauth_scopes() -> set[str]:
@@ -8473,13 +8670,47 @@ def has_google_sheets_auth_config() -> bool:
     """Return whether Sheets MCP has any usable auth source configured."""
     if os.getenv("CREDENTIALS_CONFIG"):
         return True
-    if has_shared_google_oauth_token():
+    if get_google_oauth_token_path_for_mcp().exists():
+        return True
+    if build_google_sheets_oauth_client_config() is not None:
         return True
     for env_name in ("SERVICE_ACCOUNT_PATH", "CREDENTIALS_PATH", "TOKEN_PATH"):
         env_value = os.getenv(env_name)
         if env_value and Path(env_value).expanduser().exists():
             return True
     return False
+
+
+def build_google_sheets_oauth_client_config() -> dict[str, Any] | None:
+    """Build an OAuth client config payload for mcp-google-sheets from app env."""
+    client_id = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+    client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        return None
+
+    return {
+        "installed": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": ["http://localhost"],
+        }
+    }
+
+
+def ensure_google_sheets_oauth_credentials_file() -> Path | None:
+    """Persist an OAuth client credentials file for the Sheets MCP when needed."""
+    payload = build_google_sheets_oauth_client_config()
+    if payload is None:
+        return None
+
+    GOOGLE_SHEETS_MCP_CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    GOOGLE_SHEETS_MCP_CREDENTIALS_PATH.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return GOOGLE_SHEETS_MCP_CREDENTIALS_PATH
 
 
 def normalize_openai_base_url(base_url: str) -> str:
@@ -10457,6 +10688,14 @@ class LocalLLMMessageFormatMiddleware(AgentMiddleware):
             )
             if direct_sheet_response is not None:
                 return direct_sheet_response
+            direct_form_database_link_response = await asyncio.to_thread(
+                run_with_google_oauth_session,
+                google_oauth_session_key,
+                maybe_complete_form_database_link_request,
+                messages,
+            )
+            if direct_form_database_link_response is not None:
+                return direct_form_database_link_response
             direct_database_response = await asyncio.to_thread(
                 run_with_google_oauth_session,
                 google_oauth_session_key,
@@ -10556,7 +10795,7 @@ def build_chat_model() -> ChatOpenAI:
     )
 
 
-def build_mcp_client() -> MultiServerMCPClient:
+def build_mcp_client(*, include_google_sheets: bool = True) -> MultiServerMCPClient:
     """Build the MCP client for the configured stdio MCP servers."""
     forms_server_path = Path(get_required_env("GOOGLE_FORMS_MCP_PATH")).expanduser()
     if not forms_server_path.exists():
@@ -10569,7 +10808,10 @@ def build_mcp_client() -> MultiServerMCPClient:
         "GOOGLE_CLIENT_ID": get_required_env("GOOGLE_CLIENT_ID"),
         "GOOGLE_CLIENT_SECRET": get_required_env("GOOGLE_CLIENT_SECRET"),
     }
-    refresh_token = load_google_refresh_token(discover_single_session=False)
+    refresh_token = (
+        _load_google_refresh_token_from_file(get_google_oauth_token_path_for_mcp())
+        or os.getenv("GOOGLE_REFRESH_TOKEN")
+    )
     if refresh_token:
         forms_server_env["GOOGLE_REFRESH_TOKEN"] = refresh_token
 
@@ -10582,7 +10824,7 @@ def build_mcp_client() -> MultiServerMCPClient:
         }
     }
 
-    if is_env_truthy("ENABLE_GOOGLE_SHEETS_MCP"):
+    if include_google_sheets and is_env_truthy("ENABLE_GOOGLE_SHEETS_MCP"):
         if not has_google_sheets_auth_config():
             return MultiServerMCPClient(
                 servers,
@@ -10601,10 +10843,17 @@ def build_mcp_client() -> MultiServerMCPClient:
             )
             if (value := os.getenv(key))
         }
-        if "TOKEN_PATH" not in sheets_server_env and has_shared_google_oauth_token():
-            sheets_server_env["TOKEN_PATH"] = str(
-                get_google_oauth_token_path(discover_single_session=False)
-            )
+        if "TOKEN_PATH" not in sheets_server_env:
+            preferred_token_path = get_google_oauth_token_path_for_mcp()
+            if preferred_token_path.exists():
+                sheets_server_env["TOKEN_PATH"] = str(preferred_token_path)
+        if (
+            "SERVICE_ACCOUNT_PATH" not in sheets_server_env
+            and "CREDENTIALS_PATH" not in sheets_server_env
+        ):
+            generated_credentials_path = ensure_google_sheets_oauth_credentials_file()
+            if generated_credentials_path is not None:
+                sheets_server_env["CREDENTIALS_PATH"] = str(generated_credentials_path)
         sheets_enabled_tools = os.getenv(
             "GOOGLE_SHEETS_ENABLED_TOOLS",
             "search_spreadsheets,list_spreadsheets,list_sheets,get_sheet_data,"
@@ -10627,10 +10876,28 @@ def build_mcp_client() -> MultiServerMCPClient:
 
 async def build_agent() -> Any:
     """Create the Deep Agent with Google Forms MCP tools."""
+    global GOOGLE_SHEETS_MCP_DISABLED_UNTIL_RESTART
     _ensure_form_response_sync_worker_started()
     model = build_chat_model()
-    client = build_mcp_client()
-    mcp_tools = await client.get_tools()
+    include_google_sheets = (
+        is_env_truthy("ENABLE_GOOGLE_SHEETS_MCP")
+        and not GOOGLE_SHEETS_MCP_DISABLED_UNTIL_RESTART
+    )
+    client = await asyncio.to_thread(
+        build_mcp_client,
+        include_google_sheets=include_google_sheets,
+    )
+    try:
+        mcp_tools = await client.get_tools()
+    except Exception:
+        if not include_google_sheets:
+            raise
+        GOOGLE_SHEETS_MCP_DISABLED_UNTIL_RESTART = True
+        client = await asyncio.to_thread(
+            build_mcp_client,
+            include_google_sheets=False,
+        )
+        mcp_tools = await client.get_tools()
     filtered_mcp_tools = [
         tool
         for tool in mcp_tools

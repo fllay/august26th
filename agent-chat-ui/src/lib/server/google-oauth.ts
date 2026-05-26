@@ -134,8 +134,12 @@ export async function getGoogleOauthSessionKey(): Promise<string> {
   return getOrCreateGoogleOauthSessionKey();
 }
 
+function getGoogleOauthBaseTokenPath(): string {
+  return process.env.GOOGLE_OAUTH_TOKEN_PATH?.trim() || DEFAULT_TOKEN_PATH;
+}
+
 export async function getGoogleOauthTokenPath(): Promise<string> {
-  const basePath = process.env.GOOGLE_OAUTH_TOKEN_PATH?.trim() || DEFAULT_TOKEN_PATH;
+  const basePath = getGoogleOauthBaseTokenPath();
   const sessionKey = await getOrCreateGoogleOauthSessionKey();
   const baseDir = path.dirname(basePath);
   return path.join(baseDir, "google-oauth-sessions", `${sessionKey}.json`);
@@ -275,8 +279,11 @@ async function fetchGoogleUserProfile(
 }
 
 export async function saveGoogleOauthToken(token: StoredGoogleToken) {
+  const baseTokenPath = getGoogleOauthBaseTokenPath();
   const tokenPath = await getGoogleOauthTokenPath();
+  await mkdir(path.dirname(baseTokenPath), { recursive: true });
   await mkdir(path.dirname(tokenPath), { recursive: true });
+  await writeFile(baseTokenPath, JSON.stringify(token, null, 2), "utf-8");
   await writeFile(tokenPath, JSON.stringify(token, null, 2), "utf-8");
 }
 
@@ -290,5 +297,6 @@ export async function loadGoogleOauthToken(): Promise<StoredGoogleToken | null> 
 }
 
 export async function deleteGoogleOauthToken() {
+  await rm(getGoogleOauthBaseTokenPath(), { force: true });
   await rm(await getGoogleOauthTokenPath(), { force: true });
 }
