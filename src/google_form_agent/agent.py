@@ -2107,7 +2107,7 @@ def _validate_readonly_response_store_sql(sql: str) -> str:
 
     stripped = normalized.rstrip().rstrip(";").strip()
     lowered = stripped.casefold()
-    if not (lowered.startswith("select ") or lowered.startswith("with ")):
+    if not re.match(r"^(select|with)\b", lowered):
         raise RuntimeError("Only read-only SELECT or WITH queries are allowed.")
 
     if ";" in stripped:
@@ -2154,6 +2154,75 @@ def _extract_embedded_readonly_sql(text: str) -> str:
         except Exception:
             return ""
     return ""
+
+
+def _extract_manual_readonly_sql_candidate(text: str) -> str:
+    """Recover a read-only SQL statement from raw/manual SQL style user input."""
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        return ""
+
+    candidates: list[str] = [raw_text]
+
+    lines = [line.rstrip() for line in raw_text.splitlines()]
+    if lines:
+        first_line = lines[0].strip().casefold()
+        if first_line in {
+            "run this read-only sql against the form response database.",
+            "run this read-only sql against the form response database",
+        }:
+            candidates.append("\n".join(lines[1:]).strip())
+
+        if first_line == "sql":
+            candidates.append("\n".join(lines[1:]).strip())
+
+        if first_line.startswith("```sql"):
+            body = "\n".join(lines[1:])
+            body = re.sub(r"\n```+\s*$", "", body).strip()
+            candidates.append(body)
+
+    for candidate in candidates:
+        normalized = candidate.strip()
+        if not normalized:
+            continue
+        if normalized.startswith("```"):
+            normalized = re.sub(r"^```(?:sql)?\s*", "", normalized, flags=re.IGNORECASE)
+            normalized = re.sub(r"\s*```$", "", normalized).strip()
+        if normalized.casefold().startswith("sql\n"):
+            normalized = normalized.split("\n", 1)[1].strip()
+        try:
+            return _validate_readonly_response_store_sql(normalized)
+        except Exception:
+            continue
+    return ""
+
+
+def _looks_like_manual_sql_attempt(text: str) -> bool:
+    """Heuristic: detect when the user is trying to submit SQL directly."""
+    lowered = str(text or "").strip().casefold()
+    if not lowered:
+        return False
+    if lowered.startswith("select") or lowered.startswith("with"):
+        return True
+    sql_markers = (
+        "select ",
+        "select\n",
+        "\nselect ",
+        "\nselect\n",
+        "with ",
+        "with\n",
+        "\nwith ",
+        "\nwith\n",
+        " from ",
+        "\nfrom ",
+        " where ",
+        "\nwhere ",
+        " order by ",
+        "\norder by ",
+        " group by ",
+        "\ngroup by ",
+    )
+    return any(marker in lowered for marker in sql_markers)
 
 
 def _format_query_payload_as_markdown_table(payload: dict[str, Any]) -> str:
@@ -9015,7 +9084,11 @@ def maybe_complete_spreadsheet_analysis_request(messages: list[AnyMessage]) -> A
         ) from exc
 
 
-def maybe_complete_database_request(messages: list[AnyMessage]) -> AIMessage | None:
+def maybe_complete_database_request(
+    messages: list[AnyMessage],
+    *,
+    manual_sql_enabled: bool = False,
+) -> AIMessage | None:
     """Directly answer obvious Postgres response-store requests with read-only SQL."""
     latest_human_index = -1
     for index in range(len(messages) - 1, -1, -1):
@@ -9035,7 +9108,45 @@ def maybe_complete_database_request(messages: list[AnyMessage]) -> AIMessage | N
     explicit_form_id = _extract_requested_form_id(latest_human_content)
     recent_thread_form_id = _extract_recent_thread_form_id(messages, latest_human_index)
     target_form_id = explicit_form_id or recent_thread_form_id
-    embedded_sql = _extract_embedded_readonly_sql(latest_human_content)
+    recovered_manual_sql = _extract_manual_readonly_sql_candidate(latest_human_content)
+    sql_like_attempt = _looks_like_manual_sql_attempt(latest_human_content)
+    if manual_sql_enabled:
+        try:
+            embedded_sql = recovered_manual_sql or _validate_readonly_response_store_sql(
+                latest_human_content
+            )
+        except Exception as exc:
+            if user_language == "th":
+                return AIMessage(
+                    content=(
+                        "โหมด Manual SQL รองรับเฉพาะคำสั่งแบบอ่านอย่างเดียวที่เป็น SELECT หรือ WITH เท่านั้น\n\n"
+                        f"รายละเอียด: {exc}"
+                    )
+                )
+            return AIMessage(
+                content=(
+                    "Manual SQL mode only supports read-only SELECT or WITH queries.\n\n"
+                    f"Details: {exc}"
+                )
+            )
+    else:
+        embedded_sql = _extract_embedded_readonly_sql(latest_human_content)
+        if not embedded_sql:
+            embedded_sql = recovered_manual_sql
+    if sql_like_attempt and not embedded_sql:
+        if user_language == "th":
+            return AIMessage(
+                content=(
+                    "ตรวจพบว่าคุณกำลังส่งคำสั่ง SQL โดยตรง แต่คำสั่งนี้ไม่ผ่านเงื่อนไขของโหมด read-only\n\n"
+                    "ใช้ได้เฉพาะคำสั่ง SELECT หรือ WITH แบบหนึ่งคำสั่งเท่านั้น"
+                )
+            )
+        return AIMessage(
+            content=(
+                "I detected a direct SQL submission, but it did not pass the read-only SQL rules.\n\n"
+                "Only a single SELECT or WITH statement is allowed."
+            )
+        )
     form_scoped_query_plan = (
         _plan_form_scoped_database_query(latest_human_content)
         if target_form_id
@@ -9046,20 +9157,26 @@ def maybe_complete_database_request(messages: list[AnyMessage]) -> AIMessage | N
         and looks_like_spreadsheet_analysis_request(latest_human_content)
     )
     if (
+        not manual_sql_enabled
+        and (
         not looks_like_database_request(lowered)
         and not thread_form_analysis_request
         and not embedded_sql
         and not form_scoped_query_plan
         and not target_form_id
+        )
     ):
         return None
     if (
+        not manual_sql_enabled
+        and (
         looks_like_form_creation_request(latest_human_content)
         and not explicit_form_id
         and not thread_form_analysis_request
         and not embedded_sql
         and not form_scoped_query_plan
         and not target_form_id
+        )
     ):
         return None
 
@@ -9122,6 +9239,12 @@ def maybe_complete_database_request(messages: list[AnyMessage]) -> AIMessage | N
             payload = _execute_readonly_response_store_query(embedded_sql, row_limit=200)
             row_count = int(payload.get("rowCount", 0) or 0)
             table = _format_query_payload_as_markdown_table(payload)
+            if manual_sql_enabled:
+                if table:
+                    return AIMessage(content=table)
+                if user_language == "th":
+                    return AIMessage(content="ไม่พบข้อมูล")
+                return AIMessage(content="No rows found.")
             if user_language == "th":
                 lines = [
                     "ผลลัพธ์จากคำสั่ง SQL แบบอ่านอย่างเดียว:",
@@ -11356,6 +11479,22 @@ def get_attached_file_context(request: ModelRequest) -> str:
     return ""
 
 
+def get_manual_sql_enabled_from_request(request: ModelRequest) -> bool:
+    """Read the Web UI manual SQL toggle from request context or metadata."""
+    context = request.state.get("context") if isinstance(request.state, dict) else None
+    if isinstance(context, dict):
+        value = context.get("manual_sql_enabled")
+        if isinstance(value, bool):
+            return value
+
+    metadata = getattr(request, "metadata", None)
+    if isinstance(metadata, dict):
+        value = metadata.get("manual_sql_enabled")
+        if isinstance(value, bool):
+            return value
+    return False
+
+
 def get_google_oauth_session_key_from_request(request: ModelRequest) -> str | None:
     """Read the user-scoped Google OAuth session key from runtime or state context."""
     def _find_session_key(value: Any, depth: int = 0) -> str | None:
@@ -11997,6 +12136,7 @@ class LocalLLMMessageFormatMiddleware(AgentMiddleware):
                 if request.system_message is not None
                 else None
             )
+            manual_sql_enabled = get_manual_sql_enabled_from_request(request)
             messages = [sanitize_message_content(message) for message in original_messages]
             messages = inject_attached_file_context(
                 messages,
@@ -12023,6 +12163,7 @@ class LocalLLMMessageFormatMiddleware(AgentMiddleware):
                 google_oauth_session_key,
                 maybe_complete_database_request,
                 messages,
+                manual_sql_enabled=manual_sql_enabled,
             )
             if direct_database_response is not None:
                 return direct_database_response

@@ -4,6 +4,8 @@ import { motion } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { useStreamContext } from "@/providers/Stream";
 import { Button } from "../ui/button";
+import { Label } from "../ui/label";
+import { Switch } from "../ui/switch";
 import type {
   Checkpoint,
   Message,
@@ -132,6 +134,7 @@ export function Thread() {
     parseAsBoolean.withDefault(false),
   );
   const [input, setInput] = useState("");
+  const [manualSqlMode, setManualSqlMode] = useState(false);
   const [userId, setUserId] = useState("");
   const userIdRef = useRef("");
   const {
@@ -341,6 +344,26 @@ export function Thread() {
     if ((input.trim().length === 0 && contentBlocks.length === 0) || isLoading)
       return;
 
+    const trimmedInput = input.trim();
+    if (manualSqlMode) {
+      if (contentBlocks.length > 0) {
+        toast.error("Attachments are not supported in manual SQL mode.", {
+          duration: 3000,
+        });
+        return;
+      }
+      const normalizedSql = trimmedInput.toLowerCase();
+      if (
+        trimmedInput.length > 0 &&
+        !/^(select|with)\b/.test(normalizedSql)
+      ) {
+        toast.error("Manual SQL mode only supports read-only SELECT or WITH queries.", {
+          duration: 3500,
+        });
+        return;
+      }
+    }
+
     const resolvedUserId = await resolveUserId();
     const interrupt = stream.interrupt;
     const approvalDecision =
@@ -386,8 +409,9 @@ export function Thread() {
     )
       .filter(Boolean)
       .join("\n\n");
+    const submittedInput = trimmedInput;
     const inputWithAttachments = [
-      input.trim(),
+      submittedInput,
       attachedFileContext
         ? `The uploaded file has already been processed by the application. Do not use tools. Do not say you cannot access it.\nExact extracted uploaded file text:\n<<<FILE_TEXT>>>\n${attachedFileContext}\n<<<END_FILE_TEXT>>>\nWhen the user asks for text in the uploaded file, return only the text between FILE_TEXT markers.`
         : "",
@@ -443,6 +467,7 @@ export function Thread() {
         : {}),
       web_search_enabled: false,
       google_oauth_session_key: googleOauthSessionKey,
+      manual_sql_enabled: manualSqlMode,
     };
 
     const guestId = ensureGuestId();
@@ -458,6 +483,7 @@ export function Thread() {
       web_search_enabled: false,
       user_id: resolvedUserId,
       google_oauth_session_key: googleOauthSessionKey,
+      manual_sql_enabled: manualSqlMode,
     };
 
     if (needsThreadId && newThreadId) {
@@ -813,11 +839,18 @@ export function Thread() {
                             form?.requestSubmit();
                           }
                         }}
-                        placeholder="Type your message..."
-                        className="composer-scrollbar min-h-24 max-h-72 w-full resize-none overflow-hidden border-none bg-transparent p-3.5 pb-0 leading-6 shadow-none ring-0 outline-none focus:ring-0 focus:outline-none"
+                        placeholder={
+                          manualSqlMode
+                            ? "SELECT ... or WITH ..."
+                            : "Type your message..."
+                        }
+                        className={cn(
+                          "composer-scrollbar min-h-24 max-h-72 w-full resize-none overflow-hidden border-none bg-transparent p-3.5 pb-0 leading-6 shadow-none ring-0 outline-none focus:ring-0 focus:outline-none",
+                          manualSqlMode && "font-mono text-sm",
+                        )}
                       />
 
-                      <div className="flex items-center p-2 pt-4">
+                      <div className="flex items-center gap-3 p-2 pt-4">
                         <input
                           ref={fileInputRef}
                           type="file"
@@ -828,13 +861,34 @@ export function Thread() {
                         />
                         <TooltipIconButton
                           type="button"
-                          tooltip="Add file"
+                          tooltip={
+                            manualSqlMode
+                              ? "Attachments are disabled in manual SQL mode"
+                              : "Add file"
+                          }
                           variant="ghost"
                           className="shrink-0 hover:bg-gray-200 dark:hover:bg-zinc-700"
                           onClick={() => fileInputRef.current?.click()}
+                          disabled={manualSqlMode}
                         >
                           <Paperclip className="h-4 w-4" />
                         </TooltipIconButton>
+                        <Label
+                          htmlFor="manual-sql-mode"
+                          className="text-muted-foreground ml-1 flex items-center gap-2 text-xs"
+                        >
+                          <Switch
+                            id="manual-sql-mode"
+                            checked={manualSqlMode}
+                            onCheckedChange={setManualSqlMode}
+                          />
+                          Manual SQL
+                        </Label>
+                        {manualSqlMode && (
+                          <span className="text-muted-foreground text-xs">
+                            Read-only `SELECT` or `WITH` only
+                          </span>
+                        )}
                         {stream.isLoading ? (
                           <Button
                             key="stop"

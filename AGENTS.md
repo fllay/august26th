@@ -206,3 +206,15 @@ These instructions apply to this repository unless a more specific `AGENTS.md` e
 - In the chat UI, any spreadsheet-analysis visual payload with exactly one chart should render in single-chart mode, even if the backend flag or request-text heuristic is missing. This prevents the outer spreadsheet-analysis header from appearing around a single requested graph.
 
 - Spreadsheet-analysis bar charts in the chat UI now render as vertical columns, not horizontal bars. Use category labels on the X axis, numeric counts on the Y axis, and rotate dense labels when needed so score distributions read top-to-bottom.
+
+- The web UI composer supports a Manual SQL toggle for user-authored read-only queries. When enabled, it disables attachments, switches the prompt area to SQL-oriented input, wraps the submitted text in a fenced sql block, and passes manual_sql_enabled through chat context/metadata so the backend can route it through the existing read-only SQL path.
+
+- Manual SQL mode client-side validation should accept SELECT or WITH followed by any SQL word boundary, not only a literal space, so multiline queries starting on the next line are allowed.
+
+- Manual SQL mode must submit the user-authored SQL verbatim and bypass thread-derived form context. When manual_sql_enabled is set in request context/metadata, prioritize validating and executing the latest human message as the exact read-only query, and return just the result table or an explicit no-rows message.
+
+- The database shortcut must recover manual SQL even when the frontend still sends older wrapped payloads or the manual flag is missing. Before falling back to NL-to-SQL on a form-scoped message, try extracting a raw read-only SQL candidate from plain text, old helper wrappers, bare sql prefixes, and fenced code blocks.
+
+- SQL-looking user input must never fall through to the generic NL-to-SQL branch when direct SQL extraction fails. Treat that as a direct manual-SQL validation failure and return a deterministic read-only-SQL error message instead of reinterpreting the request from thread form context.
+
+- Read-only SQL validation must accept SELECT or WITH followed by any word boundary, not only a literal space. Multiline SQL that starts with SELECT on the first line and the rest of the query on following lines is valid and should not be rejected.
