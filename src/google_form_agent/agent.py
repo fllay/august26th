@@ -16,6 +16,7 @@ import re
 import threading
 import time
 from urllib import error as urllib_error
+from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 import zipfile
 from collections.abc import Callable
@@ -625,6 +626,14 @@ def _load_agent_form_catalog() -> list[dict[str, Any]]:
     return [row for row in rows if isinstance(row, dict)]
 
 
+def _form_id_ambiguity_key(form_id: str) -> str:
+    """Normalize visually ambiguous form-id characters for catalog lookup only."""
+    key = str(form_id or "").strip()
+    key = re.sub(r"[^A-Za-z0-9_-]+", "", key)
+    key = key.casefold()
+    return key.translate(str.maketrans({"i": "l", "1": "l", "o": "0"}))
+
+
 def _choose_database_analysis_form(
     request_text: str,
     catalog_rows: list[dict[str, Any]],
@@ -640,12 +649,22 @@ def _choose_database_analysis_form(
         for row in catalog_rows:
             if str(row.get("form_id", "") or "").strip() == normalized_preferred_form_id:
                 return row
+        preferred_key = _form_id_ambiguity_key(normalized_preferred_form_id)
+        if preferred_key:
+            for row in catalog_rows:
+                if _form_id_ambiguity_key(str(row.get("form_id", "") or "")) == preferred_key:
+                    return row
 
     explicit_form_id = _extract_requested_form_id(request_text)
     if explicit_form_id:
         for row in catalog_rows:
             if str(row.get("form_id", "") or "").strip() == explicit_form_id:
                 return row
+        explicit_key = _form_id_ambiguity_key(explicit_form_id)
+        if explicit_key:
+            for row in catalog_rows:
+                if _form_id_ambiguity_key(str(row.get("form_id", "") or "")) == explicit_key:
+                    return row
 
     lowered = str(request_text or "").strip().casefold()
     for row in catalog_rows:
@@ -2064,6 +2083,44 @@ def _response_store_schema_payload() -> dict[str, Any]:
     }
 
 
+def _response_store_sql_pattern_payload() -> dict[str, Any]:
+    """Return compact SQL idioms that help NL-to-SQL handle complex form questions."""
+    return {
+        "response_level_score": (
+            "COALESCE(NULLIF(fr.response_json->>'totalScore', '')::numeric, "
+            "(SELECT SUM((answer.answer_obj->'grade'->>'score')::numeric) "
+            "FROM jsonb_each(fr.response_json->'answers') AS answer(question_id, answer_obj) "
+            "WHERE answer.answer_obj->'grade'->>'score' IS NOT NULL))"
+        ),
+        "answer_value_filter": (
+            "EXISTS (SELECT 1 FROM form_response_answers fa "
+            "WHERE fa.form_id = fr.form_id AND fa.response_id = fr.response_id "
+            "AND fa.question_title = '<actual question title>' "
+            "AND fa.answer_text ILIKE '<value or pattern>')"
+        ),
+        "answer_value_grouping": (
+            "JOIN form_response_answers fa ON fa.form_id = fr.form_id "
+            "AND fa.response_id = fr.response_id "
+            "AND fa.question_title = '<actual question title>'"
+        ),
+        "per_question_distribution": (
+            "SELECT question_title, answer_text, COUNT(*) AS response_count "
+            "FROM form_response_answers "
+            "WHERE form_id = '<form id>' "
+            "GROUP BY question_title, answer_text "
+            "ORDER BY question_title, response_count DESC"
+        ),
+        "multi_answer_comparison": (
+            "Use separate aliases of form_response_answers for each referenced question, "
+            "joining each alias on form_id and response_id."
+        ),
+        "time_window": (
+            "Filter form_responses.created_time or last_submitted_time with timestamp/date "
+            "comparisons when the user asks for before, after, since, between, latest, or recent."
+        ),
+    }
+
+
 _FORBIDDEN_SQL_TOKENS = (
     "insert",
     "update",
@@ -2251,8 +2308,92 @@ def _looks_like_form_response_query_request(text: str) -> bool:
     lowered = str(text or "").casefold()
     if not lowered:
         return False
+    complex_markers = (
+        "average",
+        "avg",
+        "mean",
+        "median",
+        "count",
+        "counts",
+        "percentage",
+        "percent",
+        "ratio",
+        "distribution",
+        "breakdown",
+        "compare",
+        "comparison",
+        "group",
+        "group by",
+        " by ",
+        "where",
+        "filter",
+        "only",
+        "except",
+        "exclude",
+        "include",
+        "greater than",
+        "less than",
+        "more than",
+        "fewer than",
+        "between",
+        "before",
+        "after",
+        "since",
+        "until",
+        "matching",
+        "contains",
+        "equals",
+        "top",
+        "bottom",
+        "rank",
+        "score",
+        "scores",
+        "ค่าเฉลี่ย",
+        "ค่ากลาง",
+        "มัธยฐาน",
+        "จำนวน",
+        "ร้อยละ",
+        "เปอร์เซ็นต์",
+        "สัดส่วน",
+        "แจกแจง",
+        "เปรียบเทียบ",
+        "จัดกลุ่ม",
+        "ตาม",
+        "เฉพาะ",
+        "ยกเว้น",
+        "มากกว่า",
+        "น้อยกว่า",
+        "ระหว่าง",
+        "ก่อน",
+        "หลัง",
+        "ตั้งแต่",
+        "จนถึง",
+        "มีคำว่า",
+        "เท่ากับ",
+        "อันดับ",
+        "คะแนน",
+    )
+    raw_markers = (
+        "raw data",
+        "raw responses",
+        "raw answers",
+        "all rows",
+        "all records",
+        "dump responses",
+        "full response rows",
+        "ข้อมูลดิบ",
+        "คำตอบดิบ",
+        "ทุกแถว",
+        "ทุกระเบียน",
+    )
+    if any(marker in lowered for marker in complex_markers) and not any(
+        marker in lowered for marker in raw_markers
+    ):
+        return False
     exact_markers = (
-        "query",
+        "query responses",
+        "query answers",
+        "query raw data",
         "show data",
         "show response",
         "show responses",
@@ -2319,6 +2460,11 @@ def _plan_form_scoped_database_query(text: str) -> dict[str, Any] | None:
         return {
             "kind": "response-rows",
         }
+    aggregate_plan = _plan_common_form_aggregate_query(text)
+    if aggregate_plan:
+        return aggregate_plan
+    if _looks_like_complex_form_scoped_database_query(text):
+        return None
     if _looks_like_score_statistics_request(text):
         return {
             "kind": "score-stats",
@@ -2329,6 +2475,180 @@ def _plan_form_scoped_database_query(text: str) -> dict[str, Any] | None:
             "direction": _infer_score_ranking_direction(text),
         }
     return None
+
+
+def _extract_grouping_phrase(text: str) -> str:
+    """Extract a requested grouping field from aggregate wording."""
+    raw_text = str(text or "").strip()
+    patterns = (
+        r"แยกตาม\s*(.+)$",
+        r"จัดกลุ่ม(?:ตาม)?\s*(.+)$",
+        r"เปรียบเทียบ.+?ตาม\s*(.+)$",
+        r"เทียบ(?:กับ|ตาม)?\s*(.+)$",
+        r"group\s+by\s+(.+)$",
+        r"\bby\s+(.+)$",
+        r"\bper\s+(.+)$",
+        r"for\s+each\s+(.+)$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, raw_text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        phrase = match.group(1).strip()
+        phrase = re.sub(
+            r"\bform(?:\s*[_-]?\s*id)?\s*[:=]\s*[A-Za-z0-9_-]{10,}\b",
+            "",
+            phrase,
+            flags=re.IGNORECASE,
+        )
+        phrase = phrase.strip(" .,:;|")
+        if phrase:
+            return phrase
+    return ""
+
+
+def _plan_common_form_aggregate_query(text: str) -> dict[str, Any] | None:
+    """Plan common form-scoped aggregate queries without relying on brittle NL SQL."""
+    lowered = str(text or "").casefold()
+    if not lowered:
+        return None
+
+    if any(marker in lowered for marker in ("ตอบผิด", "wrong", "incorrect")) and any(
+        marker in lowered for marker in ("มากที่สุด", "most", "highest", "top")
+    ):
+        return {"kind": "most-wrong-question"}
+
+    if any(marker in lowered for marker in ("distribution", "การกระจาย", "แจกแจง")) and any(
+        marker in lowered for marker in ("score", "คะแนน")
+    ):
+        return {"kind": "score-distribution"}
+
+    grouping_phrase = _extract_grouping_phrase(text)
+    asks_for_average_score = any(
+        marker in lowered for marker in ("average", "avg", "mean", "ค่าเฉลี่ย", "คะแนนเฉลี่ย")
+    ) and any(marker in lowered for marker in ("score", "คะแนน"))
+    if asks_for_average_score and grouping_phrase:
+        return {
+            "kind": "avg-score-by-answer-field",
+            "group_phrase": grouping_phrase,
+        }
+
+    asks_for_count = any(
+        marker in lowered
+        for marker in (
+            "count",
+            "counts",
+            "how many",
+            "number of",
+            "summary",
+            "summarize",
+            "จำนวน",
+            "นับ",
+            "กี่",
+            "สรุป",
+        )
+    )
+    if asks_for_count and any(marker in lowered for marker in ("email domain", "อีเมลโดเมน", "โดเมน")):
+        return {"kind": "count-by-email-domain"}
+    if asks_for_count and grouping_phrase:
+        plan: dict[str, Any] = {
+            "kind": "count-by-answer-field",
+            "group_phrase": grouping_phrase,
+        }
+        score_filter = _extract_score_filter(text)
+        if score_filter:
+            plan["score_filter"] = score_filter
+        return plan
+
+    return None
+
+
+def _extract_score_filter(text: str) -> dict[str, Any] | None:
+    """Extract a numeric score filter from aggregate wording."""
+    raw_text = str(text or "")
+    patterns = (
+        (r"(?:score|คะแนน)\s*(>=|<=|>|<|=)\s*(\d+(?:\.\d+)?)", None),
+        (r"(?:score|คะแนน)\s*(?:มากกว่า|เกิน|above|over|greater\s+than|more\s+than)\s*(\d+(?:\.\d+)?)", ">"),
+        (r"(?:score|คะแนน)\s*(?:น้อยกว่า|ต่ำกว่า|below|under|less\s+than|fewer\s+than)\s*(\d+(?:\.\d+)?)", "<"),
+        (r"(?:score|คะแนน)\s*(?:อย่างน้อย|ไม่ต่ำกว่า|at\s+least)\s*(\d+(?:\.\d+)?)", ">="),
+        (r"(?:score|คะแนน)\s*(?:ไม่เกิน|at\s+most)\s*(\d+(?:\.\d+)?)", "<="),
+    )
+    for pattern, fixed_operator in patterns:
+        match = re.search(pattern, raw_text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        operator = fixed_operator or match.group(1)
+        value_group = 1 if fixed_operator else 2
+        try:
+            threshold = float(match.group(value_group))
+        except (TypeError, ValueError):
+            continue
+        if operator == "=":
+            operator = "="
+        if operator not in {">", ">=", "<", "<=", "="}:
+            continue
+        return {"operator": operator, "threshold": threshold}
+    return None
+
+
+def _looks_like_complex_form_scoped_database_query(text: str) -> bool:
+    """Return whether a form-scoped DB ask needs generated SQL instead of a trivial template."""
+    lowered = str(text or "").casefold()
+    if not lowered:
+        return False
+    complex_markers = (
+        " by ",
+        "group",
+        "grouped",
+        "group by",
+        "breakdown",
+        "distribution",
+        "compare",
+        "comparison",
+        "versus",
+        " vs ",
+        "where",
+        "filter",
+        "only",
+        "except",
+        "exclude",
+        "include",
+        "greater than",
+        "less than",
+        "more than",
+        "fewer than",
+        "at least",
+        "at most",
+        "between",
+        "before",
+        "after",
+        "since",
+        "until",
+        "matching",
+        "contains",
+        "equals",
+        "per ",
+        "for each",
+        "ตาม",
+        "แยกตาม",
+        "จัดกลุ่ม",
+        "แจกแจง",
+        "เปรียบเทียบ",
+        "เฉพาะ",
+        "ยกเว้น",
+        "มากกว่า",
+        "น้อยกว่า",
+        "อย่างน้อย",
+        "ไม่เกิน",
+        "ระหว่าง",
+        "ก่อน",
+        "หลัง",
+        "ตั้งแต่",
+        "จนถึง",
+        "มีคำว่า",
+        "เท่ากับ",
+    )
+    return any(marker in lowered for marker in complex_markers)
 
 
 def _looks_like_score_ranking_request(text: str) -> bool:
@@ -2345,11 +2665,7 @@ def _looks_like_score_ranking_request(text: str) -> bool:
         "best score",
         "worst score",
         "คะแนน",
-        "คะแนนมากที่สุด",
-        "คะแนนน้อยที่สุด",
         "ได้คะแนน",
-        "คะแนนสูงสุด",
-        "คะแนนต่ำสุด",
     )
     ranking_markers = (
         "top",
@@ -2363,9 +2679,8 @@ def _looks_like_score_ranking_request(text: str) -> bool:
         "ต่ำสุด",
         "อันดับ",
     )
-    return any(marker in lowered for marker in score_markers) or (
-        any(marker in lowered for marker in ranking_markers)
-        and any(marker in lowered for marker in ("score", "scores", "คะแนน"))
+    return any(marker in lowered for marker in ranking_markers) and any(
+        marker in lowered for marker in score_markers
     )
 
 
@@ -2409,6 +2724,70 @@ def _looks_like_score_statistics_request(text: str) -> bool:
         "ค่าเฉลี่ยคะแนน",
     )
     return any(marker in lowered for marker in stats_markers)
+
+
+def _looks_like_explicit_visual_analysis_request(text: str) -> bool:
+    """Return whether a DB request should use the chart/dashboard analysis path."""
+    lowered = str(text or "").casefold()
+    if not lowered:
+        return False
+    visual_markers = (
+        "dashboard",
+        "chart",
+        "charts",
+        "graph",
+        "graphs",
+        "visual",
+        "visualize",
+        "plot",
+        "แดชบอร์ด",
+        "กราฟ",
+        "ชาร์ต",
+        "ภาพรวม",
+    )
+    analysis_only_markers = (
+        "analyze",
+        "analysis",
+        "insight",
+        "insights",
+        "วิเคราะห์",
+        "อินไซต์",
+    )
+    aggregate_table_markers = (
+        "count",
+        "number of",
+        "how many",
+        "distribution",
+        "breakdown",
+        "compare",
+        "average",
+        "avg",
+        "mean",
+        "median",
+        "group",
+        "group by",
+        " by ",
+        "per ",
+        "for each",
+        "จำนวน",
+        "นับ",
+        "กี่",
+        "การกระจาย",
+        "แจกแจง",
+        "แยกตาม",
+        "ตาม",
+        "เปรียบเทียบ",
+        "ค่าเฉลี่ย",
+        "ค่ากลาง",
+        "มัธยฐาน",
+        "มากที่สุด",
+        "น้อยที่สุด",
+    )
+    if any(marker in lowered for marker in visual_markers):
+        return True
+    return any(marker in lowered for marker in analysis_only_markers) and not any(
+        marker in lowered for marker in aggregate_table_markers
+    )
 
 
 def _infer_requested_score_statistics(text: str) -> list[str]:
@@ -2732,6 +3111,7 @@ def _load_form_structure_context(form_id: str) -> dict[str, Any]:
     sample_grade_keys: list[str] = []
     sample_text_answer_keys: list[str] = []
     sample_answer_shapes: list[dict[str, Any]] = []
+    sample_answer_values_by_question: dict[str, list[dict[str, Any]]] = {}
     rows = sample_payload.get("rows", [])
     if rows and isinstance(rows[0], dict):
         raw_response_json = rows[0].get("response_json")
@@ -2764,6 +3144,44 @@ def _load_form_structure_context(form_id: str) -> dict[str, Any]:
                         }
                     )
 
+    answer_value_payload = _execute_readonly_response_store_query(
+        (
+            "WITH answer_counts AS ("
+            " SELECT question_id, question_title, answer_text, COUNT(*) AS answer_count, "
+            "        ROW_NUMBER() OVER ("
+            "          PARTITION BY question_id "
+            "          ORDER BY COUNT(*) DESC, answer_text ASC"
+            "        ) AS answer_rank "
+            " FROM form_response_answers "
+            f" WHERE form_id = {_quote_sql_string_literal(normalized_form_id)} "
+            "   AND NULLIF(BTRIM(answer_text), '') IS NOT NULL "
+            " GROUP BY question_id, question_title, answer_text"
+            ") "
+            "SELECT question_id, question_title, answer_text, answer_count "
+            "FROM answer_counts "
+            "WHERE answer_rank <= 5 "
+            "ORDER BY question_title ASC, answer_rank ASC"
+        ),
+        row_limit=250,
+    )
+    for row in answer_value_payload.get("rows", []):
+        if not isinstance(row, dict):
+            continue
+        question_title = str(row.get("question_title", "") or "").strip()
+        answer_text = str(row.get("answer_text", "") or "").strip()
+        if not question_title or not answer_text:
+            continue
+        values = sample_answer_values_by_question.setdefault(question_title, [])
+        if len(values) >= 5:
+            continue
+        values.append(
+            {
+                "question_id": str(row.get("question_id", "") or "").strip(),
+                "answer_text": answer_text,
+                "answer_count": row.get("answer_count"),
+            }
+        )
+
     return {
         "form_id": normalized_form_id,
         "question_map": question_map,
@@ -2772,6 +3190,7 @@ def _load_form_structure_context(form_id: str) -> dict[str, Any]:
         "sample_grade_keys": sample_grade_keys,
         "sample_text_answer_keys": sample_text_answer_keys,
         "sample_answer_shapes": sample_answer_shapes,
+        "sample_answer_values_by_question": sample_answer_values_by_question,
     }
 
 
@@ -2885,6 +3304,237 @@ def _build_score_statistics_sql(form_id: str, requested_stats: list[str] | None 
     )
 
 
+def _response_total_score_sql(table_alias: str = "fr") -> str:
+    """Return the response-level score expression used by aggregate SQL builders."""
+    alias = str(table_alias or "fr").strip()
+    return (
+        "COALESCE("
+        f"NULLIF({alias}.response_json->>'totalScore', '')::numeric, "
+        "("
+        f" SELECT SUM((answer.answer_obj->'grade'->>'score')::numeric) "
+        f" FROM jsonb_each({alias}.response_json->'answers') AS answer(question_id, answer_obj) "
+        " WHERE answer.answer_obj->'grade'->>'score' IS NOT NULL"
+        ")"
+        ")"
+    )
+
+
+def _build_count_by_answer_field_sql(
+    form_id: str,
+    *,
+    group_question_title: str,
+    group_alias: str,
+    score_filter: dict[str, Any] | None = None,
+) -> str:
+    alias = str(group_alias or group_question_title or "group_value").strip().replace('"', '""')
+    normalized_filter = score_filter or {}
+    operator = str(normalized_filter.get("operator", "") or "").strip()
+    threshold = normalized_filter.get("threshold")
+    if operator in {">", ">=", "<", "<=", "="} and threshold is not None:
+        threshold_text = ("%f" % float(threshold)).rstrip("0").rstrip(".")
+        score_expr = _response_total_score_sql("fr")
+        return (
+            "WITH scores AS ("
+            " SELECT fr.response_id, "
+            f"        {score_expr} AS total_score "
+            " FROM form_responses fr "
+            f" WHERE fr.form_id = {_quote_sql_string_literal(form_id)} "
+            "), groups AS ("
+            " SELECT response_id, answer_text AS group_value "
+            " FROM form_response_answers "
+            f" WHERE form_id = {_quote_sql_string_literal(form_id)} "
+            f"   AND question_title = {_quote_sql_string_literal(group_question_title)} "
+            ") "
+            f"SELECT COALESCE(NULLIF(BTRIM(groups.group_value), ''), '-') AS \"{alias}\", "
+            "       COUNT(DISTINCT scores.response_id) AS response_count "
+            "FROM scores "
+            "JOIN groups ON groups.response_id = scores.response_id "
+            f"WHERE scores.total_score {operator} {threshold_text} "
+            "GROUP BY COALESCE(NULLIF(BTRIM(groups.group_value), ''), '-') "
+            "ORDER BY response_count DESC, "
+            "         COALESCE(NULLIF(BTRIM(groups.group_value), ''), '-') ASC"
+        )
+    return (
+        f"SELECT COALESCE(NULLIF(BTRIM(answer_text), ''), '-') AS \"{alias}\", "
+        "       COUNT(DISTINCT response_id) AS response_count "
+        "FROM form_response_answers "
+        f"WHERE form_id = {_quote_sql_string_literal(form_id)} "
+        f"  AND question_title = {_quote_sql_string_literal(group_question_title)} "
+        "GROUP BY COALESCE(NULLIF(BTRIM(answer_text), ''), '-') "
+        "ORDER BY response_count DESC, "
+        "         COALESCE(NULLIF(BTRIM(answer_text), ''), '-') ASC"
+    )
+
+
+def _build_count_by_email_domain_sql(form_id: str) -> str:
+    return (
+        "WITH email_values AS ("
+        " SELECT response_id, NULLIF(BTRIM(respondent_email), '') AS email "
+        " FROM form_responses "
+        f" WHERE form_id = {_quote_sql_string_literal(form_id)} "
+        " UNION ALL "
+        " SELECT response_id, NULLIF(BTRIM(answer_text), '') AS email "
+        " FROM form_response_answers "
+        f" WHERE form_id = {_quote_sql_string_literal(form_id)} "
+        "   AND (lower(question_title) LIKE '%email%' OR question_title LIKE '%อีเมล%')"
+        "), resolved AS ("
+        " SELECT DISTINCT ON (response_id) response_id, email "
+        " FROM email_values "
+        " WHERE email IS NOT NULL AND email LIKE '%@%' "
+        " ORDER BY response_id, CASE WHEN email LIKE '%@%' THEN 0 ELSE 1 END"
+        ") "
+        "SELECT lower(split_part(email, '@', 2)) AS email_domain, "
+        "       COUNT(DISTINCT response_id) AS response_count "
+        "FROM resolved "
+        "GROUP BY lower(split_part(email, '@', 2)) "
+        "ORDER BY response_count DESC, email_domain ASC"
+    )
+
+
+def _build_score_distribution_sql(form_id: str) -> str:
+    score_expr = _response_total_score_sql("fr")
+    return (
+        "WITH scores AS ("
+        " SELECT "
+        f"   {score_expr} AS total_score "
+        " FROM form_responses fr "
+        f" WHERE fr.form_id = {_quote_sql_string_literal(form_id)} "
+        ") "
+        "SELECT total_score, COUNT(*) AS response_count "
+        "FROM scores "
+        "WHERE total_score IS NOT NULL "
+        "GROUP BY total_score "
+        "ORDER BY total_score ASC"
+    )
+
+
+def _build_average_score_by_answer_field_sql(
+    form_id: str,
+    *,
+    group_question_title: str,
+    group_alias: str,
+) -> str:
+    score_expr = _response_total_score_sql("fr")
+    alias = str(group_alias or group_question_title or "group_value").strip().replace('"', '""')
+    return (
+        "WITH scores AS ("
+        " SELECT fr.response_id, "
+        f"        {score_expr} AS total_score "
+        " FROM form_responses fr "
+        f" WHERE fr.form_id = {_quote_sql_string_literal(form_id)} "
+        "), groups AS ("
+        " SELECT response_id, answer_text AS group_value "
+        " FROM form_response_answers "
+        f" WHERE form_id = {_quote_sql_string_literal(form_id)} "
+        f"   AND question_title = {_quote_sql_string_literal(group_question_title)} "
+        ") "
+        f"SELECT COALESCE(NULLIF(BTRIM(groups.group_value), ''), '-') AS \"{alias}\", "
+        "       COUNT(DISTINCT scores.response_id) AS response_count, "
+        "       ROUND(AVG(scores.total_score), 2) AS avg_score "
+        "FROM scores "
+        "JOIN groups ON groups.response_id = scores.response_id "
+        "WHERE scores.total_score IS NOT NULL "
+        "GROUP BY COALESCE(NULLIF(BTRIM(groups.group_value), ''), '-') "
+        "ORDER BY avg_score DESC NULLS LAST, response_count DESC"
+    )
+
+
+def _build_most_wrong_question_sql(form_id: str) -> str:
+    return (
+        "WITH correct_answers AS ("
+        " SELECT answer.question_id, fr.response_id "
+        " FROM form_responses fr "
+        " JOIN LATERAL jsonb_each(fr.response_json->'answers') AS answer(question_id, answer_obj) ON TRUE "
+        f" WHERE fr.form_id = {_quote_sql_string_literal(form_id)} "
+        "   AND ("
+        "     answer.answer_obj->'grade'->>'correct' = 'true' "
+        "     OR (answer.answer_obj->'grade'->>'score' IS NOT NULL "
+        "         AND (answer.answer_obj->'grade'->>'score')::numeric > 0)"
+        "   )"
+        "), gradable_answers AS ("
+        " SELECT fa.question_id, fa.question_title, fa.response_id "
+        " FROM form_response_answers fa "
+        f" WHERE fa.form_id = {_quote_sql_string_literal(form_id)} "
+        "   AND fa.question_id IN (SELECT DISTINCT question_id FROM correct_answers)"
+        ") "
+        "SELECT ga.question_title, "
+        "       COUNT(DISTINCT ga.response_id) - COUNT(DISTINCT ca.response_id) AS wrong_response_count "
+        "FROM gradable_answers ga "
+        "LEFT JOIN correct_answers ca "
+        "  ON ca.question_id = ga.question_id "
+        " AND ca.response_id = ga.response_id "
+        "GROUP BY ga.question_id, ga.question_title "
+        "HAVING COUNT(DISTINCT ga.response_id) - COUNT(DISTINCT ca.response_id) > 0 "
+        "ORDER BY wrong_response_count DESC, question_title ASC "
+        "LIMIT 20"
+    )
+
+
+def _normalize_question_match_text(text: str) -> str:
+    """Normalize question text for loose user phrase matching."""
+    normalized = str(text or "").casefold()
+    return re.sub(r"[\s_\-/\\|():：,.;]+", "", normalized)
+
+
+def _resolve_question_title_for_phrase(form_id: str, phrase: str) -> str:
+    """Resolve a user-provided grouping phrase to an actual stored question title."""
+    normalized_phrase = _normalize_question_match_text(phrase)
+    if not normalized_phrase:
+        return str(phrase or "").strip()
+    synonym_terms: list[str] = []
+    if any(
+        marker in normalized_phrase
+        for marker in (
+            "หน่วยงาน",
+            "organization",
+            "organisation",
+            "agency",
+            "affiliation",
+            "school",
+        )
+    ):
+        synonym_terms.extend(["โรงเรียน", "หน่วยงาน", "school", "organization", "organisation"])
+
+    payload = _execute_readonly_response_store_query(
+        (
+            "SELECT question_title, COUNT(*) AS usage_count "
+            "FROM form_response_answers "
+            f"WHERE form_id = {_quote_sql_string_literal(form_id)} "
+            "GROUP BY question_title "
+            "ORDER BY usage_count DESC, question_title ASC"
+        ),
+        row_limit=500,
+    )
+    best_title = ""
+    best_score = 0
+    for row in payload.get("rows", []):
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("question_title", "") or "").strip()
+        if not title:
+            continue
+        normalized_title = _normalize_question_match_text(title)
+        score = 0
+        if normalized_title == normalized_phrase:
+            score = 100
+        elif normalized_phrase in normalized_title:
+            score = 80
+        elif normalized_title in normalized_phrase:
+            score = 70
+        elif synonym_terms and any(term in title.casefold() for term in synonym_terms):
+            score = 60
+        else:
+            phrase_tokens = set(re.findall(r"[\w\u0E00-\u0E7F]+", str(phrase).casefold()))
+            title_tokens = set(re.findall(r"[\w\u0E00-\u0E7F]+", title.casefold()))
+            overlap = len(phrase_tokens & title_tokens)
+            if overlap:
+                score = 20 + overlap
+        if score > best_score:
+            best_score = score
+            best_title = title
+    return best_title or str(phrase or "").strip()
+
+
 def _generate_readonly_response_store_sql_from_nl(
     request_text: str,
     *,
@@ -2917,6 +3567,14 @@ def _generate_readonly_response_store_sql_from_nl(
         "When iterating response_json.answers, prefer jsonb_each(response_json->'answers') AS answer(question_id, answer_obj).",
         "When aggregating quiz scores, sum numeric values from answer_obj->'grade'->>'score' per response.",
         "If form-specific structure context is provided, use the actual question titles and question ids from that context instead of guessing labels like Name or Email.",
+        "For filters, cohorts, comparisons, and grouped summaries, join form_response_answers once per referenced question and match actual question_title values from context.",
+        "For answer-option counts or distributions, group by form_response_answers.question_title and answer_text.",
+        "For respondent-level filters, prefer EXISTS subqueries against form_response_answers so each response is counted once.",
+        "For time windows, filter form_responses.created_time or last_submitted_time.",
+        "When the user asks for top, latest, largest, smallest, or a sample, include ORDER BY and LIMIT.",
+        "Use ILIKE for text matching unless the request asks for an exact value.",
+        "Avoid SELECT *; choose clear output columns with aliases that match the user's intent.",
+        "If the request has multiple conditions, satisfy all of them in the same query instead of returning raw rows.",
     ]
     if user_language == "th":
         guidance_lines.append(
@@ -2925,6 +3583,8 @@ def _generate_readonly_response_store_sql_from_nl(
 
     prompt_parts = [
         f"Schema:\n{json.dumps(schema_payload, ensure_ascii=False, indent=2)}",
+        "SQL patterns:\n"
+        f"{json.dumps(_response_store_sql_pattern_payload(), ensure_ascii=False, indent=2)}",
     ]
     if target_form_id.strip():
         prompt_parts.append(f"Preferred target form_id: {target_form_id.strip()}")
@@ -2965,6 +3625,8 @@ def _generate_readonly_response_store_sql_retry_on_error(
     )
     prompt_parts = [
         f"Schema:\n{json.dumps(schema_payload, ensure_ascii=False, indent=2)}",
+        "SQL patterns:\n"
+        f"{json.dumps(_response_store_sql_pattern_payload(), ensure_ascii=False, indent=2)}",
     ]
     if target_form_id.strip():
         prompt_parts.append(f"Preferred target form_id: {target_form_id.strip()}")
@@ -2989,6 +3651,9 @@ def _generate_readonly_response_store_sql_retry_on_error(
         "Do not repeat the same mistake.",
         "If the error shows invalid numeric casting, avoid casting free-text answer columns and prefer numeric grade data from response_json.answers[*].grade.score.",
         "If the error says it cannot extract elements from an object, treat response_json.answers as a JSON object and iterate it with jsonb_each, not jsonb_array_elements.",
+        "For filters, cohorts, comparisons, and grouped summaries, join form_response_answers once per referenced question and match actual question_title values from context.",
+        "For respondent-level filters, prefer EXISTS subqueries against form_response_answers so each response is counted once.",
+        "For answer-option counts or distributions, group by form_response_answers.question_title and answer_text.",
         "Do not include markdown fences, commentary, labels, or explanations.",
     ]
     if user_language == "th":
@@ -3023,6 +3688,8 @@ def _generate_readonly_response_store_sql_retry_on_blank_result(
     )
     prompt_parts = [
         f"Schema:\n{json.dumps(schema_payload, ensure_ascii=False, indent=2)}",
+        "SQL patterns:\n"
+        f"{json.dumps(_response_store_sql_pattern_payload(), ensure_ascii=False, indent=2)}",
     ]
     if target_form_id.strip():
         prompt_parts.append(f"Preferred target form_id: {target_form_id.strip()}")
@@ -3047,6 +3714,7 @@ def _generate_readonly_response_store_sql_retry_on_blank_result(
         "If the user is asking for a person or respondent, return a non-empty respondent identifier.",
         "Prefer COALESCE(NULLIF(fr.respondent_email, ''), fallback_name, fr.response_id) for respondent identity when email may be empty.",
         "A fallback_name can come from form_response_answers for likely identity questions such as titles containing name, email, ชื่อ, อีเมล, or หน่วยงาน when available.",
+        "For grouped or filtered requests, keep the query scoped to matching response_id values and avoid accidental cross-products between answer rows.",
         "Do not include markdown fences, commentary, labels, or explanations.",
     ]
     if user_language == "th":
@@ -9354,6 +10022,108 @@ def maybe_complete_database_request(
                 )
             return AIMessage(content="\n".join(lines).strip())
 
+        if form_scoped_query_plan and form_scoped_query_plan.get("kind") in {
+            "count-by-answer-field",
+            "count-by-email-domain",
+            "score-distribution",
+            "most-wrong-question",
+            "avg-score-by-answer-field",
+        }:
+            catalog_rows = _load_agent_form_catalog()
+            form_row = _choose_database_analysis_form(
+                latest_human_content,
+                catalog_rows,
+                preferred_form_id=target_form_id,
+            )
+            if (
+                explicit_form_id
+                and (
+                    not form_row
+                    or _form_id_ambiguity_key(str(form_row.get("form_id", "") or ""))
+                    != _form_id_ambiguity_key(explicit_form_id)
+                )
+            ):
+                _sync_form_id_into_response_store(explicit_form_id)
+                catalog_rows = _load_agent_form_catalog()
+                form_row = _choose_database_analysis_form(
+                    latest_human_content,
+                    catalog_rows,
+                    preferred_form_id=explicit_form_id,
+                )
+            if not form_row:
+                if user_language == "th":
+                    return AIMessage(content="ยังไม่พบข้อมูลฟอร์มนี้ใน Postgres")
+                return AIMessage(content="This form is not stored in Postgres yet.")
+
+            form_id = str(form_row.get("form_id", "") or "").strip()
+            plan_kind = str(form_scoped_query_plan.get("kind", "") or "")
+            if plan_kind == "count-by-email-domain":
+                aggregate_sql = _build_count_by_email_domain_sql(form_id)
+                row_limit = 200
+            elif plan_kind == "score-distribution":
+                aggregate_sql = _build_score_distribution_sql(form_id)
+                row_limit = 200
+            elif plan_kind == "most-wrong-question":
+                aggregate_sql = _build_most_wrong_question_sql(form_id)
+                row_limit = 20
+            else:
+                group_phrase = str(form_scoped_query_plan.get("group_phrase", "") or "").strip()
+                group_question_title = _resolve_question_title_for_phrase(form_id, group_phrase)
+                if plan_kind == "avg-score-by-answer-field":
+                    aggregate_sql = _build_average_score_by_answer_field_sql(
+                        form_id,
+                        group_question_title=group_question_title,
+                        group_alias=group_phrase or group_question_title,
+                    )
+                else:
+                    aggregate_sql = _build_count_by_answer_field_sql(
+                        form_id,
+                        group_question_title=group_question_title,
+                        group_alias=group_phrase or group_question_title,
+                        score_filter=(
+                            form_scoped_query_plan.get("score_filter")
+                            if isinstance(form_scoped_query_plan.get("score_filter"), dict)
+                            else None
+                        ),
+                    )
+                row_limit = 200
+            payload = _execute_readonly_response_store_query(aggregate_sql, row_limit=row_limit)
+            table = _format_query_payload_as_markdown_table(payload)
+            if table:
+                return AIMessage(content=table)
+            if user_language == "th":
+                return AIMessage(content="ไม่พบข้อมูล")
+            return AIMessage(content="No rows found.")
+
+        if (
+            target_form_id
+            and not form_scoped_query_plan
+            and not _looks_like_explicit_visual_analysis_request(latest_human_content)
+        ):
+            catalog_rows = _load_agent_form_catalog()
+            form_row = _choose_database_analysis_form(
+                latest_human_content,
+                catalog_rows,
+                preferred_form_id=target_form_id,
+            )
+            resolved_target_form_id = (
+                str(form_row.get("form_id", "") or "").strip()
+                if form_row
+                else target_form_id
+            )
+            sql, payload = _run_nl_to_sql_response_store_query(
+                latest_human_content,
+                target_form_id=resolved_target_form_id,
+                user_language=user_language,
+                row_limit=200,
+            )
+            table = _format_query_payload_as_markdown_table(payload)
+            if table:
+                return AIMessage(content=table)
+            if user_language == "th":
+                return AIMessage(content="ไม่พบข้อมูล")
+            return AIMessage(content="No rows found.")
+
         if any(marker in lowered for marker in analysis_markers):
             catalog_rows = _load_agent_form_catalog()
             form_row = _choose_database_analysis_form(
@@ -10117,8 +10887,6 @@ def has_google_sheets_auth_config() -> bool:
         return True
     if get_google_oauth_token_path_for_mcp().exists():
         return True
-    if build_google_sheets_oauth_client_config() is not None:
-        return True
     for env_name in ("SERVICE_ACCOUNT_PATH", "CREDENTIALS_PATH", "TOKEN_PATH"):
         env_value = os.getenv(env_name)
         if env_value and Path(env_value).expanduser().exists():
@@ -10163,6 +10931,22 @@ def normalize_openai_base_url(base_url: str) -> str:
     normalized = base_url.strip().rstrip("/")
     if not normalized.startswith(("http://", "https://")):
         normalized = f"http://{normalized}"
+    parsed = urllib_parse.urlsplit(normalized)
+    if Path("/.dockerenv").exists() and parsed.hostname in {"0.0.0.0", "127.0.0.1", "localhost"}:
+        docker_host = os.getenv("LOCAL_LLM_DOCKER_HOST", "host.docker.internal").strip()
+        if docker_host:
+            netloc = docker_host
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            normalized = urllib_parse.urlunsplit(
+                (
+                    parsed.scheme,
+                    netloc,
+                    parsed.path,
+                    parsed.query,
+                    parsed.fragment,
+                )
+            ).rstrip("/")
     if not normalized.endswith("/v1"):
         normalized = f"{normalized}/v1"
     return normalized

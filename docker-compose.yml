@@ -36,6 +36,8 @@ services:
     dns:
       - 1.1.1.1
       - 8.8.8.8
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - google_oauth_data:/data
       - langgraph_runtime_data:/app/.langgraph_api
