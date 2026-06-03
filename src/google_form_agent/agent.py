@@ -491,6 +491,253 @@ def _format_markdown_table(
     return "\n".join(lines).strip()
 
 
+def _looks_like_table_graph_followup(text: str) -> bool:
+    """Return whether the user is asking to graph the immediately previous table."""
+    lowered = str(text or "").strip().casefold()
+    if not lowered:
+        return False
+    graph_markers = (
+        "graph",
+        "chart",
+        "plot",
+        "visualize",
+        "make it visual",
+        "show as graph",
+        "show as chart",
+        "กราฟ",
+        "ชาร์ต",
+        "ทำกราฟ",
+        "ขอเป็นกราฟ",
+        "แสดงเป็นกราฟ",
+    )
+    return any(marker in lowered for marker in graph_markers)
+
+
+def _split_markdown_table_row(line: str) -> list[str]:
+    """Split one markdown table row while preserving escaped pipe characters."""
+    stripped = str(line or "").strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for char in stripped:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == "|":
+            cells.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+    cells.append("".join(current).strip())
+    return cells
+
+
+def _is_markdown_separator_row(cells: Sequence[str]) -> bool:
+    return bool(cells) and all(
+        re.fullmatch(r":?-{3,}:?", str(cell or "").strip()) is not None
+        for cell in cells
+    )
+
+
+def _parse_markdown_table(text: str) -> tuple[list[str], list[list[str]]] | None:
+    """Parse the first GitHub-flavored markdown table from text."""
+    lines = str(text or "").splitlines()
+    for index in range(0, max(0, len(lines) - 1)):
+        if "|" not in lines[index] or "|" not in lines[index + 1]:
+            continue
+        headers = _split_markdown_table_row(lines[index])
+        separator = _split_markdown_table_row(lines[index + 1])
+        if not headers or not _is_markdown_separator_row(separator):
+            continue
+
+        rows: list[list[str]] = []
+        row_index = index + 2
+        while row_index < len(lines) and "|" in lines[row_index].strip():
+            row = _split_markdown_table_row(lines[row_index])
+            if len(row) < len(headers):
+                break
+            rows.append(row[: len(headers)])
+            row_index += 1
+        if rows:
+            return headers, rows
+    return None
+
+
+def _extract_latest_markdown_table(
+    messages: list[AnyMessage],
+    before_index: int,
+) -> tuple[list[str], list[list[str]]] | None:
+    """Return the latest assistant markdown table before a follow-up graph request."""
+    for index in range(before_index - 1, -1, -1):
+        message = messages[index]
+        if message.type != "ai":
+            continue
+        text = content_to_text(message.content)
+        text = re.sub(
+            rf"{re.escape(SPREADSHEET_ANALYSIS_VISUAL_START)}[\s\S]*?{re.escape(SPREADSHEET_ANALYSIS_VISUAL_END)}",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        parsed = _parse_markdown_table(text)
+        if parsed:
+            return parsed
+    return None
+
+
+def _coerce_chart_number(value: Any) -> float | None:
+    raw = str(value or "").strip().replace(",", "")
+    if not raw or raw == "-":
+        return None
+    if raw.endswith("%"):
+        raw = raw[:-1].strip()
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _build_visual_payload_from_markdown_table(
+    headers: Sequence[str],
+    rows: Sequence[Sequence[str]],
+    *,
+    request_text: str,
+    user_language: str,
+) -> dict[str, Any] | None:
+    """Build a chart payload from a previous markdown table result."""
+    if len(headers) < 2 or not rows:
+        return None
+
+    numeric_scores: dict[int, int] = {}
+    for column_index in range(len(headers)):
+        numeric_scores[column_index] = sum(
+            1
+            for row in rows
+            if column_index < len(row) and _coerce_chart_number(row[column_index]) is not None
+        )
+    numeric_columns = [
+        column_index
+        for column_index, score in numeric_scores.items()
+        if score > 0 and score >= max(1, len(rows) // 2)
+    ]
+    if not numeric_columns:
+        return None
+
+    value_column = numeric_columns[-1]
+    label_column = 0
+    for column_index in range(len(headers)):
+        if column_index != value_column and numeric_scores.get(column_index, 0) < len(rows):
+            label_column = column_index
+            break
+    if label_column == value_column and len(headers) > 1:
+        label_column = 0 if value_column != 0 else 1
+
+    points: list[dict[str, Any]] = []
+    for row in rows:
+        if value_column >= len(row) or label_column >= len(row):
+            continue
+        value = _coerce_chart_number(row[value_column])
+        label = str(row[label_column] or "").strip()
+        if value is None or not label:
+            continue
+        points.append({"label": label, "value": value})
+    if not points:
+        return None
+
+    original_count = len(points)
+    points = points[:30]
+    total = sum(float(point["value"]) for point in points)
+    for point in points:
+        point["percent"] = round((float(point["value"]) / total) * 100, 2) if total else 0
+        if float(point["value"]).is_integer():
+            point["value"] = int(point["value"])
+
+    label_header = str(headers[label_column] or "").strip()
+    value_header = str(headers[value_column] or "").strip()
+    title = (
+        f"{value_header} ตาม {label_header}"
+        if user_language == "th"
+        else f"{value_header} by {label_header}"
+    )
+    summary = ""
+    if original_count > len(points):
+        summary = (
+            f"แสดง {len(points)} รายการแรกจากทั้งหมด {original_count} รายการในตารางล่าสุด"
+            if user_language == "th"
+            else f"Showing the first {len(points)} rows from {original_count} rows in the latest table."
+        )
+
+    return {
+        "version": 1,
+        "kind": "spreadsheet-analysis-visual",
+        "displayMode": "single-chart",
+        "userLanguage": "th" if user_language == "th" else "en",
+        "spreadsheetId": "previous-query",
+        "spreadsheetTitle": "Previous query result",
+        "spreadsheetUrl": "",
+        "processedSheetName": "Previous query",
+        "detailSheetName": "",
+        "summarySheetName": "Previous query",
+        "rowCountWritten": len(rows),
+        "questionCount": 1,
+        "analysisRequest": request_text,
+        "insights": [],
+        "charts": [
+            {
+                "id": "previous-query-table-chart",
+                "title": title,
+                "chartType": "bar",
+                "total": int(total) if float(total).is_integer() else round(total, 2),
+                "series": points,
+                "summary": summary,
+                "reason": (
+                    "สร้างจากตารางคำตอบล่าสุดในแชต"
+                    if user_language == "th"
+                    else "Built from the latest query table in the chat."
+                ),
+            }
+        ],
+    }
+
+
+def _maybe_graph_latest_table_result(
+    messages: list[AnyMessage],
+    latest_human_index: int,
+    *,
+    request_text: str,
+    user_language: str,
+) -> AIMessage | None:
+    """Answer graph follow-ups by charting the previous markdown table."""
+    if not _looks_like_table_graph_followup(request_text):
+        return None
+    parsed = _extract_latest_markdown_table(messages, latest_human_index)
+    if not parsed:
+        return None
+    payload = _build_visual_payload_from_markdown_table(
+        parsed[0],
+        parsed[1],
+        request_text=request_text,
+        user_language=user_language,
+    )
+    if not payload:
+        return None
+    response_text = (
+        "สร้างกราฟจากตารางผลลัพธ์ล่าสุดให้แล้ว"
+        if user_language == "th"
+        else "I made a graph from the latest result table."
+    )
+    return AIMessage(content=_append_spreadsheet_visual_payload(response_text, payload))
+
+
 def _extract_requested_form_id(text: str) -> str:
     """Extract an explicit form_id reference from free-form user text."""
     raw_text = str(text or "")
@@ -712,127 +959,6 @@ def _sync_form_id_into_response_store(form_id: str) -> dict[str, Any]:
         )
     finally:
         GOOGLE_OAUTH_SESSION_KEY.reset(token_session)
-
-
-def _build_postgres_form_analysis_snapshot(
-    form_row: dict[str, Any],
-    *,
-    analysis_request: str,
-    user_language: str,
-) -> tuple[dict[str, Any], int, int]:
-    """Build chart-ready analysis payload from SQL-backed form response data."""
-    form_id = str(form_row.get("form_id", "") or "").strip()
-    spreadsheet_id = str(form_row.get("spreadsheet_id", "") or "").strip()
-    form_title = str(form_row.get("form_title", "") or form_id).strip() or form_id
-    spreadsheet_url = str(form_row.get("spreadsheet_url", "") or "").strip()
-    quoted_form_id = _quote_sql_string_literal(form_id)
-
-    responses_payload = json.loads(
-        query_form_response_database.invoke(
-            {
-                "sql": (
-                    "SELECT response_id, created_time, respondent_email, "
-                    "COALESCE(response_json->>'totalScore', '') AS total_score "
-                    f"FROM form_responses WHERE form_id = {quoted_form_id} "
-                    "ORDER BY created_time ASC NULLS LAST, response_id ASC"
-                ),
-                "row_limit": 10000,
-            }
-        )
-    )
-    answers_payload = json.loads(
-        query_form_response_database.invoke(
-            {
-                "sql": (
-                    "SELECT response_id, question_title, answer_text "
-                    f"FROM form_response_answers WHERE form_id = {quoted_form_id} "
-                    "ORDER BY response_id ASC, question_title ASC"
-                ),
-                "row_limit": 50000,
-            }
-        )
-    )
-
-    response_rows = [
-        row for row in responses_payload.get("rows", []) if isinstance(row, dict)
-    ]
-    answer_rows = [
-        row for row in answers_payload.get("rows", []) if isinstance(row, dict)
-    ]
-
-    question_titles: list[str] = []
-    for row in answer_rows:
-        question_title = str(row.get("question_title", "") or "").strip()
-        if question_title and question_title not in question_titles:
-            question_titles.append(question_title)
-
-    answer_matrix: dict[str, dict[str, str]] = {}
-    question_counts: dict[str, dict[str, int]] = {}
-    response_ids_with_answers: set[str] = set()
-    for row in answer_rows:
-        response_id = str(row.get("response_id", "") or "").strip()
-        question_title = str(row.get("question_title", "") or "").strip()
-        answer_text = str(row.get("answer_text", "") or "").strip()
-        if not response_id or not question_title:
-            continue
-        response_ids_with_answers.add(response_id)
-        answer_matrix.setdefault(response_id, {})[question_title] = answer_text
-        normalized_answer = answer_text or "-"
-        question_counts.setdefault(question_title, {})
-        question_counts[question_title][normalized_answer] = (
-            question_counts[question_title].get(normalized_answer, 0) + 1
-        )
-
-    processed_headers = ["Response ID", "Submitted At", "Respondent Email", "Total Score", *question_titles]
-    processed_rows: list[list[str]] = []
-    for response in response_rows:
-        response_id = str(response.get("response_id", "") or "").strip()
-        answer_lookup = answer_matrix.get(response_id, {})
-        processed_rows.append(
-            [
-                response_id,
-                str(response.get("created_time", "") or "").strip(),
-                str(response.get("respondent_email", "") or "").strip(),
-                str(response.get("total_score", "") or "").strip(),
-                *[str(answer_lookup.get(question_title, "") or "").strip() for question_title in question_titles],
-            ]
-        )
-
-    summary_rows: list[list[str]] = []
-    for question_title in question_titles:
-        counts = question_counts.get(question_title, {})
-        total = sum(counts.values())
-        if total <= 0:
-            continue
-        ordered_answers = sorted(
-            counts.items(),
-            key=lambda item: (-int(item[1]), str(item[0]).casefold()),
-        )
-        for answer_text, count in ordered_answers:
-            percent = round((count / total) * 100, 2)
-            summary_rows.append(
-                [
-                    question_title,
-                    answer_text,
-                    str(count),
-                    f"{percent:.2f}",
-                ]
-            )
-
-    visual_payload = _build_spreadsheet_visual_payload(
-        spreadsheet_id=spreadsheet_id or form_id,
-        spreadsheet_title=form_title,
-        spreadsheet_url=spreadsheet_url,
-        processed_sheet_name="SQL Responses",
-        summary_sheet_name="SQL Summary",
-        row_count_written=len(processed_rows),
-        summary_rows=summary_rows,
-        analysis_request=analysis_request,
-        processed_headers=processed_headers,
-        processed_rows=processed_rows,
-        user_language=user_language,
-    )
-    return visual_payload, len(response_ids_with_answers), len(question_titles)
 
 
 def looks_like_form_creation_request(text: str) -> bool:
@@ -9815,6 +9941,14 @@ def maybe_complete_database_request(
                 "Only a single SELECT or WITH statement is allowed."
             )
         )
+    graph_latest_table_message = _maybe_graph_latest_table_result(
+        messages,
+        latest_human_index,
+        request_text=latest_human_content,
+        user_language=user_language,
+    )
+    if graph_latest_table_message is not None:
+        return graph_latest_table_message
     form_scoped_query_plan = (
         _plan_form_scoped_database_query(latest_human_content)
         if target_form_id
@@ -9885,23 +10019,6 @@ def maybe_complete_database_request(
         "คำตอบทั้งหมด",
         "แสดงคำตอบ",
     )
-    analysis_markers = (
-        "analy",
-        "analysis",
-        "summary",
-        "summarize",
-        "insight",
-        "dashboard",
-        "chart",
-        "graph",
-        "วิเคราะห์",
-        "สรุป",
-        "อินไซต์",
-        "แดชบอร์ด",
-        "กราฟ",
-        "ชาร์ต",
-    )
-
     try:
         if embedded_sql:
             payload = _execute_readonly_response_store_query(embedded_sql, row_limit=200)
@@ -10123,63 +10240,6 @@ def maybe_complete_database_request(
             if user_language == "th":
                 return AIMessage(content="ไม่พบข้อมูล")
             return AIMessage(content="No rows found.")
-
-        if any(marker in lowered for marker in analysis_markers):
-            catalog_rows = _load_agent_form_catalog()
-            form_row = _choose_database_analysis_form(
-                latest_human_content,
-                catalog_rows,
-                preferred_form_id=recent_thread_form_id,
-            )
-            if not form_row:
-                if user_language == "th":
-                    return AIMessage(content="ยังไม่พบฟอร์มที่เก็บไว้ใน Postgres สำหรับการวิเคราะห์")
-                return AIMessage(content="No stored Postgres form was found for analysis.")
-
-            visual_payload, response_count, answered_question_count = _build_postgres_form_analysis_snapshot(
-                form_row,
-                analysis_request=latest_human_content,
-                user_language=user_language,
-            )
-            chart_count = len(visual_payload.get("charts", []) or [])
-            form_title = str(form_row.get("form_title", "") or form_row.get("form_id", "")).strip()
-            form_id = str(form_row.get("form_id", "") or "").strip()
-            explicit_score_distribution_request = _request_explicitly_asks_for_score_distribution_chart(
-                latest_human_content
-            )
-            if explicit_score_distribution_request:
-                response_text = (
-                    "กราฟการกระจายคะแนนรวม:"
-                    if user_language == "th"
-                    else "Overall score distribution graph:"
-                )
-            elif user_language == "th":
-                response_text = "\n".join(
-                    [
-                        "ฉันวิเคราะห์ข้อมูลคำตอบจาก Postgres และเตรียมกราฟสรุปไว้แล้ว",
-                        "",
-                        f"- ฟอร์ม: {form_title}",
-                        f"- Form ID: {form_id}",
-                        f"- จำนวนแถวคำตอบที่ใช้วิเคราะห์: {response_count}",
-                        f"- จำนวนคำถามที่มีคำตอบ: {answered_question_count}",
-                        f"- จำนวนกราฟที่แสดงในแชต: {chart_count}",
-                    ]
-                ).strip()
-            else:
-                response_text = "\n".join(
-                    [
-                        "I analyzed the stored Postgres form responses and prepared summary charts.",
-                        "",
-                        f"- Form: {form_title}",
-                        f"- Form ID: {form_id}",
-                        f"- Response rows analyzed: {response_count}",
-                        f"- Questions with answers: {answered_question_count}",
-                        f"- Charts shown in chat: {chart_count}",
-                    ]
-                ).strip()
-            return AIMessage(
-                content=_append_spreadsheet_visual_payload(response_text, visual_payload)
-            )
 
         if form_scoped_query_plan and form_scoped_query_plan.get("kind") == "response-rows":
             catalog_rows = _load_agent_form_catalog()
