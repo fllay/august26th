@@ -82,6 +82,22 @@ services:
       backend:
         condition: service_healthy
 
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command:
+      [
+        "tunnel",
+        "--no-autoupdate",
+        "run",
+        "--token",
+        "${CLOUDFLARED_TUNNEL_TOKEN}",
+      ]
+    restart: unless-stopped
+    network_mode: "service:webui"
+    depends_on:
+      webui:
+        condition: service_started
+
 volumes:
   google_oauth_data:
   langgraph_runtime_data:
